@@ -1,0 +1,14 @@
+name: plantdensityanalysis_env
+channels:
+  - rios
+  - conda-forge
+  - defaults
+dependencies:
+  - numpy
+  - pandas
+  - pyarrow
+  - scikit-learn
+  - trimesh
+  - ipykernel
+  - dask
+  - distributed
