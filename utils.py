@@ -785,41 +785,41 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
         mask = (t_enter <= t_exit + epsilon) & (t_exit >= -epsilon)
 
         # Setup arrays for returned values
-        t_enter_coords = np.full((mask.shape[0], mask.shape[1], origins.shape[2]), np.nan, dtype=np.float64)
-        t_exit_coords = np.full((mask.shape[0], mask.shape[1], origins.shape[2]), np.nan, dtype=np.float64)
-        t_entry_radii = np.full_like(mask, np.nan, dtype=np.float64)
-        t_exit_radii = np.full_like(mask, np.nan, dtype=np.float64)
+        # t_enter_coords = np.full((mask.shape[0], mask.shape[1], origins.shape[2]), np.nan, dtype=np.float64)
+        # t_exit_coords = np.full((mask.shape[0], mask.shape[1], origins.shape[2]), np.nan, dtype=np.float64)
+        # t_entry_radii = np.full_like(mask, np.nan, dtype=np.float64)
+        # t_exit_radii = np.full_like(mask, np.nan, dtype=np.float64)
 
-        # If there are any true values in mask, run calculations
-        has_nonzero = np.any(mask, axis=(0,1))
-        if has_nonzero:
-            # Calculate the entry and exit coordinates for valid rays
-            origins = np.broadcast_to(origins, (mask.shape[0], mask.shape[1], origins.shape[2]))
-            directions = np.broadcast_to(directions, (mask.shape[0], mask.shape[1], directions.shape[2]))
+        # # If there are any true values in mask, run calculations
+        # has_nonzero = np.any(mask, axis=(0,1))
+        # if has_nonzero:
+        #     # Calculate the entry and exit coordinates for valid rays
+        #     origins = np.broadcast_to(origins, (mask.shape[0], mask.shape[1], origins.shape[2]))
+        #     directions = np.broadcast_to(directions, (mask.shape[0], mask.shape[1], directions.shape[2]))
             
-            origins = origins[mask]
-            directions = directions[mask]
-            t_enter = t_enter[mask]
-            t_exit = t_exit[mask]
+        #     origins = origins[mask]
+        #     directions = directions[mask]
+        #     t_enter = t_enter[mask]
+        #     t_exit = t_exit[mask]
             
-            t_enter_coords[mask] = origins + t_enter[:, np.newaxis] * directions
-            t_exit_coords[mask] = origins + t_exit[:, np.newaxis] * directions
+        #     t_enter_coords[mask] = origins + t_enter[:, np.newaxis] * directions
+        #     t_exit_coords[mask] = origins + t_exit[:, np.newaxis] * directions
 
-            # Calculate the radii from beam divergence using t_enter and t_exit as distances
-            t_entry_radii[mask] = (t_enter * np.tan(beam_divergence)).astype(np.float64)
-            t_exit_radii[mask] = (t_exit * np.tan(beam_divergence)).astype(np.float64)
+        #     # Calculate the radii from beam divergence using t_enter and t_exit as distances
+        #     t_entry_radii[mask] = (t_enter * np.tan(beam_divergence)).astype(np.float64)
+        #     t_exit_radii[mask] = (t_exit * np.tan(beam_divergence)).astype(np.float64)
         
-        return mask, t_enter_coords, t_exit_coords, t_entry_radii, t_exit_radii
+        return mask # , t_enter_coords, t_exit_coords, t_entry_radii, t_exit_radii
 
 
         
     
-    # Calcul{ate mask, t_enter, and t_exit for max voxels that fit into memory
+    # Calculate mask, t_enter, and t_exit for max voxels that fit into memory
     masks = {}
-    t_enter_coords = {}
-    t_exit_coords = {}
-    t_entry_radiis = {}
-    t_exit_radiis = {}
+    # t_enter_coords = {}
+    # t_exit_coords = {}
+    # t_entry_radiis = {}
+    # t_exit_radiis = {}
 
     temp_dir = tempfile.mkdtemp(dir=temp_dir)
     os.makedirs(temp_dir, exist_ok=True)
@@ -827,11 +827,12 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
     # Generate a unique ID for the process
     process_id = uuid.uuid4().hex
 
+    print(f"Process {process_id}: Start {num_rays} rays, {num_voxels} voxels, in ({int(np.ceil(num_voxels / chunks_per_compute))}) chunks.")
     
     for i in range(0, voxel_mins.shape[0], chunks_per_compute):
 
         # Calculate the number of chunks to process in this iteration
-        chunk_mask, chunk_t_enter_coord, chunk_t_exit_coord, chunk_t_entry_radii, chunk_t_exit_radii = broadcasted_ray_tracing(
+        chunk_mask = broadcasted_ray_tracing( #, chunk_t_enter_coord, chunk_t_exit_coord, chunk_t_entry_radii, chunk_t_exit_radii = broadcasted_ray_tracing(
             voxel_mins[i:i+chunks_per_compute, :, :], 
             voxel_maxs[i:i+chunks_per_compute, :, :], 
             origins, 
@@ -840,43 +841,43 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
 
         # Save chunk_mask, t_enter, and t_exit to disk with unique filenames
         chunk_mask_filename = os.path.join(temp_dir, f"chunk_mask_{i}_{process_id}.npy")
-        t_enter_filename = os.path.join(temp_dir, f"t_enter_{i}_{process_id}.npy")
-        t_exit_filename = os.path.join(temp_dir, f"t_exit_{i}_{process_id}.npy")
-        t_entry_radii_filename = os.path.join(temp_dir, f"t_entry_radii_{i}_{process_id}.npy")
-        t_exit_radii_filename = os.path.join(temp_dir, f"t_exit_radii_{i}_{process_id}.npy")
+        # t_enter_filename = os.path.join(temp_dir, f"t_enter_{i}_{process_id}.npy")
+        # t_exit_filename = os.path.join(temp_dir, f"t_exit_{i}_{process_id}.npy")
+        # t_entry_radii_filename = os.path.join(temp_dir, f"t_entry_radii_{i}_{process_id}.npy")
+        # t_exit_radii_filename = os.path.join(temp_dir, f"t_exit_radii_{i}_{process_id}.npy")
 
         # Save arrays to disk
         np.save(chunk_mask_filename, chunk_mask)
-        np.save(t_enter_filename, chunk_t_enter_coord)
-        np.save(t_exit_filename, chunk_t_exit_coord)
-        np.save(t_entry_radii_filename, chunk_t_entry_radii)
-        np.save(t_exit_radii_filename, chunk_t_exit_radii)
+        # np.save(t_enter_filename, chunk_t_enter_coord)
+        # np.save(t_exit_filename, chunk_t_exit_coord)
+        # np.save(t_entry_radii_filename, chunk_t_entry_radii)
+        # np.save(t_exit_radii_filename, chunk_t_exit_radii)
 
         dtype = chunk_mask.dtype
         shape = chunk_mask.shape
         masks[i] = [chunk_mask_filename, dtype, shape]
 
-        dtype = chunk_t_enter_coord.dtype
-        shape = chunk_t_enter_coord.shape
-        t_enter_coords[i] = [t_enter_filename, dtype, shape]
+        # dtype = chunk_t_enter_coord.dtype
+        # shape = chunk_t_enter_coord.shape
+        # t_enter_coords[i] = [t_enter_filename, dtype, shape]
 
-        dtype = chunk_t_exit_coord.dtype
-        shape = chunk_t_exit_coord.shape
-        t_exit_coords[i] = [t_exit_filename, dtype, shape]
+        # dtype = chunk_t_exit_coord.dtype
+        # shape = chunk_t_exit_coord.shape
+        # t_exit_coords[i] = [t_exit_filename, dtype, shape]
 
-        dtype = chunk_t_entry_radii.dtype
-        shape = chunk_t_entry_radii.shape
-        t_entry_radiis[i] = [t_entry_radii_filename, dtype, shape]
+        # dtype = chunk_t_entry_radii.dtype
+        # shape = chunk_t_entry_radii.shape
+        # t_entry_radiis[i] = [t_entry_radii_filename, dtype, shape]
 
-        dtype = chunk_t_exit_radii.dtype
-        shape = chunk_t_exit_radii.shape
-        t_exit_radiis[i] = [t_exit_radii_filename, dtype, shape]
+        # dtype = chunk_t_exit_radii.dtype
+        # shape = chunk_t_exit_radii.shape
+        # t_exit_radiis[i] = [t_exit_radii_filename, dtype, shape]
 
 
-        del chunk_mask, chunk_t_enter_coord, chunk_t_exit_coord, chunk_t_entry_radii, chunk_t_exit_radii
+        del chunk_mask #, chunk_t_enter_coord, chunk_t_exit_coord, chunk_t_entry_radii, chunk_t_exit_radii
         gc.collect()
 
-        
+    print(f"Process {process_id}: Finished {num_rays} rays, {num_voxels} voxels. Concatenating results...")
 
     # Combine masks, t_enters, and t_exits into single arrays for further processing
     mask = None
@@ -911,72 +912,72 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
     del mask, chunk_masks, chunk
     gc.collect()
 
-    # Combine t_enter and t_exit arrays
-    t_enters = []
-    for key in sorted(t_enter_coords.keys()):
-        # Use np.memmap to map the saved files
-        filename = t_enter_coords[key][0]
-        dtype = t_enter_coords[key][1]
-        shape = t_enter_coords[key][2]
+    # # Combine t_enter and t_exit arrays
+    # t_enters = []
+    # for key in sorted(t_enter_coords.keys()):
+    #     # Use np.memmap to map the saved files
+    #     filename = t_enter_coords[key][0]
+    #     dtype = t_enter_coords[key][1]
+    #     shape = t_enter_coords[key][2]
 
-        chunk_t_enter = np.lib.format.open_memmap(filename, mode='r', dtype=dtype, shape=shape)
-        t_enters.append(chunk_t_enter)
+    #     chunk_t_enter = np.lib.format.open_memmap(filename, mode='r', dtype=dtype, shape=shape)
+    #     t_enters.append(chunk_t_enter)
     
-    filtered_t_entry_coords = np.concatenate(t_enters, axis=0)    
-    filtered_t_entry_coords = filtered_t_entry_coords[voxel_ref_idx, ray_ref_idx]
-    # Cleanup memory
-    del t_enter_coords, t_enters
-    gc.collect()
+    # filtered_t_entry_coords = np.concatenate(t_enters, axis=0)    
+    # filtered_t_entry_coords = filtered_t_entry_coords[voxel_ref_idx, ray_ref_idx]
+    # # Cleanup memory
+    # del t_enter_coords, t_enters
+    # gc.collect()
 
-    t_exits = []
-    for key in sorted(t_exit_coords.keys()):
-        # Use np.memmap to map the saved files
-        filename = t_exit_coords[key][0]
-        dtype = t_exit_coords[key][1]
-        shape = t_exit_coords[key][2]
+    # t_exits = []
+    # for key in sorted(t_exit_coords.keys()):
+    #     # Use np.memmap to map the saved files
+    #     filename = t_exit_coords[key][0]
+    #     dtype = t_exit_coords[key][1]
+    #     shape = t_exit_coords[key][2]
 
-        chunk_t_exit = np.lib.format.open_memmap(filename, mode='r', dtype=dtype, shape=shape)
-        t_exits.append(chunk_t_exit)
+    #     chunk_t_exit = np.lib.format.open_memmap(filename, mode='r', dtype=dtype, shape=shape)
+    #     t_exits.append(chunk_t_exit)
 
-    filtered_t_exit_coords = np.concatenate(t_exits, axis=0)
-    filtered_t_exit_coords = filtered_t_exit_coords[voxel_ref_idx, ray_ref_idx]
-    # Cleanup memory
-    del t_exit_coords, t_exits
-    gc.collect()
+    # filtered_t_exit_coords = np.concatenate(t_exits, axis=0)
+    # filtered_t_exit_coords = filtered_t_exit_coords[voxel_ref_idx, ray_ref_idx]
+    # # Cleanup memory
+    # del t_exit_coords, t_exits
+    # gc.collect()
 
-    # t_entry_radii
-    t_en_radiis = []
-    for key in sorted(t_entry_radiis.keys()):
-        # Use np.memmap to map the saved files
-        filename = t_entry_radiis[key][0]
-        dtype = t_entry_radiis[key][1]
-        shape = t_entry_radiis[key][2]
+    # # t_entry_radii
+    # t_en_radiis = []
+    # for key in sorted(t_entry_radiis.keys()):
+    #     # Use np.memmap to map the saved files
+    #     filename = t_entry_radiis[key][0]
+    #     dtype = t_entry_radiis[key][1]
+    #     shape = t_entry_radiis[key][2]
 
-        chunk_t_entry_radii = np.lib.format.open_memmap(filename, mode='r', dtype=dtype, shape=shape)
-        t_en_radiis.append(chunk_t_entry_radii)
+    #     chunk_t_entry_radii = np.lib.format.open_memmap(filename, mode='r', dtype=dtype, shape=shape)
+    #     t_en_radiis.append(chunk_t_entry_radii)
 
-    filtered_t_entry_radii = np.concatenate(t_en_radiis, axis=0)
-    filtered_t_entry_radii = filtered_t_entry_radii[voxel_ref_idx, ray_ref_idx]
-    # Cleanup memory
-    del t_en_radiis, chunk_t_entry_radii, t_entry_radiis
-    gc.collect()
+    # filtered_t_entry_radii = np.concatenate(t_en_radiis, axis=0)
+    # filtered_t_entry_radii = filtered_t_entry_radii[voxel_ref_idx, ray_ref_idx]
+    # # Cleanup memory
+    # del t_en_radiis, chunk_t_entry_radii, t_entry_radiis
+    # gc.collect()
 
-    # t_exit_radii
-    t_ex_radiis = []
-    for key in sorted(t_exit_radiis.keys()):
-        # Use np.memmap to map the saved files
-        filename = t_exit_radiis[key][0]
-        dtype = t_exit_radiis[key][1]
-        shape = t_exit_radiis[key][2]
+    # # t_exit_radii
+    # t_ex_radiis = []
+    # for key in sorted(t_exit_radiis.keys()):
+    #     # Use np.memmap to map the saved files
+    #     filename = t_exit_radiis[key][0]
+    #     dtype = t_exit_radiis[key][1]
+    #     shape = t_exit_radiis[key][2]
 
-        chunk_t_exit_radii = np.lib.format.open_memmap(filename, mode='r', dtype=dtype, shape=shape)
-        t_ex_radiis.append(chunk_t_exit_radii)
+    #     chunk_t_exit_radii = np.lib.format.open_memmap(filename, mode='r', dtype=dtype, shape=shape)
+    #     t_ex_radiis.append(chunk_t_exit_radii)
 
-    filtered_t_exit_radii = np.concatenate(t_ex_radiis, axis=0)
-    filtered_t_exit_radii = filtered_t_exit_radii[voxel_ref_idx, ray_ref_idx]
+    # filtered_t_exit_radii = np.concatenate(t_ex_radiis, axis=0)
+    # filtered_t_exit_radii = filtered_t_exit_radii[voxel_ref_idx, ray_ref_idx]
 
-    del t_ex_radiis, chunk_t_exit_radii, t_exit_radiis
-    gc.collect()
+    # del t_ex_radiis, chunk_t_exit_radii, t_exit_radiis
+    # gc.collect()
 
     # Delete the temporary folder and its contents
     shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1002,23 +1003,36 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
     del voxel_ids, voxel_sizes, voxel_mins, voxel_maxs, leg_ids, ray_ids, is_leaf, points, origins, directions
     # gc.collect()
 
-
-
     # Filter out points that are within each respective voxel  
     filtered_hit_rays = np.all((filtered_points >= filtered_voxel_mins) & (filtered_points <= filtered_voxel_maxs), axis=1)
     
     # Filter out rays which have previously hit a voxel (and therefore do not continue into this next one)
     # Also keep any NAN points (i.e. unbound rays)
-    distance_to_exit = np.linalg.norm(filtered_t_exit_coords - filtered_origins, axis=1)
-    distance_to_point = np.linalg.norm(filtered_points - filtered_origins, axis=1)
-    yet_to_hit_rays = np.logical_or(distance_to_point > distance_to_exit, np.isnan(filtered_points).any(axis=1)) 
+    # distance_to_exit = np.linalg.norm(filtered_t_exit_coords - filtered_origins, axis=1)
+    filtered_directions = np.where(
+        np.abs(filtered_directions) <= epsilon,
+        np.where(filtered_directions == 0, epsilon, np.sign(filtered_directions) * epsilon),
+        filtered_directions
+    )
+    t_min = (filtered_voxel_mins - filtered_origins) / filtered_directions
+    t_max = (filtered_voxel_maxs - filtered_origins) / filtered_directions
+    t_enter = np.max(np.minimum(t_min, t_max), axis=1)
+    t_exit = np.min(np.maximum(t_min, t_max), axis=1)
+    del t_min, t_max
+    gc.collect()
+
+    t_exit_coords = filtered_origins + t_exit[:, np.newaxis] * filtered_directions
+    t_enter_coords = filtered_origins + t_enter[:, np.newaxis] * filtered_directions
+    distance_to_exit_squared = np.sum((filtered_origins + t_exit[:, np.newaxis] * filtered_directions - filtered_origins) ** 2, axis=1)
+    distance_to_point_squared = np.sum((filtered_points - filtered_origins) ** 2, axis=1)
+    yet_to_hit_rays = np.logical_or(distance_to_point_squared > distance_to_exit_squared, np.isnan(filtered_points).any(axis=1)) 
     valid_ray_mask = np.logical_or(filtered_hit_rays, yet_to_hit_rays)
 
     if not np.any(valid_ray_mask):
         print("No valid rays intersect these voxels.")
         return pd.DataFrame(columns=voxel_ray_intersection_schema.names)
         
-    del filtered_voxel_mins, filtered_voxel_maxs, filtered_origins, filtered_directions
+    del filtered_voxel_mins, filtered_voxel_maxs
     gc.collect()
     
     # Ensure only hit ray points are kept per voxel
@@ -1033,14 +1047,27 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
     filtered_voxel_ids = filtered_voxel_ids[valid_ray_mask]
     filtered_leg_ids = filtered_leg_ids[valid_ray_mask]
     filtered_ray_ids = filtered_ray_ids[valid_ray_mask]
-    filtered_t_entry_coords = filtered_t_entry_coords[valid_ray_mask]
-    filtered_t_exit_coords = filtered_t_exit_coords[valid_ray_mask]
-    filtered_t_entry_radii = filtered_t_entry_radii[valid_ray_mask]
-    filtered_t_exit_radii = filtered_t_exit_radii[valid_ray_mask]
+    # filtered_t_entry_coords = filtered_t_entry_coords[valid_ray_mask]
+    # filtered_t_exit_coords = filtered_t_exit_coords[valid_ray_mask]
+    # filtered_t_entry_radii = filtered_t_entry_radii[valid_ray_mask]
+    # filtered_t_exit_radii = filtered_t_exit_radii[valid_ray_mask]
     filtered_points = filtered_points[valid_ray_mask]
     filtered_viewing_angles = filtered_viewing_angles[valid_ray_mask]
     filtered_hit_rays = filtered_hit_rays[valid_ray_mask]
     filtered_is_leaf = filtered_is_leaf[valid_ray_mask] 
+    filtered_origins = filtered_origins[valid_ray_mask]
+    filtered_directions = filtered_directions[valid_ray_mask]
+
+    filtered_t_exit_coords = t_exit_coords[valid_ray_mask]
+    filtered_t_entry_coords = t_enter_coords[valid_ray_mask]
+    del t_exit_coords, t_enter_coords
+    gc.collect()
+
+    beam_divergence = 0.001
+    filtered_t_entry_radii = t_enter[valid_ray_mask] * np.tan(beam_divergence)
+    filtered_t_exit_radii = t_exit[valid_ray_mask] * np.tan(beam_divergence)
+    del t_enter, t_exit, filtered_origins, filtered_directions
+    gc.collect()
 
     data = [
         pa.array(filtered_voxel_sizes),
@@ -1066,6 +1093,9 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
     result = result.to_pandas()
 
     del filtered_voxel_sizes, filtered_voxel_ids, filtered_leg_ids, filtered_ray_ids, filtered_t_entry_coords, filtered_t_exit_coords, filtered_t_entry_radii, filtered_t_exit_radii, filtered_points, filtered_viewing_angles, filtered_hit_rays, filtered_is_leaf
+    gc.collect()
+
+    print(f"Process {process_id}. Returning results...")
 
     return result
 
