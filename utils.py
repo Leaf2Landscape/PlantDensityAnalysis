@@ -1295,7 +1295,7 @@ def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, 
     logger.info(statement)
 
 # Function used for taking valid_rays parquet files and references to establish voxel_ray intersections per valid_rays file
-def voxel_ray_intersections(valid_rays_dir, references_dir, debug=True, epsilon=1e-6):
+def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir, cpus=None, debug=True, epsilon=1e-6):
     import os
     import glob
     import pandas as pd
@@ -1375,7 +1375,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, debug=True, epsilon=
     for file in valid_rays_files:
         # Read in parquet file
         df = dd.read_parquet(file, engine='pyarrow', blocksize=100 * 1024 * 1024)
-        cpus = os.cpu_count() or 4
+        cpus = os.cpu_count() if cpus is None else cpus
 
         if df.npartitions < cpus:
             # Check for the size of resulting partition
