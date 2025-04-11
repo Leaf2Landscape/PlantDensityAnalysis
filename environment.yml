@@ -12,3 +12,5 @@ dependencies:
   - ipykernel
   - dask
   - distributed
+  - pip:
+      - fnvhash==0.1.0

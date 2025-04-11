@@ -3,23 +3,18 @@ A Python script of commonly shared utilities for other scripts.
 Includes schemas for i/o data, functions, and helpers.
 """
 
-import dask.distributed
 from fnvhash import fnv1a_32
 import pyarrow as pa
 import pandas as pd
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
-import trimesh
-import math
 import gc
 import dask
-from distributed import Client
 import os
 import tempfile
 import uuid
 import shutil
-from datetime import datetime
-import pickle
+
 
 ### CONSTANTS ###
 beam_divergence = np.float64(0.001) # Beam divergence in radians
@@ -708,9 +703,6 @@ def find_viewing_angles(directions, reference_vector=np.array([0, 0, 1])):
 
 # Function to traverse the voxels and find ray intersections
 def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, epsilon=1e-6):
-
-    
-    import uuid
 
     if ray_partition.empty:
         return pd.DataFrame(columns=voxel_ray_intersection_schema.names)
