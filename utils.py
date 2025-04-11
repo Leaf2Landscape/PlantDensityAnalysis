@@ -702,7 +702,7 @@ def find_viewing_angles(directions, reference_vector=np.array([0, 0, 1])):
     return viewing_angle
 
 # Function to traverse the voxels and find ray intersections
-def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, epsilon=1e-6):
+def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_dir, epsilon=1e-6):
 
     if ray_partition.empty:
         return pd.DataFrame(columns=voxel_ray_intersection_schema.names)
@@ -714,6 +714,9 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, epsilon
     directions = np.asarray(ray_partition[['direction_x', 'direction_y', 'direction_z']].values)
     points = np.asarray(ray_partition[['point_x', 'point_y', 'point_z']].values)
     is_leaf = np.asarray(ray_partition['is_leaf'].values)
+
+    num_rays = len(ray_partition)
+    num_voxels = len(voxel_references)
     
     voxel_ids = voxel_references['voxel_id'].values
     voxel_sizes = voxel_references['voxel_size'].values
@@ -818,13 +821,16 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, epsilon
     t_entry_radiis = {}
     t_exit_radiis = {}
 
-    temp_dir = tempfile.mkdtemp()
+    temp_dir = tempfile.mkdtemp(dir=temp_dir)
     os.makedirs(temp_dir, exist_ok=True)
 
     # Generate a unique ID for the process
     process_id = uuid.uuid4().hex
 
+    
     for i in range(0, voxel_mins.shape[0], chunks_per_compute):
+
+        # Calculate the number of chunks to process in this iteration
         chunk_mask, chunk_t_enter_coord, chunk_t_exit_coord, chunk_t_entry_radii, chunk_t_exit_radii = broadcasted_ray_tracing(
             voxel_mins[i:i+chunks_per_compute, :, :], 
             voxel_maxs[i:i+chunks_per_compute, :, :], 
@@ -901,6 +907,9 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, epsilon
 
         # Return an empty DataFrame with the same schema
         return pd.DataFrame(columns=voxel_ray_intersection_schema.names)
+    
+    del mask, chunk_masks, chunk
+    gc.collect()
 
     # Combine t_enter and t_exit arrays
     t_enters = []
@@ -1055,6 +1064,8 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, epsilon
     ]
     result = pa.Table.from_arrays(data, schema=voxel_ray_intersection_schema)
     result = result.to_pandas()
+
+    del filtered_voxel_sizes, filtered_voxel_ids, filtered_leg_ids, filtered_ray_ids, filtered_t_entry_coords, filtered_t_exit_coords, filtered_t_entry_radii, filtered_t_exit_radii, filtered_points, filtered_viewing_angles, filtered_hit_rays, filtered_is_leaf
 
     return result
 
@@ -1287,7 +1298,7 @@ def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, 
     logger.info(statement)
 
 # Function used for taking valid_rays parquet files and references to establish voxel_ray intersections per valid_rays file
-def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir, cpus=None, debug=True, epsilon=1e-6):
+def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir, cpus=None, mem=None, debug=True, epsilon=1e-6):
     import os
     import glob
     import pandas as pd
@@ -1339,27 +1350,16 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir, cpus=None,
         total_mem_per_ray_per_voxel = num_voxels * mem_required_per_ray
         chunk_size = max(min_chunk_size, available_memory / total_mem_per_ray_per_voxel)
         return chunk_size
-    
-    num_voxels = len(voxel_references)
-    n_workers = os.cpu_count() or 1
-    available_memory = psutil.virtual_memory().available
-    available_memory_per_worker = available_memory / n_workers
-    mem_safety_factor = 0.7
-    target_partition_mem = (10 * 1024 * 1024) # bytes
 
-
-    available_memory_mb = available_memory / (1024 * 1024)
-    chunk_size_mb = calculate_chunk_size_mb(num_voxels, available_memory_mb)
-    chunk_size = int(chunk_size_mb * 1024 * 1024)
 
     # Compile all valid_rays parquets
     valid_rays_files = glob.glob(os.path.join(valid_rays_dir, '*_valid_rays.parquet'))
 
-    def map_ray_partition_to_function(ray_partition, voxel_group, chunks_per_compute):
+    def map_ray_partition_to_function(ray_partition, voxel_group, temp_dir, chunks_per_compute):
 
 
 
-        result = traverse_voxels(ray_partition=ray_partition, voxel_references=voxel_group, chunks_per_compute=chunks_per_compute)
+        result = traverse_voxels(ray_partition=ray_partition, voxel_references=voxel_group, chunks_per_compute=chunks_per_compute, temp_dir=temp_dir)
         return result
 
     voxel_ray_intersections = {}
@@ -1371,10 +1371,10 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir, cpus=None,
 
         if df.npartitions < cpus:
             # Check for the size of resulting partition
-            mem = df.memory_usage(deep=True).compute().sum()
+            df_mem = df.memory_usage(deep=True).compute().sum()
             target_partition_mem = 25 * 1024 * 1024 # bytes
-            if mem / cpus < target_partition_mem: # Avoid too small partitions
-                cpus = int(mem / target_partition_mem)
+            if df_mem / cpus < target_partition_mem: # Avoid too small partitions
+                cpus = int(df_mem / target_partition_mem)
             
             df = df.repartition(npartitions=cpus)
 
@@ -1385,24 +1385,29 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir, cpus=None,
         # Map partitions to traverse voxels
         meta = pd.DataFrame(columns=voxel_ray_intersection_schema.names)
 
-        # client = Client()
-
-        available_mem = psutil.virtual_memory().available * 0.8
+        if mem == None:
+            mem = psutil.virtual_memory().available
+        
+        available_mem = mem * 0.8
         partition_mem = df.memory_usage_per_partition(deep=True).compute().max()
         num_voxels = len(voxel_references)
 
         voxel_memory = num_voxels * 12 * 8  # Voxels are broadcast to (n, 1, 8), each element is 8 bytes (float64)
         mem_per_compute = (partition_mem + voxel_memory) * 2
         # Calculate the memory required for broadcasting a single voxel to all rays
-        chunks_per_compute = int(np.floor(available_mem / (mem_per_compute * df.npartitions)))
+        chunks_per_compute = int((available_mem / (mem_per_compute * df.npartitions)))
 
         if chunks_per_compute < 1:
             required_partitions = int(np.ceil(partition_mem / mem_per_compute))
             max_partitions = int(np.floor(available_mem / (required_partitions * partition_mem)))
+            df = df.repartition(npartitions=max_partitions)
+            chunks_per_compute = int((available_mem / (mem_per_compute * df.npartitions)))
             while (max_partitions * partition_mem) > available_mem:
                 max_partitions -= 1
                 df = df.repartition(npartitions=max_partitions)
                 partition_mem = df.memory_usage_per_partition(deep=True).compute().max()
+            
+            chunks_per_compute = int((available_mem / (mem_per_compute * df.npartitions)))
 
         dd_results = []
 
@@ -1410,6 +1415,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir, cpus=None,
             map_ray_partition_to_function,
             voxel_group=voxel_references,
             chunks_per_compute=chunks_per_compute,
+            temp_dir=temp_dir,
             meta=meta
         )
 
@@ -1443,6 +1449,9 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir, cpus=None,
 
             print(f"Saving results for leg {leg_id}...")
             results = results.groupby('voxel_size').apply(lambda x: save_task(x, leg_id))
+
+            del results
+            gc.collect()
 
             print(f"Completed leg {leg_id}!")
 
