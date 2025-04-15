@@ -1710,3 +1710,33 @@ def get_voxel_metrics(intersections_files, lambda_1, is_leaf_true=True, debug=Tr
         voxel_metrics_df = voxel_metrics_df.compute()
         voxel_metrics_df = voxel_metrics_df.reset_index(drop=True)
     return voxel_metrics_df
+
+def calculate_occlusion_metrics(intersections_files,  debug=True, epsilon=1e-9):
+    """
+    This function will take the voxel_ray_intersection files and calculate the occlusion metrics for each voxel and group of points
+    It will return a dataframe for voxel information:
+        - Number of rays from each direction (i.e. North, South, East, West, Up, Down)
+        - Total volume coverage percentave (i.e. using beam divergence, what percentage of voxel volume is explored)
+        This can be used to create a voxel map .xyz which demonstrates all space of the chosen plot (i.e. not just explored voxels)
+        
+    It will also return a dataframe for point information, which is based on point groups:
+        - Number of rays from each direction (i.e. North, South, East, West, Up, Down)
+        This can be used to create a .laz file which includes extra classification information that demonstrates the points exploration metrics.
+        """
+    pass
+
+def convert_parquet_to_csv(parquet_file, output_file):
+    """
+    Convert a parquet file to a csv file.
+    """
+    
+    import pandas as pd
+    import pyarrow as pa
+
+    # Read the parquet file
+    df = pd.read_parquet(parquet_file, engine='pyarrow')
+
+    df.to_csv(output_file, index=False)
+
+
+
