@@ -12,5 +12,6 @@ dependencies:
   - ipykernel
   - dask
   - distributed
+  - open3d
   - pip:
       - fnvhash==0.1.0
