@@ -20,7 +20,8 @@ legs = 'all'
 voxel_sizes = 'all'  # or [0.2, 0.5,&]
 
 for _, row in leaf_area_df.iterrows():
-    tree_id = str(row['tree_id']).zfill(3)
+    # do this:
+    tree_id = f"{int(row['tree_id']):03d}"
     avg_leaf = row['average_leaf_area']
 
     # Set up the project directory
