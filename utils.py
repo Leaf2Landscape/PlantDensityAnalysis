@@ -1934,6 +1934,17 @@ def get_voxel_metrics_old(intersections_files, lambda_1, is_leaf_true=True, debu
 
     pass
 
+# Calculate effective path lengths and free path lengths
+def calculate_effective_path_length(path_lengths, lambda_1):
+    with np.errstate(divide='ignore', invalid='ignore'):
+        mask = (lambda_1 * path_lengths) < 1
+        effective_path_length = np.where(
+            mask,
+            -np.log(1 - lambda_1 * path_lengths) / lambda_1,
+            np.nan
+        )
+    return effective_path_length
+
 def get_voxel_metrics(intersections_files, lambda_1, is_leaf_true=True, debug=True, epsilon=1e-9):
     """
     This function will take the voxel_ray_intersection files and calculate the metrics for each voxel.
@@ -2027,16 +2038,6 @@ def get_voxel_metrics(intersections_files, lambda_1, is_leaf_true=True, debug=Tr
         sum_free_path_length_hit_leaf = np.nansum(free_path_lengths[leaf_mask])
         # mean_free_path_length_leaf = np.nanmean(free_path_lengths_leaf)
 
-        # Calculate effective path lengths and free path lengths
-        def calculate_effective_path_length(path_lengths, lambda_1):
-            with np.errstate(divide='ignore', invalid='ignore'):
-                mask = (lambda_1 * path_lengths) < 1
-                effective_path_length = np.where(
-                    mask,
-                    -np.log(1 - lambda_1 * path_lengths) / lambda_1,
-                    np.nan
-                )
-            return effective_path_length
         eff_path_lengths = calculate_effective_path_length(path_lengths, lambda_1)
         eff_free_path_lengths = calculate_effective_path_length(free_path_lengths, lambda_1)
 
@@ -2178,7 +2179,7 @@ def get_voxel_metrics(intersections_files, lambda_1, is_leaf_true=True, debug=Tr
         voxel_metrics_df = voxel_metrics_df.reset_index(drop=True)
     return voxel_metrics_df
 
-def calculate_occlusion_metrics(intersections_files, reference_file,  debug=True, epsilon=1e-9):
+def calculate_occlusion_metrics(intersections_files, reference_file, max_beam_distance=50, heat_map_resolution=0.01, debug=True, epsilon=1e-9):
     """
     This function will take the voxel_ray_intersection files and calculate the occlusion metrics for each voxel and group of points
     It will return a dataframe for voxel information:
@@ -2190,7 +2191,6 @@ def calculate_occlusion_metrics(intersections_files, reference_file,  debug=True
         - Number of rays from each direction (i.e. North, South, East, West, Up, Down)
         This can be used to create a .laz file which includes extra classification information that demonstrates the points exploration metrics.
         """
-
     from sklearn.neighbors import NearestNeighbors
     
     dfs = []
@@ -2208,15 +2208,24 @@ def calculate_occlusion_metrics(intersections_files, reference_file,  debug=True
 
     # Retrieve reference information for voxel boundaries
     reference_df = pd.read_csv(reference_file, index_col=None, header=0)
-    reference_df = reference_df[['voxel_id', 'voxel_cx', 'voxel_cy', 'voxel_cz', 'voxel_size']]
+    reference_df = reference_df[['voxel_id', 'voxel_cx', 'voxel_cy', 'voxel_cz']]
     reference_df = reference_df.drop_duplicates()
     reference_df = reference_df.set_index('voxel_id')
-    
-    voxel_mins = reference_df[['voxel_cx', 'voxel_cy', 'voxel_cz']].values - (reference_df['voxel_size'].values / 2)
-    voxel_maxs = reference_df[['voxel_cx', 'voxel_cy', 'voxel_cz']].values + (reference_df['voxel_size'].values / 2)
 
-    def get_occlusion_per_voxel(voxel_df, voxel_min, voxel_max, epsilon=1e-9):
+    # Merge the voxel intersections with the reference dataframe
+    voxel_intersections_df = voxel_intersections_df.merge(reference_df, left_on='voxel_id', right_index=True, how='left', suffixes=('', ''))
+
+    del reference_df
+    
+    def get_occlusion_per_voxel(voxel_df, epsilon=1e-9):
+
         # Calculate the planes which constitute each face of the voxel
+        voxel_min = np.zeros(3)
+        voxel_max = np.zeros(3)
+        for i in range(3):
+            voxel_min[i] = (voxel_df['voxel_c' + ['x', 'y', 'z'][i]].values[0] - (voxel_df['voxel_size'].values[0] / 2))
+            voxel_max[i] = (voxel_df['voxel_c' + ['x', 'y', 'z'][i]].values[0] + (voxel_df['voxel_size'].values[0] / 2))
+
         voxel_planes = np.array([
             [voxel_min[0], voxel_min[1], voxel_min[2]],
             [voxel_max[0], voxel_min[1], voxel_min[2]],
@@ -2226,7 +2235,8 @@ def calculate_occlusion_metrics(intersections_files, reference_file,  debug=True
             [voxel_max[0], voxel_min[1], voxel_max[2]],
             [voxel_min[0], voxel_max[1], voxel_max[2]],
             [voxel_max[0], voxel_max[1], voxel_max[2]]
-        ])
+        ]
+        )
 
         points = voxel_df[['point_x', 'point_y', 'point_z']].values
 
@@ -2244,40 +2254,117 @@ def calculate_occlusion_metrics(intersections_files, reference_file,  debug=True
         total_volume = np.prod(voxel_max - voxel_min)
         entry_coords = voxel_df[['t_entry_x', 't_entry_y', 't_entry_z']].values
         exit_coords = voxel_df[['t_exit_x', 't_exit_y', 't_exit_z']].values
-        entry_radii = voxel_df[['t_entry_radii']].values
-        exit_radii = voxel_df[['t_exit_radii']].values
-        beam_volumes = ((1/3) * np.pi * np.linalg.norm(entry_coords - exit_coords, axis=1)) * (entry_radii ** 2 + entry_radii * exit_radii + exit_radii ** 2)
-        total_volume_coverage = np.sum(beam_volumes) / total_volume
+        entry_radii = voxel_df[['t_entry_radius']].values
+        exit_radii = voxel_df[['t_exit_radius']].values
 
-        # Calculate per point group (nearest neighbours) statistics
-        # Group points using nearest neighbors
-        def group_points_with_nearest_neighbors(points, radius=0.1):
-            """
-            Group points using nearest neighbors within a specified radius.
+        # Calculate the weight of each beam, based on the distance from t_entry to sensor origin
+        distance_to_exit = np.linalg.norm(exit_coords - entry_coords, axis=1)
+        denom = (exit_radii - entry_radii)
+        denom[denom == 0] = epsilon
+        distance_to_sensor = (entry_radii * distance_to_exit) / denom
 
-            Args:
-                points (numpy.ndarray): Array of points (N x 3).
-                radius (float): Radius for nearest neighbors.
+        # Weight beams linearly with max distance from sensor specified
+        beam_weights = np.clip(1 - (distance_to_sensor / max_beam_distance), 0, 1)
+        beam_weights = np.exp(-distance_to_sensor / distance_to_exit)
 
-            Returns:
-                numpy.ndarray: Array of group labels for each point.
-            """
-            if len(points) == 0:
-                return np.array([])
+        # Calculate the theoretical and actual beam volumes
+        def calculate_beam_volume(s_coords, e_coords, s_radii, e_radii):
+            distance_to_end = np.linalg.norm(s_coords - e_coords, axis=1)
+            beam_volumes = ((1/3) * np.pi * distance_to_end) * (s_radii ** 2 + s_radii * e_radii + e_radii ** 2)
+            return beam_volumes
+        # Theoretical beam volumes
+        theoretical_beam_volumes = calculate_beam_volume(entry_coords, exit_coords, entry_radii, exit_radii)
+        weighted_theoretical_beam_volumes = theoretical_beam_volumes * beam_weights
 
-            # Fit NearestNeighbors model
-            nbrs = NearestNeighbors(radius=radius).fit(points)
-            adjacency_matrix = nbrs.radius_neighbors_graph(points, mode='connectivity')
+        # Actual beam volumes
+        hit_mask = voxel_df['hit_ray'].values
+        points = voxel_df[['point_x', 'point_y', 'point_z']][hit_mask].values
+        valid_entry_coords = entry_coords[hit_mask]
+        valid_entry_radii = entry_radii[hit_mask]
+        valid_exit_radii = exit_radii[hit_mask]
+        actual_beam_volumes = theoretical_beam_volumes
 
-            _, group_labels = connected_components(adjacency_matrix, directed=False)
+        distance_to_point = np.linalg.norm(points - valid_entry_coords, axis=1)
+        radii_at_point = valid_entry_radii * ((valid_exit_radii - valid_entry_radii) / distance_to_exit) * distance_to_point
+        actual_beam_volumes[hit_mask] = calculate_beam_volume(valid_entry_coords, points, valid_entry_radii, radii_at_point)
+        weighted_actual_beam_volumes = actual_beam_volumes * beam_weights
 
-            return group_labels
+        #### INSERT DESIRED OCCLUSION METRICS HERE ####
+        # At the moment, we'll just save the coverage volumes and work with the results
 
-        # Apply grouping to points
-        group_labels = group_points_with_nearest_neighbors(points)
+        # Calculate the heat map for each direction (i.e. face of the voxel intersected by t_entry)
+        voxel_size = voxel_df['voxel_size'].values[0]
+        bins_per_face = int(voxel_size / heat_map_resolution)
+        face_heatmaps = {
+            'x_minus': np.zeros((bins_per_face, bins_per_face)),
+            'x_plus': np.zeros((bins_per_face, bins_per_face)),
+            'y_minus': np.zeros((bins_per_face, bins_per_face)),
+            'y_plus': np.zeros((bins_per_face, bins_per_face)),
+            'z_minus': np.zeros((bins_per_face, bins_per_face)),
+            'z_plus': np.zeros((bins_per_face, bins_per_face))
+        }
+        for i in range(6):
+            # Get the points that intersect with the plane
+            plane_mask = np.abs(entry_coords[:, i % 3] - voxel_planes[i % 3]) < epsilon
+            if np.sum(plane_mask) > 0:
+                # Get the coordinates of the points on the plane
+                plane_points = entry_coords[plane_mask]
+                # Calculate the bin indices for each point
+                bin_indices_x = ((plane_points[:, 0] - voxel_min[0]) / heat_map_resolution).astype(int)
+                bin_indices_y = ((plane_points[:, 1] - voxel_min[1]) / heat_map_resolution).astype(int)
+                # Update the heatmap
+                face_heatmaps[['x_minus', 'x_plus', 'y_minus', 'y_plus', 'z_minus', 'z_plus'][i]] += np.histogram2d(bin_indices_x, bin_indices_y, bins=bins_per_face)[0]
+
+
+
+
+
+        # Calculate beam_volume for each direction (i.e. face of the voxel intersected by t_entry)
+        beam_volume_per_plane = np.zeros(6)
+        for i in range(6):
+            # Get the points that intersect with the plane
+            plane_mask = np.abs(points[:, i % 3] - voxel_planes[i % 3]) < epsilon
+            beam_volume_per_plane[i] = np.sum(beam_volumes[plane_mask])
+            
+        # Convert to ratio
+        beam_volume_per_plane = (beam_volume_per_plane / total_volume)
+
+        # Add to dataframe with direction columns
+
+
+        # # Calculate per point group (nearest neighbours) statistics
+        # # Group points using nearest neighbors
+        # def group_points_with_nearest_neighbors(points, radius=0.1):
+        #     """
+        #     Group points using nearest neighbors within a specified radius.
+
+        #     Args:
+        #         points (numpy.ndarray): Array of points (N x 3).
+        #         radius (float): Radius for nearest neighbors.
+
+        #     Returns:
+        #         numpy.ndarray: Array of group labels for each point.
+        #     """
+        #     if len(points) == 0:
+        #         return np.array([])
+
+        #     # Fit NearestNeighbors model
+        #     nbrs = NearestNeighbors(radius=radius).fit(points)
+        #     adjacency_matrix = nbrs.radius_neighbors_graph(points, mode='connectivity')
+
+        #     _, group_labels = connected_components(adjacency_matrix, directed=False)
+
+        #     return group_labels
+
+        # # Apply grouping to points
+        # group_labels = group_points_with_nearest_neighbors(points)
 
         # Add group labels to the dataframe
-        voxel_df['group_label'] = group_labels
+        # voxel_df['group_label'] = group_labels
+
+    # Group by voxel_id and apply the occlusion function to each voxel
+    voxel_occlusion_df = voxel_intersections_df.groupby('voxel_id').apply(get_occlusion_per_voxel).reset_index(drop=True)
+    return voxel_occlusion_df
 
 
 
