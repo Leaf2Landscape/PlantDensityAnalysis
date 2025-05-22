@@ -26,10 +26,10 @@ for _, row in leaf_area_df.iterrows():
 
     # Set up the project directory
     project_dir = '/home/uqrarya1/Desktop/Scratch/veg3d/uqrarya1/phd_work/blender2heliosScene'
-    valid_rays_dir = os.path.join(project_dir, f'{tree_id}', 'Leaf&Wood', 'valid_rays')
-    references_dir = os.path.join(project_dir, f'{tree_id}', 'Leaf&Wood', 'references')
+    valid_rays_dir = os.path.join(project_dir, f'{tree_id}_Trees', 'Leaf&Wood', 'valid_rays')
+    references_dir = os.path.join(project_dir, f'{tree_id}_Trees', 'Leaf&Wood', 'references')
     # Set up the output directory
-    output_dir = os.path.join(project_dir, f'{tree_id}', 'Leaf&Wood', 'results')
+    output_dir = os.path.join(project_dir, f'{tree_id}_Trees', 'Leaf&Wood', 'results')
 
     # Create the output directory if it doesn't exist
     if not os.path.exists(output_dir):
@@ -103,9 +103,6 @@ for _, row in leaf_area_df.iterrows():
 
         # Merge to maintain voxel_id matching
         voxel_metrics_df = voxel_metrics_df.merge(df_ref, on='voxel_id', how='left')
-
-        # Add lambda_1 to the dataframe
-        voxel_metrics_df['lambda_1'] = lambda_1
 
         ### Add LAD calculations here if desired
         """Example, LAD_BL_TLS
