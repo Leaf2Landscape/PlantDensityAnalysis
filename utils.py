@@ -2087,7 +2087,7 @@ def get_voxel_metrics(intersections_files, lambda_1, is_leaf_true=True, debug=Tr
             'I_leaf': I_leaf,
             'G_lw': np.nan,
             'G_leaf': G_leaf,
-            'lamda_1': lambda_1,
+            'lambda_1': lambda_1,
             'LIAD_leaf_bin_2.5': LIAD_leaf_values[0],
             'LIAD_leaf_bin_7.5': LIAD_leaf_values[1],
             'LIAD_leaf_bin_12.5': LIAD_leaf_values[2],
