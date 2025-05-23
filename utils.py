@@ -126,7 +126,6 @@ voxel_metrics_schema = pa.schema([
     pa.field('I_leaf', pa.int64()),  # num_leaf_hits / num_rays (i.e. leaf only)
     pa.field('G_lw', pa.float64()),                    # G function calculated from leaf and wood hits
     pa.field('G_leaf', pa.float64()),               # G function calculated from leaf hits only
-    pa.field('lambda_1', pa.float64()), # Lambda_1 for the voxel
     pa.field('LIAD_leaf_bin_2.5', pa.float64()),
     pa.field('LIAD_leaf_bin_7.5', pa.float64()),
     pa.field('LIAD_leaf_bin_12.5', pa.float64()),
@@ -1935,6 +1934,17 @@ def get_voxel_metrics_old(intersections_files, lambda_1, is_leaf_true=True, debu
 
     pass
 
+# Calculate effective path lengths and free path lengths
+def calculate_effective_path_length(path_lengths, lambda_1):
+    with np.errstate(divide='ignore', invalid='ignore'):
+        mask = (lambda_1 * path_lengths) < 1
+        effective_path_length = np.where(
+            mask,
+            -np.log(1 - lambda_1 * path_lengths) / lambda_1,
+            np.nan
+        )
+    return effective_path_length
+
 def get_voxel_metrics(intersections_files, lambda_1, is_leaf_true=True, debug=True, epsilon=1e-9):
     """
     This function will take the voxel_ray_intersection files and calculate the metrics for each voxel.
@@ -2028,16 +2038,7 @@ def get_voxel_metrics(intersections_files, lambda_1, is_leaf_true=True, debug=Tr
         sum_free_path_length_hit_leaf = np.nansum(free_path_lengths[leaf_mask])
         # mean_free_path_length_leaf = np.nanmean(free_path_lengths_leaf)
 
-        # Calculate effective path lengths and free path lengths
-        def calculate_effective_path_length(path_lengths, lambda_1):
-            with np.errstate(divide='ignore', invalid='ignore'):
-                mask = (lambda_1 * path_lengths) < 1
-                effective_path_length = np.where(
-                    mask,
-                    -np.log(1 - lambda_1 * path_lengths) / lambda_1,
-                    np.nan
-                )
-            return effective_path_length
+        
         eff_path_lengths = calculate_effective_path_length(path_lengths, lambda_1)
         eff_free_path_lengths = calculate_effective_path_length(free_path_lengths, lambda_1)
 
@@ -2087,7 +2088,6 @@ def get_voxel_metrics(intersections_files, lambda_1, is_leaf_true=True, debug=Tr
             'I_leaf': I_leaf,
             'G_lw': np.nan,
             'G_leaf': G_leaf,
-            'lambda_1': lambda_1,
             'LIAD_leaf_bin_2.5': LIAD_leaf_values[0],
             'LIAD_leaf_bin_7.5': LIAD_leaf_values[1],
             'LIAD_leaf_bin_12.5': LIAD_leaf_values[2],

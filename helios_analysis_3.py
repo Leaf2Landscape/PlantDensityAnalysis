@@ -104,6 +104,9 @@ for _, row in leaf_area_df.iterrows():
         # Merge to maintain voxel_id matching
         voxel_metrics_df = voxel_metrics_df.merge(df_ref, on='voxel_id', how='left')
 
+        # Add lambda_1 to the dataframe
+        voxel_metrics_df['lambda_1'] = lambda_1
+        
         ### Add LAD calculations here if desired
         """Example, LAD_BL_TLS
 
@@ -126,4 +129,4 @@ for _, row in leaf_area_df.iterrows():
         if os.path.exists(output_file):
             os.remove(output_file)
         voxel_metrics_df.to_csv(output_file)
-        print(f" {tree_id}, vs={voxel_size} Â {output_file}")
+        print(f"tree= {tree_id}, vs={voxel_size} at {output_file}")
