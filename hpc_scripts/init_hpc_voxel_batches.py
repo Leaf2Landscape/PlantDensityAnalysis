@@ -7,7 +7,7 @@ import pyvista as pv
 import numpy as np
 import argparse
 import math
-from scipy.spatial import cKDTree 
+
 
 def _faces_to_poly(vertices: np.ndarray, faces: List[List[int]]) -> Optional[pv.PolyData]:
     """
@@ -75,6 +75,7 @@ def load_and_split_by_group(scene_file: Union[str, Path], leaf_keys, wood_keys) 
 
     scene_mesh = pv.read(scene_file)
     bounds = scene_mesh.bounds
+
     
     return leaf_mesh_path, wood_mesh_path, bounds, leaf_mesh, wood_mesh
 
@@ -112,20 +113,11 @@ def process_triangle(tri, vertices, voxel_size, min_bound):
 
     return occupied_voxels
 
-def generate_voxel_centers(bounds, voxel_size, npz_path, leaf_mesh=None, wood_mesh=None):
+def generate_voxel_centers(voxel_size, leaf_mesh=None, wood_mesh=None):
     """
     Placeholder function to generate voxel centers.
     Replace this with actual logic from your 040.py script.
     """
-    ### OLD ###
-    # xmin, xmax, ymin, ymax, zmin, zmax = bounds
-    # print(f"xmin: {xmin}, xmax: {xmax}, ymin: {ymin}, ymax: {ymax}, zmin: {zmin}, zmax: {zmax}")
-    # xs = np.arange(xmin, xmax, voxel_size)
-    # ys = np.arange(ymin, ymax, voxel_size)
-    # zs = np.arange(zmin, zmax, voxel_size)
-    # X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
-    # centers = np.vstack([X.ravel(), Y.ravel(), Z.ravel()]).T
-
     # Generate voxel grid for the combined plot bounds of leaf_mesh and wood_mesh
     if leaf_mesh is not None:
         min_bound = leaf_mesh.bounds[0:3]  # Get the minimum bounds of the leaf mesh
@@ -150,111 +142,6 @@ def generate_voxel_centers(bounds, voxel_size, npz_path, leaf_mesh=None, wood_me
     
     return voxel_centers, voxel_ids
 
-        # Create voxel grid based on the combined mesh bounds
-        
-
-    # valid_voxels = {}
-
-    # # Mask voxel centers that contain leaf mesh data
-    # if leaf_mesh is not None:
-    #     leaf_tree = cKDTree(leaf_mesh.points)
-    #     radius = voxel_size * math.sqrt(3) + 0.01
-
-    #     def process_voxel(center):
-    #         # i, center = i_center
-    #         voxel = pv.Cube(
-    #             center=center, 
-    #             x_length=voxel_size, 
-    #             y_length=voxel_size, 
-    #             z_length=voxel_size
-    #         )
-            
-    #         indices = leaf_tree.query_ball_point(center, r=radius)
-    #         indices = np.array(indices, dtype=int)
-
-    #         if len(indices) == 0:
-    #             print(f"No leaf mesh data found for voxel near {center}. Skipping.")
-    #             return None, None, None, None, None, None, None
-            
-    #         submesh_leaf = leaf_mesh.extract_points(indices, adjacent_cells=True)
-            
-    #         is_leaf = submesh_leaf.select_enclosed_points(voxel, tolerance=0.01)
-    #         if is_leaf['SelectedPoints'].any():
-    #             # Clip the leaf mesh to the voxel bounds
-    #             clipped_leaf_mesh = leaf_mesh.clip_box(bounds=voxel.bounds, invert=False)
-    #             voxel_id = generate_unique_id(center, voxel_size)
-    #             # Extract vertices and triangles froZm the clipped mesh
-    #             if clipped_leaf_mesh.n_cells == 0:
-    #                 return None, None
-    #             if isinstance(clipped_leaf_mesh, pv.UnstructuredGrid):
-    #                 clipped_leaf_mesh = clipped_leaf_mesh.extract_geometry()
-    #             if not clipped_leaf_mesh.is_all_triangles:
-    #                 clipped_leaf_mesh = clipped_leaf_mesh.triangulate()
-
-    #             leaf_vertices = np.asarray(clipped_leaf_mesh.points)
-    #             leaf_faces = np.asarray(clipped_leaf_mesh.faces.reshape(-1, 4)[:, 1:])  # Reshape to get triangles
-
-    #             # Check if the wood mesh intersects with the voxel
-    #             wood_vertices = np.array([])
-    #             wood_faces = np.array([])
-    #             if wood_mesh is not None:
-    #                 clipped_wood_mesh = wood_mesh.clip_box(bounds=voxel.bounds, invert=False)
-                    
-    #                 if clipped_wood_mesh.n_cells > 0:
-    #                     if isinstance(clipped_wood_mesh, pv.UnstructuredGrid):
-    #                         clipped_wood_mesh = clipped_wood_mesh.extract_geometry()
-    #                     if not clipped_wood_mesh.is_all_triangles:
-    #                         clipped_wood_mesh = clipped_wood_mesh.triangulate()
-
-    #                     wood_vertices = np.asarray(clipped_wood_mesh.points)
-    #                     wood_faces = np.asarray(clipped_wood_mesh.faces.reshape(-1, 4)[:, 1:])
-    #                 else:
-    #                     wood_vertices = np.array([])
-    #                     wood_faces = np.array([])
-
-    #             # Save vertice and face to npz
-    #             npz_basename = f"{voxel_id}.npz"
-    #             npz_file = f"{os.path.join(npz_path, npz_basename)}"
-    #             # np.savez_compressed(npz_file, leaf_vertices=leaf_vertices, leaf_faces=leaf_faces, wood_vertices=wood_vertices, wood_faces=wood_faces)
-
-    #             # Return information for the dictionary
-    #             center = center + voxel_size / 2.0  # Adjust center to be the center of the voxel
-    #             return voxel_id, center, leaf_vertices, leaf_faces, wood_vertices, wood_faces, npz_file
-            
-    #         else:
-    #             # If no leaf mesh intersects, skip this voxel
-    #             print(f"Voxel at {center} does not intersect with leaf mesh. Skipping.\n")
-    #             return None, None, None, None, None, None, None
-
-    #     # Use ThreadPoolExecutor for IO-bound or ProcessPoolExecutor for CPU-bound
-    #     with concurrent.futures.ThreadPoolExecutor() as executor:
-    #         futures = {executor.submit(process_voxel, center): i for i, center in enumerate(centers)}
-
-    #         with tqdm(total=len(centers), desc="Processing voxels", unit="voxel") as pbar:
-    #             for future in concurrent.futures.as_completed(futures):
-    #                 pbar.update(1)
-        
-    #     for future in futures:
-    #         voxel_id, center, leaf_vertices, leaf_faces, wood_vertices, wood_faces, npz_file = future.result()
-    #         if voxel_id is not None:
-    #             np.savez_compressed(npz_file,
-    #                                 leaf_vertices=leaf_vertices,
-    #                                 leaf_faces=leaf_faces,
-    #                                 wood_vertices=wood_vertices,
-    #                                 wood_faces=wood_faces)
-    #             valid_voxels[voxel_id] = {
-    #                 'center': center,
-    #                 'data': npz_file
-    #             }
-    
-    # else:
-    #     # If no leaf_mesh is provided, return None
-    #     print("No leaf mesh provided. Returning empty valid_voxels.")
-
-    # return valid_voxels
-
-    # return centers
-
 def split_into_batches(centers, batch_size):
     """
     Split valid_voxels (dictionary) into batches of a given size.
@@ -269,7 +156,7 @@ def split_into_batches(centers, batch_size):
     batches = [centers[i:i + batch_size] for i in range(0, len(centers), batch_size)]
     return batches
 
-def write_csv(csv_path, scene_file, wood_volume_file, voxel_sizes, ray_spacing, cross_section_area, batch_size, angles, leaf_keys=["leaf"], wood_keys=["wood"]):
+def write_csv(csv_path, scene_file, wood_volume_file, voxel_sizes, ray_spacing, cross_section_area, available_cpus, array_batch_size, angles, leaf_keys=["leaf"], wood_keys=["wood"]):
     """
     Write voxel batch metadata to a CSV file.
     """
@@ -284,6 +171,12 @@ def write_csv(csv_path, scene_file, wood_volume_file, voxel_sizes, ray_spacing, 
         'wood_mesh_file': wood_mesh_file,
         'wood_volume_file': wood_volume_file if wood_volume_file else "",
     }
+
+    memory_per_cpu = 5 # Tune this value based on your system's memory usage per CPU
+    max_cpu_batches = max(1, int((16384/array_batch_size) // (available_cpus * memory_per_cpu)))  # Maximum memory per CPU in GB
+    voxel_batch_size = max_cpu_batches * available_cpus  # Total batch size based on available CPUs and memory 
+    min_mem_req = voxel_batch_size * memory_per_cpu  # Estimate memory requirement in GB
+
     
     with open(csv_path, 'w', newline='') as csvfile:
         fieldnames = ['files', 'voxel_size', 'lambda_1', 'ray_spacing', 'voxel_ids', 'voxel_centers', 'angles']
@@ -292,19 +185,14 @@ def write_csv(csv_path, scene_file, wood_volume_file, voxel_sizes, ray_spacing, 
 
         for voxel_size in voxel_sizes:
             print(f"Initialising voxel size: {voxel_size}m")
-            npz_path = os.path.join(os.path.dirname(scene_file), "npz_files")
-            if not os.path.exists(npz_path):
-                os.makedirs(npz_path, exist_ok=True)
-            # valid_voxels = generate_voxel_centers(bounds, voxel_size, npz_path, leaf_mesh, wood_mesh)
-            voxel_centers, voxel_idxs = generate_voxel_centers(bounds, voxel_size, npz_path, leaf_mesh, wood_mesh)
+
+            voxel_centers, voxel_idxs = generate_voxel_centers(voxel_size, leaf_mesh, wood_mesh)
             print(f"Generated {len(voxel_centers)} valid voxel centers for voxel size {voxel_size}m.")
-            # if not centers:
-            #     print(f"No valid voxels found for voxel size {voxel_size}m. Skipping this voxel size.")
-            #     continue
-            voxel_centers_batches = [voxel_centers[i:i + batch_size] for i in range(0, len(voxel_centers), batch_size)]
-            voxel_ids_batches = [voxel_idxs[i:i + batch_size] for i in range(0, len(voxel_idxs), batch_size)]
-            print(f"Split voxel centers into {len(voxel_centers_batches)} batches of size {batch_size}.")
-            print(f"Split voxel IDs into {len(voxel_ids_batches)} batches of size {batch_size}.")
+            
+            voxel_centers_batches = [voxel_centers[i:i + voxel_batch_size] for i in range(0, len(voxel_centers), voxel_batch_size)]
+            voxel_ids_batches = [voxel_idxs[i:i + voxel_batch_size] for i in range(0, len(voxel_idxs), voxel_batch_size)]
+            print(f"Split voxel centers into {len(voxel_centers_batches)} batches of size {voxel_batch_size}.")
+            print(f"Split voxel IDs into {len(voxel_ids_batches)} batches of size {voxel_batch_size}.")
 
             lambda_1 = cross_section_area / (voxel_size ** 3)
 
@@ -317,30 +205,14 @@ def write_csv(csv_path, scene_file, wood_volume_file, voxel_sizes, ray_spacing, 
                     'ray_spacing': ray_spacing,
                     'voxel_ids': json.dumps(id_batch.tolist()),  # Convert IDs to list for JSON serialization
                     'voxel_centers': json.dumps(center_batch.tolist()),  # Convert centers to list for JSON serialization
-                    'angles': json.dumps([angle for angle in angles if angle >= 0.0 and angle <= 90.0])  # Filter angles
+                    'angles': json.dumps(angles)  
                 })
-
-
-                # Convert batch centers to numpy array for JSON serialization
-                # batch_voxel_id = np.array(list(batch.keys()))
-                # batch_centers = np.array([v['center'] for v in batch.values()])
-                # batch_data = np.array([v['data'] for v in batch.values()])
-                # angles = [angle for angle in angles if angle >= 0.0 and angle <= 90.0]
-
-                # # Write each batch to the CSV file
-                # writer.writerow({
-                #     'voxel_id': json.dumps(batch_voxel_id.tolist()),
-                #     'voxel_size': voxel_size,
-                #     'lambda_1': lambda_1,
-                #     'ray_spacing': ray_spacing,
-                #     'voxel_centers': json.dumps(batch_centers.tolist()),
-                #     'angles': json.dumps(angles),
-                #     'data': json.dumps(batch_data.tolist())
-                # })
             print(f"Wrote {len(voxel_centers_batches)} batches for voxel size {voxel_size}m to CSV.")
 
+    return min_mem_req
 
-def write_slurm_header(log_path, slurm_script_name, available_cpus, available_memory, time_per_batch, conda_env, num_batches=100):
+
+def write_slurm_header(log_path, slurm_script_name, available_cpus, min_req_mem, time_per_batch, container_path, num_batches=100):
     """
     Write the SLURM header for the job script.
     """
@@ -357,7 +229,7 @@ def write_slurm_header(log_path, slurm_script_name, available_cpus, available_me
 #SBATCH --job-name={slurm_script_name}
 #SBATCH --output={os.path.join(log_path, f'{slurm_script_name}.out')}
 #SBATCH --error={os.path.join(log_path, f'{slurm_script_name}.err')}
-#SBATCH --mem={available_memory}G
+#SBATCH --mem={min_req_mem}G
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task={available_cpus}
 #SBATCH --time={time_string}
@@ -365,16 +237,17 @@ def write_slurm_header(log_path, slurm_script_name, available_cpus, available_me
 #SBATCH --account=a_l2l
 #SBATCH --array=0-{num_batches-1}
 
-# Load necessary modules
-module load miniconda3
-source $EBROOTMINICONDA3/etc/profile.d/conda.sh
-conda activate {conda_env}
-
 """
+    
+    ###OLD###
+    ## Load necessary modules
+# module load miniconda3
+# source $EBROOTMINICONDA3/etc/profile.d/conda.sh
+# conda activate {container_path}
 
     return slurm_header
 
-def write_slurm_scripts(csv_path, process_path, available_cpus, available_memory, time_per_batch, conda_env, batch_size):
+def write_slurm_scripts(csv_path, process_path, available_cpus, min_req_mem, time_per_batch, container_path, batch_size):
     """
     Write SLURM scripts for each batch in the CSV file.
     """
@@ -402,10 +275,12 @@ def write_slurm_scripts(csv_path, process_path, available_cpus, available_memory
             with open(slurm_script_path, 'w') as slurm_file:
                 num_batches = len(batch)
                 slurm_script_name = f"{project_name}_batch_{batch_index}"
-                slurm_file.write(write_slurm_header(log_path, slurm_script_name, available_cpus, available_memory, time_per_batch, conda_env, num_batches))
+                slurm_file.write(write_slurm_header(log_path, slurm_script_name, available_cpus, min_req_mem, time_per_batch, container_path, num_batches))
 
                 start_index = batch_index * batch_size
-                slurm_file.write(f"python {process_path} {csv_path} --index $(({start_index} + $SLURM_ARRAY_TASK_ID)) --log_file {os.path.join(log_path, str(start_index))}_$SLURM_ARRAY_TASK_ID.log\n")
+                ### OLD ###
+                # slurm_file.write(f"python {process_path} {csv_path} --index $(({start_index} + $SLURM_ARRAY_TASK_ID)) --log_file {os.path.join(log_path, str(start_index))}_$SLURM_ARRAY_TASK_ID.log\n")
+                slurm_file.write(f"apptainer exec {container_path} python {process_path} {csv_path} --index $(({start_index} + $SLURM_ARRAY_TASK_ID)) --log_file {os.path.join(log_path, str(start_index))}_$SLURM_ARRAY_TASK_ID.log\n")
 
             slurm_scripts.append(slurm_script_path)
 
@@ -467,36 +342,20 @@ def submit_slurm_scripts(slurm_scripts, time_per_voxel_min):
 
 
 
-def main(scene_file, wood_volume_file, voxel_sizes, ray_spacing, cross_section_area, available_cpus, available_memory, time_per_voxel, csv_path, slurm_path, angles, leaf_keys, wood_keys, conda_env):
+def main(scene_file, wood_volume_file, voxel_sizes, ray_spacing, cross_section_area, available_cpus, available_memory, time_per_voxel, csv_path, slurm_path, angles, leaf_keys, wood_keys, container_path):
     """
     Main function to generate the voxel batch CSV.
     """
-    # Calculate maximum batch size based on available memory
-    per_voxel_memory = 0.0025  # Example memory usage per voxel in GB
-    # Calculate batch size so that total resource usage across all batches does not exceed 1536 CPUs and 16T RAM
     max_total_cpus = 1536
-    max_total_mem_gb = 16384  # 16T in GB
-
-    # Calculate the maximum number of batches that can run in parallel given available_cpus and available_memory
-    max_batches_by_cpu = max_total_cpus // available_cpus
-    max_batches_by_mem = max_total_mem_gb // available_memory
-    max_parallel_batches = min(max_batches_by_cpu, max_batches_by_mem)
-    print(f"Maximum parallel batches based on available resources: {max_parallel_batches}.")
-
-    # Calculate batch size per job so that total memory used by all parallel jobs does not exceed 16T
-    # Each batch will use batch_size * per_voxel_memory GB
-    batch_size = min(1000, max_parallel_batches, int((max_total_mem_gb / max_parallel_batches) / per_voxel_memory))
-    if batch_size <= 0:
-        raise ValueError("Available memory is too low to process any voxel batches.")
-    print(f"Calculated batch size for processing: {batch_size} voxels per batch.")
+    array_batch_size = min(1000, max_total_cpus // available_cpus)
 
     # Calculate estimated time per batch (minutes)
-    time_per_batch = int(math.ceil((time_per_voxel * batch_size) / 60))
+    time_per_batch = int(math.ceil((time_per_voxel * array_batch_size) / 60))
     print(f"Estimated time per batch: {time_per_batch}.")
     
     # Write the CSV file for indexed process batches
-    print(f"Writing CSV to {csv_path} with batch size {batch_size}.")
-    write_csv(csv_path, scene_file, wood_volume_file, voxel_sizes, ray_spacing, cross_section_area, batch_size, angles, leaf_keys, wood_keys)
+    print(f"Writing CSV to {csv_path} with batch size {array_batch_size}.")
+    min_req_mem = write_csv(csv_path, scene_file, wood_volume_file, voxel_sizes, ray_spacing, cross_section_area, available_cpus, array_batch_size, angles, leaf_keys, wood_keys)
 
     # Check csv was created
     if not os.path.exists(csv_path):
@@ -509,7 +368,7 @@ def main(scene_file, wood_volume_file, voxel_sizes, ray_spacing, cross_section_a
     
     # Write the slurm scripts
     print(f"Writing SLURM scripts to {slurm_path} for processing voxel batches.")
-    slurm_scripts = write_slurm_scripts(csv_path, process_path, available_cpus, available_memory, time_per_batch, conda_env, batch_size)
+    slurm_scripts = write_slurm_scripts(csv_path, process_path, available_cpus, min_req_mem, time_per_batch, container_path, array_batch_size)
     print(f"{len(slurm_scripts)} SLURM scripts created in {slurm_path} for processing voxel batches.")
 
     # Create the controller script to submit all SLURM scripts
@@ -537,7 +396,7 @@ if __name__ == "__main__":
     parser.add_argument("--angles", type=float, nargs="+", default=[0.000001, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0,  89.999999], help="List of angles for processing")
     parser.add_argument("--leaf_keys", type=str, nargs="+", default=["leaf", "leaves"], help="List of leaf mesh keys to identify in the scene file.")
     parser.add_argument("--wood_keys", type=str, nargs="+", default=["wood", "bark", "stem", "trunk"], help="List of wood mesh keys to identify in the scene file.")
-    parser.add_argument("--conda_env", type=str, default="base", help="Conda environment to activate for processing.")
+    parser.add_argument("--container_path", type=str, default="base", help="Conda environment to activate for processing.")
 
     args = parser.parse_args()
 
@@ -552,12 +411,17 @@ if __name__ == "__main__":
     angles = args.angles
     leaf_keys = args.leaf_keys
     wood_keys = args.wood_keys
-    conda_env = args.conda_env
+    container_path = args.container_path
     
     # Derive csv path from scene file
     slurm_path = os.path.join(os.path.dirname(scene_file), "slurm_scripts")
     if not os.path.exists(slurm_path):
         os.makedirs(slurm_path, exist_ok=True)
+    else:
+        # Remove existing slurm scripts if they exist
+        for file in os.listdir(slurm_path):
+            if file.endswith(".sh"):
+                os.remove(os.path.join(slurm_path, file))
     csv_path = os.path.join(slurm_path, f"{os.path.basename(scene_file)}_voxel_batches.csv")
 
     # Check scene_file exists
@@ -573,4 +437,4 @@ if __name__ == "__main__":
         os.remove(csv_path)
 
     print(f"Generating voxel batch CSV at {csv_path} with voxel sizes {voxel_sizes}, ray spacing {ray_spacing}, and cross section area {cross_section_area}.")
-    main(scene_file, wood_volume_file, voxel_sizes, ray_spacing, cross_section_area, available_cpus, available_memory, time_per_voxel, csv_path, slurm_path, angles, leaf_keys, wood_keys, conda_env)
+    main(scene_file, wood_volume_file, voxel_sizes, ray_spacing, cross_section_area, available_cpus, available_memory, time_per_voxel, csv_path, slurm_path, angles, leaf_keys, wood_keys, container_path)

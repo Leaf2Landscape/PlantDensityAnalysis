@@ -1,30 +1,40 @@
 import os
 import csv
-import glob
 import argparse
 import json
 import math
 import pandas as pd
 import numpy as np
-import pyvista as pv
 import traceback
 import open3d as o3d
 import open3d.core as o3c
 import datetime as dt
-from typing import List, Tuple, Union, Optional
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import Pool, Lock
+from typing import Optional
 import sys
 from tqdm import tqdm
 import psutil
 import gc
-from scipy.spatial import cKDTree
 from functools import partial 
-from multiprocessing.shared_memory import SharedMemory
 import joblib
 from joblib import Parallel, delayed, Memory
 import trimesh
 import contextlib
+import subprocess
+import pyvista as pv
+
+def get_memory_usage():
+    job_id = os.getenv('SLURM_JOB_ID', 'local')
+    try:
+        result = subprocess.run([
+            'scontrol', 'show', 'job', job_id
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        output = result.stdout.decode()
+        for line in output.split('\n'):
+            if 'maxRSS' in line:
+                print(f"Slurm... Used memory: {line}")
+    except Exception as e:
+        used_memory = psutil.virtual_memory().used / (1024 ** 2)  # Convert to MB
+        print(f"Not Slurm... Used memory: {used_memory:.2f} MB")
 
 @contextlib.contextmanager
 def tqdm_joblib(tqdm_object):
@@ -44,8 +54,12 @@ def tqdm_joblib(tqdm_object):
     finally:
         joblib.parallel.BatchCompletionCallBack = old_callback
         tqdm_object.close()
-    
-memory = Memory(location='cache_dir', verbose=1)
+
+temp_dir = os.getenv('TMPDIR', 'tmp')
+# temp_dir = "/scratch/project/veg3d/uqjrivor/Raja_Tumba_Test/tmp"
+if not os.path.exists(temp_dir):
+    os.makedirs(temp_dir, exist_ok=True)
+memory = Memory(location=temp_dir, verbose=1)
 
 @memory.cache
 def load_mesh_trimesh(file_path: str) -> Optional[trimesh.Trimesh]:
@@ -63,6 +77,15 @@ def load_mesh_trimesh(file_path: str) -> Optional[trimesh.Trimesh]:
         print(f"Error loading mesh from {file_path}: {e}")
         return None
     
+def _faces_to_poly(vertices, faces):
+    """Convert trimesh faces to a format compatible with PyVista.
+    """
+    if not faces:
+        return None
+    faces_arr = np.asarray(faces, dtype=np.int64)
+    n_per_face = np.full((faces_arr.shape[0], 1), faces_arr.shape[1], np.int64)
+    faces_flat = np.hstack([n_per_face, faces_arr])
+    return pv.PolyData(vertices, faces_flat)
 
 def get_clipped_meshes(
         leaf_mesh_path,
@@ -73,6 +96,7 @@ def get_clipped_meshes(
     Roughly clip a mesh using a bounding box defined by the voxel center and size.
     This function uses a KDTree for efficient point querying.
     """
+    # get_memory_usage()
     leaf_mesh = load_mesh_trimesh(leaf_mesh_path)
     leaf_tree = leaf_mesh.triangles_tree
 
@@ -88,47 +112,83 @@ def get_clipped_meshes(
         del leaf_mesh, leaf_tree
         gc.collect()
         return voxel_center, None, None, None, None
-    
+    # get_memory_usage()
     # Extract triangles within the voxel bounds
     sub_mesh = leaf_mesh.submesh([candidate_triangle_indices], append=True)
     del leaf_mesh, leaf_tree
 
-    # Convert trimesh to Open3D mesh
-    o3d_sub_mesh = o3d.geometry.TriangleMesh()
-    o3d_sub_mesh.vertices = o3d.utility.Vector3dVector(sub_mesh.vertices)
-    o3d_sub_mesh.triangles = o3d.utility.Vector3iVector(sub_mesh.faces)
-    o3d_sub_mesh.compute_vertex_normals()
+    ### NEW CODE ###
+    # This code uses pyvista's clip_box function to clip the mesh.
 
-    # Define the voxel bounding box for cropping
-    aabb = o3d.geometry.AxisAlignedBoundingBox(min_bound, max_bound)
-    clipped_leaf_mesh = o3d_sub_mesh.crop(aabb)
+    # Create a PyVista mesh from the trimesh submesh
+    sub_mesh = pv.wrap(sub_mesh)
+    voxel = pv.Cube(center=voxel_center, x_length=voxel_size, y_length=voxel_size, z_length=voxel_size)
+    clipped_leaf_mesh = sub_mesh.clip_box(voxel, invert=False)
 
-    clipped_leaf_vertices = np.asarray(clipped_leaf_mesh.vertices)
-    clipped_leaf_faces = np.asarray(clipped_leaf_mesh.triangles)
-
-    del o3d_sub_mesh, sub_mesh, clipped_leaf_mesh
+    if isinstance(clipped_leaf_mesh, pv.UnstructuredGrid):
+        clipped_leaf_mesh = clipped_leaf_mesh.extract_geometry()
+    if not clipped_leaf_mesh.is_all_triangles:
+        clipped_leaf_mesh = clipped_leaf_mesh.triangulate()
+    clipped_leaf_vertices = np.asarray(clipped_leaf_mesh.points)
+    clipped_leaf_faces = np.asarray(clipped_leaf_mesh.faces.reshape((-1, 4))[:, 1:])
+    if clipped_leaf_faces.size == 0:
+        print(f"No valid mesh found after clipping for voxel at {voxel_center}.")
+        del sub_mesh, clipped_leaf_mesh
+        gc.collect()
+        return voxel_center, None, None, None, None
     
-    # If wood mesh is provided, clip it similarly
-    wood_mesh = load_mesh_trimesh(wood_mesh_path) if wood_mesh_path else None
+    ### DEBUG ####
+    # Save .ply files for debugging
+    project_dir = os.path.dirname(leaf_mesh_path)
+    surface_area = clipped_leaf_mesh.area if hasattr(clipped_leaf_mesh, 'area') else 0.0
+    debug_leaf_path = os.path.join(project_dir, f"clipped_leaf_{voxel_center[0]:.2f}_{voxel_center[1]:.2f}_{voxel_center[2]:.2f}_{surface_area}.ply")
+    debug_wood_path = os.path.join(project_dir, f"clipped_wood_{voxel_center[0]:.2f}_{voxel_center[1]:.2f}_{voxel_center[2]:.2f}.ply")
+    clipped_leaf_mesh.save(debug_leaf_path)
+    
+    del sub_mesh, clipped_leaf_mesh
 
-    if wood_mesh is None:
+    wood_mesh = load_mesh_trimesh(wood_mesh_path) if wood_mesh_path else None
+    # get_memory_usage()
+    if wood_mesh is None:   
         gc.collect()
         return voxel_center, clipped_leaf_vertices, clipped_leaf_faces, None, None
     
+    ### NEW CODE ###
+    # Create a PyVista mesh from the wood mesh
+    wood_mesh = pv.wrap(wood_mesh)
+    clipped_wood_mesh = wood_mesh.clip_box(voxel, invert=False)
+
+    if isinstance(clipped_wood_mesh, pv.UnstructuredGrid):
+        clipped_wood_mesh = clipped_wood_mesh.extract_geometry()
+    if not clipped_wood_mesh.is_all_triangles:
+        clipped_wood_mesh = clipped_wood_mesh.triangulate()
+    clipped_wood_vertices = np.asarray(clipped_wood_mesh.points)
+    clipped_wood_faces = np.asarray(clipped_wood_mesh.faces.reshape((-1, 4))[:, 1:])
+    if clipped_leaf_faces.size == 0:
+        print(f"No valid wood mesh found after clipping for voxel at {voxel_center}.")
+        del sub_mesh, clipped_leaf_mesh
+        gc.collect()
+        return voxel_center, clipped_leaf_vertices, clipped_leaf_faces, None, None
+
+    del wood_mesh, clipped_wood_mesh, voxel
+    
+    ### OLD CODE ###
+    # See above.
+
     # Convert to open3d
-    o3d_wood_mesh = o3d.geometry.TriangleMesh()
-    o3d_wood_mesh.vertices = o3d.utility.Vector3dVector(wood_mesh.vertices)
-    o3d_wood_mesh.triangles = o3d.utility.Vector3iVector(wood_mesh.faces)
-    o3d_wood_mesh.compute_vertex_normals()
-    del wood_mesh
+    # o3d_wood_mesh = o3d.geometry.TriangleMesh()
+    # o3d_wood_mesh.vertices = o3d.utility.Vector3dVector(wood_mesh.vertices)
+    # o3d_wood_mesh.triangles = o3d.utility.Vector3iVector(wood_mesh.faces)
+    # o3d_wood_mesh.compute_vertex_normals()
+    # del wood_mesh
 
-    # Clip the wood mesh using the same voxel bounding box
-    clipped_wood_mesh = o3d_wood_mesh.crop(aabb)
+    # # Clip the wood mesh using the same voxel bounding box
+    # clipped_wood_mesh = o3d_wood_mesh.crop(aabb)
 
-    clipped_wood_vertices = np.asarray(clipped_wood_mesh.vertices)
-    clipped_wood_faces = np.asarray(clipped_wood_mesh.triangles)
-
-    del clipped_wood_mesh, o3d_wood_mesh
+    # clipped_wood_vertices = np.asarray(clipped_wood_mesh.vertices)
+    # clipped_wood_faces = np.asarray(clipped_wood_mesh.triangles)
+    # get_memory_usage()
+    # del clipped_wood_mesh, o3d_wood_mesh
     gc.collect()
     
     # Ensure the mesh is valid
@@ -811,11 +871,16 @@ if __name__ == "__main__":
             return [], []
     
     def parallel_process_voxels(voxel_centers, voxel_size, leaf_mesh_file, wood_mesh_file, ray_spacing, angles, wood_volume_file, lambda_1):
-        num_worker = max(1, psutil.cpu_count(logical=False))
+        num_worker = int(os.environ.get("SLURM_CPUS_PER_TASK", psutil.cpu_count(logical=False)))
+        num_worker = max(1, num_worker)
         # available_memory = psutil.virtual_memory().available
         # estimated_per_worker_mem = (os.path.getsize(leaf_mesh_file) + (os.path.getsize(wood_mesh_file))) * 4
         # num_worker = min(1, num_worker, available_memory // estimated_per_worker_mem)
         print(f"Using {num_worker} workers for processing voxels.")
+
+        # Load mesh into cache once, to avoid race conditions
+        leaf_mesh = load_mesh_trimesh(leaf_mesh_file)
+        wood_mesh = load_mesh_trimesh(wood_mesh_file)
 
         # Calculate the grid to pass to worker function
         grid = _grid(voxel_size * 2, ray_spacing)
@@ -881,6 +946,9 @@ if __name__ == "__main__":
         for i, (voxel_center, leaf_mesh, wood_mesh) in enumerate(tqdm(zip(voxel_centers, clipped_leaf_meshes, clipped_wood_meshes), total=len(voxel_centers), desc="Processing voxels", unit="voxel")):
             result, _ = worker(voxel_center, leaf_mesh, wood_mesh)
             df = pd.DataFrame(result)
+            mesh_surface_area = leaf_mesh.get_surface_area() if leaf_mesh else 0.0
+            LAI = (df['LAI_Leaf'].mean()/voxel_size) if not df.empty else 0.0
+            print(f"Voxel {i+1}/{len(voxel_centers)}: Center {voxel_center}, Surface Area: {mesh_surface_area:.2f}, LAI: {LAI:.2f}")
             results.append(df)
 
         total_time = dt.datetime.now() - start
@@ -900,7 +968,7 @@ if __name__ == "__main__":
     df = pd.concat(results, ignore_index=True)
     preliminary_output_path = os.path.join(os.path.dirname(csv_path), "preliminary_results")
     os.makedirs(preliminary_output_path, exist_ok=True)
-    output_csv = os.path.join(preliminary_output_path, f"processed_voxel_batch_{index}.csv")
+    output_csv = os.path.join(preliminary_output_path, f"results_batch_{index}_vs_{voxel_size}.csv")
     df.to_csv(output_csv, index=False)
 
     # Save time outputs
@@ -912,7 +980,7 @@ if __name__ == "__main__":
         'total_time': total_time.total_seconds(),
         's/voxel': raytrace_time.total_seconds() / len(voxel_centers) if len(voxel_centers) > 0 else 0.0,
     }
-    time_output_csv = os.path.join(preliminary_output_path, f"processing_times_{index}.csv")
+    time_output_csv = os.path.join(preliminary_output_path, f"processing_times_{index}_vs_{voxel_size}.csv")
     pd.DataFrame([time_output]).to_csv(time_output_csv, index=False)
     sys.stdout = original_stdout  # Reset stdout to original
 

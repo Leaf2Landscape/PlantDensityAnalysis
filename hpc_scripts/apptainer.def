@@ -1,0 +1,25 @@
+Bootstrap: docker
+From: debian:bullseye-slim
+
+%environment
+    export MAMBA_ROOT_PREFIX=/opt/micromamba
+    export PATH=/opt/micromamba/envs/plantdensityanalysis_env/bin:/opt/micromamba/bin:$PATH
+    export CONDA_DEFAULT_ENV=plantdensityanalysis_env
+
+
+%post
+    apt-get update && apt-get install -y curl bzip2 ca-certificates libglib2.0-0 libxext6 libsm6 libxrender1 git
+    curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba
+    mkdir -p /opt/micromamba/bin
+    mv bin/micromamba /opt/micromamba/bin/micromamba
+    chmod +x /opt/micromamba/bin/micromamba
+    export MAMBA_ROOT_PREFIX=/opt/micromamba
+    /opt/micromamba/bin/micromamba create -y --name plantdensityanalysis_env --file "/hpc_environment.yml"
+    /opt/micromamba/bin/micromamba clean -a -y
+    /opt/micromamba/bin/micromamba run -n plantdensityanalysis_env pip install manifold3d
+
+%files
+    hpc_environment.yml
+
+%runscript
+    exec "$@"
