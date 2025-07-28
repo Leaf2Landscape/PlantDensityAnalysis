@@ -179,6 +179,51 @@ voxel_metrics_schema = pa.schema([
     pa.field('sum_eff_free_path_length_hit_leaf', pa.float64()) # Sum of z for leaf hits only    
 ])
 
+# Occlusion metrics schema
+"""
+This schema is used to store the occlusion metrics for each voxel.
+
+TEST ONLY at this stage.
+"""
+
+# Create occlusion metrics dataframe
+voxel_occ_schema = pa.schema([
+    pa.field('voxel_id', pa.uint32()),
+    pa.field('voxel_cx', pa.float32()),
+    pa.field('voxel_cy', pa.float32()),
+    pa.field('voxel_cz', pa.float32()),
+    pa.field('theoretical_volume', pa.float64()),
+    pa.field('actual_volume', pa.float64()),
+    pa.field('volume_coverage', pa.float64()),
+    pa.field('weighted_theoretical_volume', pa.float64()),
+    pa.field('weighted_actual_volume', pa.float64()),
+    pa.field('weighted_volume_coverage', pa.float64()),
+    pa.field('theoretical_coverage_west', pa.float64()),
+    pa.field('theoretical_coverage_east', pa.float64()),
+    pa.field('theoretical_coverage_south', pa.float64()),
+    pa.field('theoretical_coverage_north', pa.float64()),
+    pa.field('theoretical_coverage_bottom', pa.float64()),
+    pa.field('theoretical_coverage_top', pa.float64()),
+    pa.field('actual_coverage_west', pa.float64()),
+    pa.field('actual_coverage_east', pa.float64()),
+    pa.field('actual_coverage_south', pa.float64()),
+    pa.field('actual_coverage_north', pa.float64()),
+    pa.field('actual_coverage_bottom', pa.float64()),
+    pa.field('actual_coverage_top', pa.float64()),
+    pa.field('weighted_theoretical_coverage_west', pa.float64()),
+    pa.field('weighted_theoretical_coverage_east', pa.float64()),
+    pa.field('weighted_theoretical_coverage_south', pa.float64()),
+    pa.field('weighted_theoretical_coverage_north', pa.float64()),
+    pa.field('weighted_theoretical_coverage_bottom', pa.float64()),
+    pa.field('weighted_theoretical_coverage_top', pa.float64()),
+    pa.field('weighted_actual_coverage_west', pa.float64()),
+    pa.field('weighted_actual_coverage_east', pa.float64()),
+    pa.field('weighted_actual_coverage_south', pa.float64()),
+    pa.field('weighted_actual_coverage_north', pa.float64()),
+    pa.field('weighted_actual_coverage_bottom', pa.float64()),
+    pa.field('weighted_actual_coverage_top', pa.float64()),
+])
+
 # Reference Schema
 """
 This schema is used to store the reference data for each voxel.
@@ -1945,6 +1990,17 @@ def calculate_effective_path_length(path_lengths, lambda_1):
         )
     return effective_path_length
 
+# Calculate effective path lengths and free path lengths
+def calculate_effective_path_length(path_lengths, lambda_1):
+    with np.errstate(divide='ignore', invalid='ignore'):
+        mask = (lambda_1 * path_lengths) < 1
+        effective_path_length = np.where(
+            mask,
+            -np.log(1 - lambda_1 * path_lengths) / lambda_1,
+            np.nan
+        )
+    return effective_path_length
+
 def get_voxel_metrics(intersections_files, lambda_1, is_leaf_true=True, debug=True, epsilon=1e-9):
     """
     This function will take the voxel_ray_intersection files and calculate the metrics for each voxel.
@@ -2180,7 +2236,7 @@ def get_voxel_metrics(intersections_files, lambda_1, is_leaf_true=True, debug=Tr
         voxel_metrics_df = voxel_metrics_df.reset_index(drop=True)
     return voxel_metrics_df
 
-def calculate_occlusion_metrics(intersections_files, reference_file,  debug=True, epsilon=1e-9):
+def calculate_occlusion_metrics(intersections_files, reference_file, max_beam_distance=50, heat_map_resolution=0.01, debug=True, epsilon=1e-9):
     """
     This function will take the voxel_ray_intersection files and calculate the occlusion metrics for each voxel and group of points
     It will return a dataframe for voxel information:
@@ -2192,7 +2248,6 @@ def calculate_occlusion_metrics(intersections_files, reference_file,  debug=True
         - Number of rays from each direction (i.e. North, South, East, West, Up, Down)
         This can be used to create a .laz file which includes extra classification information that demonstrates the points exploration metrics.
         """
-
     from sklearn.neighbors import NearestNeighbors
     
     dfs = []
@@ -2210,76 +2265,383 @@ def calculate_occlusion_metrics(intersections_files, reference_file,  debug=True
 
     # Retrieve reference information for voxel boundaries
     reference_df = pd.read_csv(reference_file, index_col=None, header=0)
-    reference_df = reference_df[['voxel_id', 'voxel_cx', 'voxel_cy', 'voxel_cz', 'voxel_size']]
+    reference_df = reference_df[['voxel_id', 'voxel_cx', 'voxel_cy', 'voxel_cz']]
     reference_df = reference_df.drop_duplicates()
     reference_df = reference_df.set_index('voxel_id')
-    
-    voxel_mins = reference_df[['voxel_cx', 'voxel_cy', 'voxel_cz']].values - (reference_df['voxel_size'].values / 2)
-    voxel_maxs = reference_df[['voxel_cx', 'voxel_cy', 'voxel_cz']].values + (reference_df['voxel_size'].values / 2)
 
-    def get_occlusion_per_voxel(voxel_df, voxel_min, voxel_max, epsilon=1e-9):
+    # Merge the voxel intersections with the reference dataframe
+    voxel_intersections_df = voxel_intersections_df.merge(reference_df, left_on='voxel_id', right_index=True, how='left', suffixes=('', ''))
+
+    del reference_df
+    
+    def get_occlusion_per_voxel(voxel_df, epsilon=1e-9):
+
         # Calculate the planes which constitute each face of the voxel
-        voxel_planes = np.array([
-            [voxel_min[0], voxel_min[1], voxel_min[2]],
-            [voxel_max[0], voxel_min[1], voxel_min[2]],
-            [voxel_min[0], voxel_max[1], voxel_min[2]],
-            [voxel_max[0], voxel_max[1], voxel_min[2]],
-            [voxel_min[0], voxel_min[1], voxel_max[2]],
-            [voxel_max[0], voxel_min[1], voxel_max[2]],
-            [voxel_min[0], voxel_max[1], voxel_max[2]],
-            [voxel_max[0], voxel_max[1], voxel_max[2]]
-        ])
+        voxel_min = voxel_df[['voxel_cx', 'voxel_cy', 'voxel_cz']].values[0] - (voxel_df['voxel_size'].values[0] / 2)
+        voxel_max = voxel_df[['voxel_cx', 'voxel_cy', 'voxel_cz']].values[0] + (voxel_df['voxel_size'].values[0] / 2)
+
+        # Define the six planes of the voxel using min/max for each axis
+        # Each face is defined by a constant value on one axis
+        # Map voxel face keys to real-world directions (assuming z is up):
+        # x_min: West, x_max: East
+        # y_min: South, y_max: North
+        # z_min: Down, z_max: Up
+        voxel_faces = {
+            'west': voxel_min[0],   # x_min
+            'east': voxel_max[0],   # x_max
+            'south': voxel_min[1],  # y_min
+            'north': voxel_max[1],  # y_max
+            'bottom': voxel_min[2],   # z_min
+            'top': voxel_max[2]      # z_max
+        }
 
         points = voxel_df[['point_x', 'point_y', 'point_z']].values
 
         # Find which points land on each plane (plus tolerance)
-        point_planes = np.array([
-            np.abs(points[:, 0] - voxel_planes[0, 0]) < epsilon,
-            np.abs(points[:, 1] - voxel_planes[0, 1]) < epsilon,
-            np.abs(points[:, 2] - voxel_planes[0, 2]) < epsilon
-        ]).T
+        # point_planes = np.array([
+        #     np.abs(points[:, 0] - voxel_planes[0, 0]) < epsilon,
+        #     np.abs(points[:, 1] - voxel_planes[0, 1]) < epsilon,
+        #     np.abs(points[:, 2] - voxel_planes[0, 2]) < epsilon
+        # ]).T
 
         # Calculate the number of points on each plane
-        num_points_per_plane = np.sum(point_planes, axis=0)
+        # num_points_per_plane = np.sum(point_planes, axis=0)
 
         # Calculate the total volume coverage percentage
         total_volume = np.prod(voxel_max - voxel_min)
         entry_coords = voxel_df[['t_entry_x', 't_entry_y', 't_entry_z']].values
         exit_coords = voxel_df[['t_exit_x', 't_exit_y', 't_exit_z']].values
-        entry_radii = voxel_df[['t_entry_radii']].values
-        exit_radii = voxel_df[['t_exit_radii']].values
-        beam_volumes = ((1/3) * np.pi * np.linalg.norm(entry_coords - exit_coords, axis=1)) * (entry_radii ** 2 + entry_radii * exit_radii + exit_radii ** 2)
-        total_volume_coverage = np.sum(beam_volumes) / total_volume
+        entry_radii = voxel_df['t_entry_radius'].values
+        exit_radii = voxel_df['t_exit_radius'].values
 
-        # Calculate per point group (nearest neighbours) statistics
-        # Group points using nearest neighbors
-        def group_points_with_nearest_neighbors(points, radius=0.1):
-            """
-            Group points using nearest neighbors within a specified radius.
+        # Calculate the weight of each beam, based on the distance from t_entry to sensor origin
+        distance_to_exit = np.linalg.norm(exit_coords - entry_coords, axis=1)
+        denom = (exit_radii - entry_radii)
+        denom[denom == 0] = epsilon
+        distance_to_sensor = (entry_radii * distance_to_exit) / denom
 
-            Args:
-                points (numpy.ndarray): Array of points (N x 3).
-                radius (float): Radius for nearest neighbors.
+        # Weight beams linearly with max distance from sensor specified
+        beam_weights = np.clip(1 - (distance_to_sensor / max_beam_distance), 0, 1)
 
-            Returns:
-                numpy.ndarray: Array of group labels for each point.
-            """
-            if len(points) == 0:
-                return np.array([])
+        # Calculate the theoretical and actual beam volumes
+        def calculate_beam_volume(s_coords, e_coords, s_radii, e_radii):
+            distance_to_end = np.linalg.norm(s_coords - e_coords, axis=1)
+            beam_volumes = ((1/3) * np.pi * distance_to_end) * (s_radii ** 2 + s_radii * e_radii + e_radii ** 2)
+            return beam_volumes
+        # Theoretical beam volumes
+        theoretical_beam_volumes = calculate_beam_volume(entry_coords, exit_coords, entry_radii, exit_radii)
+        weighted_theoretical_beam_volumes = theoretical_beam_volumes * beam_weights
 
-            # Fit NearestNeighbors model
-            nbrs = NearestNeighbors(radius=radius).fit(points)
-            adjacency_matrix = nbrs.radius_neighbors_graph(points, mode='connectivity')
+        # Actual beam volumes
+        hit_mask = voxel_df['hit_ray'].values
+        points = voxel_df[['point_x', 'point_y', 'point_z']][hit_mask].values
+        valid_entry_coords = entry_coords[hit_mask]
+        valid_entry_radii = entry_radii[hit_mask]
+        valid_exit_radii = exit_radii[hit_mask]
+        actual_beam_volumes = theoretical_beam_volumes
 
-            _, group_labels = connected_components(adjacency_matrix, directed=False)
+        distance_to_point = np.linalg.norm(points - valid_entry_coords, axis=1)
+        valid_distance_to_exit = distance_to_exit[hit_mask]
+        radii_at_point = valid_entry_radii * ((valid_exit_radii - valid_entry_radii) / valid_distance_to_exit) * distance_to_point
+        actual_beam_volumes[hit_mask] = calculate_beam_volume(valid_entry_coords, points, valid_entry_radii, radii_at_point)
+        weighted_actual_beam_volumes = actual_beam_volumes * beam_weights
 
-            return group_labels
+        #### INSERT DESIRED OCCLUSION METRICS HERE ####
+        # At the moment, we'll just save the coverage volumes and work with the results
 
-        # Apply grouping to points
-        group_labels = group_points_with_nearest_neighbors(points)
+        # Calculate the heat map for each direction (i.e. face of the voxel intersected by t_entry)
+        voxel_size = voxel_df['voxel_size'].values[0]
+        bins_per_face = int(voxel_size / heat_map_resolution)
+        face_heatmaps = {
+            'west': np.zeros((bins_per_face, bins_per_face)),
+            'east': np.zeros((bins_per_face, bins_per_face)),
+            'south': np.zeros((bins_per_face, bins_per_face)),
+            'north': np.zeros((bins_per_face, bins_per_face)),
+            'bottom': np.zeros((bins_per_face, bins_per_face)),
+            'top': np.zeros((bins_per_face, bins_per_face))
+        }
+        weighted_face_heatmaps = face_heatmaps.copy()
 
-        # Add group labels to the dataframe
-        voxel_df['group_label'] = group_labels
+        plane_beam_theoretical_volumes = {
+            'west': 0,
+            'east': 0,
+            'south': 0,
+            'north': 0,
+            'bottom': 0,
+            'top': 0
+        }
+        plane_beam_actual_volumes = {
+            'west': 0,
+            'east': 0,
+            'south': 0,
+            'north': 0,
+            'bottom': 0,
+            'top': 0
+        }
+        plane_beam_weighted_theoretical_volumes = {
+            'west': 0,
+            'east': 0,
+            'south': 0,
+            'north': 0,
+            'bottom': 0,
+            'top': 0
+        }
+        plane_beam_weighted_actual_volumes = {
+            'west': 0,
+            'east': 0,
+            'south': 0,
+            'north': 0,
+            'bottom': 0,
+            'top': 0
+        }
+
+        for i in range(3):
+            # Get the points that intersect with the plane
+            for j in range(2):
+                if j == 0:
+                    face = voxel_faces[['west', 'south', 'bottom'][i]]
+                else:
+                    face = voxel_faces[['east', 'north', 'top'][i]]
+                plane_mask = np.isclose(entry_coords[:, i % 3], face, atol=epsilon)
+                hits = np.sum(plane_mask)
+                if np.sum(plane_mask) > 0:
+                    # Get the coordinates of the points on the plane
+                    plane_points = entry_coords[plane_mask]
+                    
+                    # Calculate the bin indices for each point
+                    # Use the two axes orthogonal to i for binning
+                    axes = [0, 1, 2]
+                    axes.remove(i)
+                    bin_indices_x = ((plane_points[:, axes[0]] - voxel_min[axes[0]]) / heat_map_resolution).astype(int)
+                    bin_indices_y = ((plane_points[:, axes[1]] - voxel_min[axes[1]]) / heat_map_resolution).astype(int)
+                    # Update the heatmap
+                    if j == 0:
+                        face_heatmaps[['west', 'south', 'bottom'][i]] += np.histogram2d(bin_indices_x, bin_indices_y, bins=bins_per_face)[0]
+                        weighted_face_heatmaps[['west', 'south', 'bottom'][i]] += np.histogram2d(bin_indices_x, bin_indices_y, bins=bins_per_face, weights=weighted_theoretical_beam_volumes[plane_mask])[0]
+                        plane_beam_theoretical_volumes[['west', 'south', 'bottom'][i]] = np.sum(theoretical_beam_volumes[plane_mask])
+                        plane_beam_actual_volumes[['west', 'south', 'bottom'][i]] = np.sum(actual_beam_volumes[plane_mask])
+                        plane_beam_weighted_theoretical_volumes[['west', 'south', 'bottom'][i]] = np.sum(weighted_theoretical_beam_volumes[plane_mask])
+                        plane_beam_weighted_actual_volumes[['west', 'south', 'bottom'][i]] = np.sum(weighted_actual_beam_volumes[plane_mask])
+                    else:
+                        face_heatmaps[['east', 'north', 'top'][i]] += np.histogram2d(bin_indices_x, bin_indices_y, bins=bins_per_face)[0]
+                        weighted_face_heatmaps[['east', 'north', 'top'][i]] += np.histogram2d(bin_indices_x, bin_indices_y, bins=bins_per_face, weights=weighted_theoretical_beam_volumes[plane_mask])[0]
+                        plane_beam_theoretical_volumes[['east', 'north', 'top'][i]] = np.sum(theoretical_beam_volumes[plane_mask])
+                        plane_beam_actual_volumes[['east', 'north', 'top'][i]] = np.sum(actual_beam_volumes[plane_mask])
+                        plane_beam_weighted_theoretical_volumes[['east', 'north', 'top'][i]] = np.sum(weighted_theoretical_beam_volumes[plane_mask])
+                        plane_beam_weighted_actual_volumes[['east', 'north', 'top'][i]] = np.sum(weighted_actual_beam_volumes[plane_mask])
+
+        # Calculate the volume coverages
+        theoretical_volume = np.sum(theoretical_beam_volumes)
+        actual_volume = np.sum(actual_beam_volumes)
+        volume_coverage = (actual_volume / theoretical_volume)
+        # Calculate the weighted volume coverages
+        weighted_theoretical_volume = np.sum(weighted_theoretical_beam_volumes)
+        weighted_actual_volume = np.sum(weighted_actual_beam_volumes)
+        weighted_volume_coverage = (weighted_actual_volume / weighted_theoretical_volume)
+
+        # Calculate the percentage of beam volume coverage for each direction
+        # Vectorized calculation of beam volume per plane
+        plane_beam_theoretical_volumes = np.array([
+            plane_beam_theoretical_volumes['west'],
+            plane_beam_theoretical_volumes['east'],
+            plane_beam_theoretical_volumes['south'],
+            plane_beam_theoretical_volumes['north'],
+            plane_beam_theoretical_volumes['bottom'],
+            plane_beam_theoretical_volumes['top']
+        ])
+        plane_beam_actual_volumes = np.array([
+            plane_beam_actual_volumes['west'],
+            plane_beam_actual_volumes['east'],
+            plane_beam_actual_volumes['south'],
+            plane_beam_actual_volumes['north'],
+            plane_beam_actual_volumes['bottom'],
+            plane_beam_actual_volumes['top']
+        ])
+        plane_beam_weighted_theoretical_volumes = np.array([
+            plane_beam_weighted_theoretical_volumes['west'],
+            plane_beam_weighted_theoretical_volumes['east'],
+            plane_beam_weighted_theoretical_volumes['south'],
+            plane_beam_weighted_theoretical_volumes['north'],
+            plane_beam_weighted_theoretical_volumes['bottom'],
+            plane_beam_weighted_theoretical_volumes['top']
+        ])
+        plane_beam_weighted_actual_volumes = np.array([
+            plane_beam_weighted_actual_volumes['west'],
+            plane_beam_weighted_actual_volumes['east'],
+            plane_beam_weighted_actual_volumes['south'],
+            plane_beam_weighted_actual_volumes['north'],
+            plane_beam_weighted_actual_volumes['bottom'],
+            plane_beam_weighted_actual_volumes['top']
+        ])
+
+        if theoretical_volume > 0:
+            theoretical_coverage_per_plane = (plane_beam_theoretical_volumes / theoretical_volume)
+        else:
+            theoretical_coverage_per_plane = np.zeros(6)
+
+        if actual_volume > 0:
+            actual_coverage_per_plane = (plane_beam_actual_volumes / actual_volume)
+        else:
+            actual_coverage_per_plane = np.zeros(6)
+
+        if weighted_theoretical_volume > 0:
+            weighted_theoretical_coverage_per_plane = (plane_beam_weighted_theoretical_volumes / weighted_theoretical_volume)
+        else:
+            weighted_theoretical_coverage_per_plane = np.zeros(6)
+
+        if weighted_actual_volume > 0:
+            weighted_actual_coverage_per_plane = (plane_beam_weighted_actual_volumes / weighted_actual_volume)
+        else:
+            weighted_actual_coverage_per_plane = np.zeros(6)
+
+        west_vertices = np.array([
+            # west face
+            [voxel_min[0], voxel_min[1], voxel_min[2]],
+            [voxel_min[0], voxel_min[1], voxel_max[2]],
+            [voxel_min[0], voxel_max[1], voxel_max[2]],
+            [voxel_min[0], voxel_max[1], voxel_min[2]]
+        ])
+        east_vertices = np.array([
+            # east face
+            [voxel_max[0], voxel_min[1], voxel_min[2]],
+            [voxel_max[0], voxel_min[1], voxel_max[2]],
+            [voxel_max[0], voxel_max[1], voxel_max[2]],
+            [voxel_max[0], voxel_max[1], voxel_min[2]]
+        ])
+        south_vertices = np.array([
+            # south face
+            [voxel_min[0], voxel_min[1], voxel_min[2]],
+            [voxel_min[0], voxel_min[1], voxel_max[2]],
+            [voxel_max[0], voxel_min[1], voxel_max[2]],
+            [voxel_max[0], voxel_min[1], voxel_min[2]]
+        ])
+        north_vertices = np.array([
+            # north face
+            [voxel_min[0], voxel_max[1], voxel_min[2]],
+            [voxel_min[0], voxel_max[1], voxel_max[2]],
+            [voxel_max[0], voxel_max[1], voxel_max[2]],
+            [voxel_max[0], voxel_max[1], voxel_min[2]]
+        ])
+        top_vertices = np.array([
+            [voxel_min[0], voxel_min[1], voxel_max[2]],
+            [voxel_min[0], voxel_max[1], voxel_max[2]],
+            [voxel_max[0], voxel_max[1], voxel_max[2]],
+            [voxel_max[0], voxel_min[1], voxel_max[2]]
+        ])
+        bottom_vertices = np.array([
+            [voxel_min[0], voxel_min[1], voxel_min[2]],
+            [voxel_min[0], voxel_max[1], voxel_min[2]],
+            [voxel_max[0], voxel_max[1], voxel_min[2]],
+            [voxel_max[0], voxel_min[1], voxel_min[2]]
+        ])
+
+        face_dict = {
+            'west': {
+                'vertices': west_vertices,
+                'heatmap': face_heatmaps['west'],
+                'weighted_heatmap': weighted_face_heatmaps['west']
+            },
+            'east': {
+                'vertices': east_vertices,
+                'heatmap': face_heatmaps['east'],
+                'weighted_heatmap': weighted_face_heatmaps['east']
+            },
+            'south': {
+                'vertices': south_vertices,
+                'heatmap': face_heatmaps['south'],
+                'weighted_heatmap': weighted_face_heatmaps['south']
+            },
+            'north': {
+                'vertices': north_vertices,
+                'heatmap': face_heatmaps['north'],
+                'weighted_heatmap': weighted_face_heatmaps['north']
+            },
+            'top': {
+                'vertices': top_vertices,
+                'heatmap': face_heatmaps['top'],
+                'weighted_heatmap': weighted_face_heatmaps['top']
+            },
+            'bottom': {
+                'vertices': bottom_vertices,
+                'heatmap': face_heatmaps['bottom'],
+                'weighted_heatmap': weighted_face_heatmaps['bottom']
+            }
+        }
+        
+        # Create occlusion metrics dataframe
+        voxel_id = voxel_df.name
+        voxel_cx = voxel_df['voxel_cx'].values[0]
+        voxel_cy = voxel_df['voxel_cy'].values[0]
+        voxel_cz = voxel_df['voxel_cz'].values[0]
+        data = {
+            'voxel_id': voxel_id,
+            'voxel_cx': voxel_cx,
+            'voxel_cy': voxel_cy,
+            'voxel_cz': voxel_cz,
+            'theoretical_volume': float(theoretical_volume),
+            'actual_volume': float(actual_volume),
+            'volume_coverage': float(volume_coverage),
+            'weighted_theoretical_volume': float(weighted_theoretical_volume),
+            'weighted_actual_volume': float(weighted_actual_volume),
+            'weighted_volume_coverage': float(weighted_volume_coverage),
+            'theoretical_coverage_west': float(theoretical_coverage_per_plane[0]),
+            'theoretical_coverage_east': float(theoretical_coverage_per_plane[1]),
+            'theoretical_coverage_south': float(theoretical_coverage_per_plane[2]),
+            'theoretical_coverage_north': float(theoretical_coverage_per_plane[3]),
+            'theoretical_coverage_bottom': float(theoretical_coverage_per_plane[4]),
+            'theoretical_coverage_top': float(theoretical_coverage_per_plane[5]),
+            'actual_coverage_west': float(actual_coverage_per_plane[0]),
+            'actual_coverage_east': float(actual_coverage_per_plane[1]),
+            'actual_coverage_south': float(actual_coverage_per_plane[2]),
+            'actual_coverage_north': float(actual_coverage_per_plane[3]),
+            'actual_coverage_bottom': float(actual_coverage_per_plane[4]),
+            'actual_coverage_top': float(actual_coverage_per_plane[5]),
+            'weighted_theoretical_coverage_west': float(weighted_theoretical_coverage_per_plane[0]),
+            'weighted_theoretical_coverage_east': float(weighted_theoretical_coverage_per_plane[1]),
+            'weighted_theoretical_coverage_south': float(weighted_theoretical_coverage_per_plane[2]),
+            'weighted_theoretical_coverage_north': float(weighted_theoretical_coverage_per_plane[3]),
+            'weighted_theoretical_coverage_bottom': float(weighted_theoretical_coverage_per_plane[4]),
+            'weighted_theoretical_coverage_top': float(weighted_theoretical_coverage_per_plane[5]),
+            'weighted_actual_coverage_west': float(weighted_actual_coverage_per_plane[0]),
+            'weighted_actual_coverage_east': float(weighted_actual_coverage_per_plane[1]),
+            'weighted_actual_coverage_south': float(weighted_actual_coverage_per_plane[2]),
+            'weighted_actual_coverage_north': float(weighted_actual_coverage_per_plane[3]),
+            'weighted_actual_coverage_bottom': float(weighted_actual_coverage_per_plane[4]),
+            'weighted_actual_coverage_top': float(weighted_actual_coverage_per_plane[5]),
+            # 'face_dict': [face_dict]
+        }
+        # Create a dataframe for the occlusion metrics
+        occ_df = pd.DataFrame(data, index=[0], columns=voxel_occ_schema.names)
+        
+        # # save point cloud of t_entry
+        # import open3d as o3d
+        # pcd = o3d.geometry.PointCloud()
+        # pcd.points = o3d.utility.Vector3dVector(entry_coords)
+        # pcd.colors = o3d.utility.Vector3dVector(np.ones((entry_coords.shape[0], 3)))
+        # o3d.io.write_point_cloud(f"entry_coords_{voxel_df['voxel_id'].values[0]}.ply", pcd)
+
+        return occ_df
+
+
+    # Group by voxel_id and apply the occlusion function to each voxel
+    # meta = pd.DataFrame(columns=voxel_occ_schema.names)
+
+    voxel_grouped = voxel_intersections_df.groupby('voxel_id')
+    first_voxel_id = voxel_intersections_df['voxel_id'].values[0]
+    ### DEBUG ###
+    # voxel_occ_df, voxel_heatmaps = get_occlusion_per_voxel(voxel_grouped.get_group(first_voxel_id))
+
+    voxel_occ_df = voxel_intersections_df.groupby('voxel_id').apply(get_occlusion_per_voxel).reset_index(drop=True)
+    # Ensure the datatypes for voxel_occ_df are consistent with the schema
+    for col, field in zip(voxel_occ_schema.names, voxel_occ_schema):
+        voxel_occ_df[col] = voxel_occ_df[col].astype(field.type.to_pandas_dtype())
+
+    # # Extract the voxel heatmaps in a separate dataframe
+    # voxel_heatmaps = voxel_occ_df[['voxel_id', 'face_dict']]
+    # voxel_occ_df = voxel_occ_df.drop(columns=['face_dict'])
+    # voxel_occ_df = voxel_occ_df.reset_index(drop=True)
+
+    return voxel_occ_df
 
 
 

@@ -4,18 +4,14 @@ channels:
   - open3d-admin
   - conda-forge
   - defaults
+  - anaconda
 dependencies:
   - numpy
   - pandas
-  - pyarrow
   - pyvista
   - joblib
-  - numba
-  - scikit-learn
   - trimesh
-  - ipykernel
-  - dask
-  - distributed
   - open3d
-  - pip:
-      - fnvhash==0.1.0
+  - tqdm
+  - psutil
+  - rtree
