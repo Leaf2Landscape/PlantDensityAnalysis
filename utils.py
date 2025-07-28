@@ -33,27 +33,6 @@ It is saved in the format:
 And contains the information outlined in the following schema.
 Each index corresponds to a ray that intersects a voxel.
 """
-voxel_ray_intersection_schema_old = pa.schema([
-    pa.field('voxel_size', pa.float32()),
-    pa.field('voxel_id', pa.int64()),
-    pa.field('leg_id', pa.int64()),
-    pa.field('ray_id', pa.int64()),
-    pa.field('t_entry_x', pa.float32()),
-    pa.field('t_entry_y', pa.float32()),
-    pa.field('t_entry_z', pa.float32()),
-    pa.field('t_exit_x', pa.float32()),
-    pa.field('t_exit_y', pa.float32()),
-    pa.field('t_exit_z', pa.float32()),
-    pa.field('t_entry_radius', pa.float32()),
-    pa.field('t_exit_radius', pa.float32()),
-    pa.field('point_x', pa.float32()),
-    pa.field('point_y', pa.float32()),
-    pa.field('point_z', pa.float32()),
-    pa.field('viewing_angle', pa.float32()),
-    pa.field('hit_ray', pa.bool_()),
-    pa.field('is_leaf', pa.bool_())
-])
-
 voxel_ray_intersection_schema = pa.schema([
     pa.field('voxel_size', pa.float32()),
     pa.field('voxel_id', pa.int64()),
@@ -252,6 +231,10 @@ valid_rays_schema = pa.schema([
     pa.field('point_x', pa.float32()),
     pa.field('point_y', pa.float32()),
     pa.field('point_z', pa.float32()),
+    pa.field('normal_x', pa.float32()),
+    pa.field('normal_y', pa.float32()),
+    pa.field('normal_z', pa.float32()),
+    pa.field('point_weight', pa.float32()),
     pa.field('is_leaf', pa.bool_())
 ])
 
@@ -963,7 +946,7 @@ def find_viewing_angles(directions, reference_vector=np.array([0, 0, 1])):
 def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_dir, epsilon=1e-6):
 
     if ray_partition.empty:
-        return pd.DataFrame(columns=voxel_ray_intersection_schema_old.names)
+        return pd.DataFrame(columns=voxel_ray_intersection_schema.names)
     
     # Prep ray information
     leg_ids = ray_partition['leg_id'].values
@@ -971,6 +954,8 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
     origins = np.asarray(ray_partition[['origin_x', 'origin_y', 'origin_z']].values)
     directions = np.asarray(ray_partition[['direction_x', 'direction_y', 'direction_z']].values)
     points = np.asarray(ray_partition[['point_x', 'point_y', 'point_z']].values)
+    normals = np.asarray(ray_partition[['normal_x', 'normal_y', 'normal_z']].values)
+    point_weights = np.asarray(ray_partition['point_weight'].values)
     is_leaf = np.asarray(ray_partition['is_leaf'].values)
 
     num_rays = len(ray_partition)
@@ -994,6 +979,8 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
     origins = origins[np.newaxis, :, :]
     directions = directions[np.newaxis, :, :]
     points = points[np.newaxis, :, :]    
+    normals = normals[np.newaxis, :, :]
+    point_weights = point_weights[np.newaxis, :]
 
     ### TEST DATA ###
     # voxel_mins = np.array([
@@ -1165,7 +1152,7 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
         shutil.rmtree(temp_dir, ignore_errors=True)
 
         # Return an empty DataFrame with the same schema
-        return pd.DataFrame(columns=voxel_ray_intersection_schema_old.names)
+        return pd.DataFrame(columns=voxel_ray_intersection_schema.names)
     
     del mask, chunk_masks, chunk
     gc.collect()
@@ -1251,6 +1238,8 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
     filtered_ray_ids = ray_ids[:, ray_ref_idx].reshape(-1)
     filtered_is_leaf = is_leaf[:, ray_ref_idx].reshape(-1)
     filtered_points = points[:, ray_ref_idx, :].reshape(-1, 3)
+    filtered_normals = normals[:, ray_ref_idx, :].reshape(-1, 3)
+    filtered_point_weights = point_weights[:, ray_ref_idx].reshape(-1)
     filtered_origins = origins[:, ray_ref_idx, :].reshape(-1, 3)
     filtered_directions = directions[:, ray_ref_idx, :].reshape(-1, 3)
 
@@ -1288,7 +1277,7 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
 
     if not np.any(valid_ray_mask):
         print("No valid rays intersect these voxels.")
-        return pd.DataFrame(columns=voxel_ray_intersection_schema_old.names)
+        return pd.DataFrame(columns=voxel_ray_intersection_schema.names)
         
     del filtered_voxel_mins, filtered_voxel_maxs
     gc.collect()
@@ -1310,6 +1299,8 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
     # filtered_t_entry_radii = filtered_t_entry_radii[valid_ray_mask]
     # filtered_t_exit_radii = filtered_t_exit_radii[valid_ray_mask]
     filtered_points = filtered_points[valid_ray_mask]
+    filtered_normals = filtered_normals[valid_ray_mask]
+    filtered_point_weights = filtered_point_weights[valid_ray_mask]
     filtered_viewing_angles = filtered_viewing_angles[valid_ray_mask]
     filtered_hit_rays = filtered_hit_rays[valid_ray_mask]
     filtered_is_leaf = filtered_is_leaf[valid_ray_mask] 
@@ -1343,11 +1334,15 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
         pa.array(filtered_points[:, 0]),
         pa.array(filtered_points[:, 1]),
         pa.array(filtered_points[:, 2]),
+        pa.array(filtered_normals[:, 0]),
+        pa.array(filtered_normals[:, 1]),
+        pa.array(filtered_normals[:, 2]),
+        pa.array(filtered_point_weights),
         pa.array(filtered_viewing_angles),
         pa.array(filtered_hit_rays),
         pa.array(filtered_is_leaf)
     ]
-    result = pa.Table.from_arrays(data, schema=voxel_ray_intersection_schema_old)
+    result = pa.Table.from_arrays(data, schema=voxel_ray_intersection_schema)
     result = result.to_pandas()
 
     del filtered_voxel_sizes, filtered_voxel_ids, filtered_leg_ids, filtered_ray_ids, filtered_t_entry_coords, filtered_t_exit_coords, filtered_t_entry_radii, filtered_t_exit_radii, filtered_points, filtered_viewing_angles, filtered_hit_rays, filtered_is_leaf
@@ -1569,6 +1564,10 @@ def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, 
             rays['is_leaf'] = rays['hit_object_id'].isin(leaf_object_ids)
 
             rays = rays.drop(columns=['hit_object_id'])
+            rays['normal_x'] = np.nan
+            rays['normal_y'] = np.nan
+            rays['normal_z'] = np.nan
+            rays['point_weight'] = np.nan
             rays.to_parquet(rays_file, engine='pyarrow', compression='snappy', schema=valid_rays_schema)
 
             logger.info("Counting points...")
@@ -1671,7 +1670,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir, cpus=None,
         leg_id = int(os.path.splitext(os.path.basename(file))[0].split("_")[1])
 
         # Map partitions to traverse voxels
-        meta = pd.DataFrame(columns=voxel_ray_intersection_schema_old.names)
+        meta = pd.DataFrame(columns=voxel_ray_intersection_schema.names)
 
         if mem == None:
             mem = psutil.virtual_memory().available
@@ -1722,7 +1721,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir, cpus=None,
         output_filename = os.path.join(valid_rays_dir, f"leg_{leg_id}_voxel_{voxel_size}_intersections.parquet")
 
         # Save the dataframe to parquet
-        df.to_parquet(output_filename, engine='pyarrow', compression='snappy', schema=voxel_ray_intersection_schema_old)
+        df.to_parquet(output_filename, engine='pyarrow', compression='snappy', schema=voxel_ray_intersection_schema)
 
         return True
 
@@ -2657,6 +2656,74 @@ def convert_parquet_to_csv(parquet_file, output_file):
     df = pd.read_parquet(parquet_file, engine='pyarrow')
 
     df.to_csv(output_file, index=False)
+
+def add_normals_weights_to_valid_rays(files, knn=6):
+    """
+    Add normals and weights to the points in the valid rays files.
+    """
+    import dask.dataframe as dd
+    import numpy as np
+    from sklearn.neighbors import NearestNeighbors
+    import os
+
+    # Read the valid rays files
+    dfs = []
+    for file in files:
+        df = dd.read_parquet(file, engine='pyarrow')
+        dfs.append(df)
+
+    valid_ray_dir = os.path.dirname(files[0])
+
+    if len(dfs) == 0:
+        raise ValueError("No valid voxel_ray_intersection files found.")
+    
+    print(f"Adding normals and weights to {len(dfs)} files...")
+    
+    # Combine all dataframes into one
+    valid_rays_df = dd.concat(dfs, axis=0, ignore_index=True)
+    valid_rays_df = valid_rays_df.reset_index(drop=True)
+
+    # Filter out leaf hits (that definitely hit something)
+    leaf_df = valid_rays_df[(valid_rays_df['is_leaf'] == True)]
+    leaf_df = leaf_df.compute()
+    leaf_points = leaf_df[['point_x', 'point_y', 'point_z']].values
+
+    # Calculate normals and weights on all leaf hits
+    normals, weights = compute_normals_weights_from_points(points=leaf_points, knn=knn)
+    del leaf_points
+
+    leaf_df["normal_x"] = normals[:, 0]
+    leaf_df["normal_y"] = normals[:, 1]
+    leaf_df["normal_z"] = normals[:, 2]
+    leaf_df["point_weight"] = weights
+    del normals, weights
+
+    valid_rays_df = valid_rays_df.compute()
+
+    valid_rays_df = valid_rays_df.merge(
+        leaf_df[['ray_id', 'point_x', 'point_y', 'point_z', 'normal_x', 'normal_y', 'normal_z', 'point_weight']],
+        on=['ray_id', 'point_x', 'point_y', 'point_z'],
+        how='left',
+        suffixes=('_OLD', '')
+    )
+    del leaf_df
+
+    valid_rays_df.drop(columns=['normal_x_OLD', 'normal_y_OLD', 'normal_z_OLD', 'point_weight_OLD'], inplace=True, errors='ignore')
+
+    # Save updated valid_rays parquet files per leg
+    output_files = []
+    grouped_df = valid_rays_df.groupby('leg_id')
+    for leg_id, group in grouped_df:
+        output_file = os.path.join(valid_ray_dir, f"leg_{leg_id}_valid_rays.parquet")
+        old_file = output_file.replace('.parquet', '_old.parquet')
+        if os.path.exists(output_file):
+            os.rename(output_file, old_file)
+
+        group.to_parquet(output_file, engine='pyarrow', index=False)
+        output_files.append(output_file)
+        print(f"Saved {output_file}")
+
+    print(f"Saved {len(output_files)} valid rays files with normals and weights.")
 
 def add_normals_weights_from_intersection_files(files, knn=6):
     """
