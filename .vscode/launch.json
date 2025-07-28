@@ -28,6 +28,34 @@
                 "--index", "119",
                 "--log_file", "/home/capheus/projects/downloads/slurm_scripts/40_merged.obj_voxel_batches_119.log",
             ]
+        },
+        {
+            "name": "local_collate",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": [
+                "/home/capheus/projects/downloads/slurm_scripts/preliminary_results/",
+                "--csv_path", "/home/capheus/projects/downloads/slurm_scripts/test_results.csv",
+            ]
+        },
+        {
+            "name": "local_noarg",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "single_tree",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": [
+                "/home/capheus/projects/RAJA_TEST/1001_etri_erecto_diamond.obj"
+            ]
         }
     ]
 }

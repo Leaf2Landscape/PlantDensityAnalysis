@@ -59,7 +59,7 @@ def main(preliminary_output_path, csv_path):
         
         # Save the concatenated dataframe to a CSV file
         output_csv_path = os.path.join(os.path.dirname(csv_path), f"collated_results_vs_{voxel_size}.csv")
-        concat_df.to_csv(output_csv_path, index=False, engine="pyarrow")
+        concat_df.to_csv(output_csv_path, index=False)
         print(f"Results for voxel size {voxel_size} saved to {output_csv_path}.")
 
     # Collect all processing times CSV files in the preliminary output path
@@ -93,7 +93,7 @@ def main(preliminary_output_path, csv_path):
         
         # Save the concatenated processing times dataframe to a CSV file
         output_processing_times_csv_path = os.path.join(os.path.dirname(csv_path), f"processing_times_vs_{voxel_size}.csv")
-        concat_df.to_csv(output_processing_times_csv_path, index=False, engine="pyarrow")
+        concat_df.to_csv(output_processing_times_csv_path, index=False)
         print(f"Processing times for voxel size {voxel_size} saved to {output_processing_times_csv_path}.")
 
 if __name__ == "__main__":
