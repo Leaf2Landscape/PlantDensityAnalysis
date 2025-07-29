@@ -10,8 +10,10 @@ dependencies:
   - pandas
   - pyvista
   - joblib
-  - trimesh
   - open3d
   - tqdm
   - psutil
   - rtree
+  - pip
+  - pip:
+      - trimesh[easy]
