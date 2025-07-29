@@ -324,11 +324,11 @@ def get_clipped_meshes(
     
     ### DEBUG ####
     # Save .ply files for debugging
-    # project_dir = os.path.dirname(leaf_mesh_path)
-    # surface_area = clipped_leaf_mesh.area if hasattr(clipped_leaf_mesh, 'area') else 0.0
-    # debug_leaf_path = os.path.join(project_dir, f"clipped_leaf_{voxel_center[0]:.2f}_{voxel_center[1]:.2f}_{voxel_center[2]:.2f}_{surface_area}.ply")
-    # debug_wood_path = os.path.join(project_dir, f"clipped_wood_{voxel_center[0]:.2f}_{voxel_center[1]:.2f}_{voxel_center[2]:.2f}.ply")
-    # clipped_leaf_mesh.save(debug_leaf_path)
+    project_dir = os.path.dirname(leaf_mesh_path)
+    surface_area = clipped_leaf_mesh.area if hasattr(clipped_leaf_mesh, 'area') else 0.0
+    debug_leaf_path = os.path.join(project_dir, f"clipped_leaf_{voxel_center[0]:.2f}_{voxel_center[1]:.2f}_{voxel_center[2]:.2f}_{surface_area}.ply")
+    debug_wood_path = os.path.join(project_dir, f"clipped_wood_{voxel_center[0]:.2f}_{voxel_center[1]:.2f}_{voxel_center[2]:.2f}.ply")
+    clipped_leaf_mesh.save(debug_leaf_path)
     
     del sub_mesh, clipped_leaf_mesh
 
@@ -354,6 +354,11 @@ def get_clipped_meshes(
         del sub_mesh, clipped_leaf_mesh
         gc.collect()
         return voxel_center, clipped_leaf_vertices, clipped_leaf_faces, None, None
+    
+    ### DEBUG
+    # Save .ply files for debugging
+    clipped_wood_mesh.save(debug_wood_path)
+
 
     del wood_mesh, clipped_wood_mesh, voxel
     
@@ -582,7 +587,7 @@ def simulate_combined_mesh_with_points(scene, leaf_gid, wood_gid,
     efpl_f = compute_efpl_array(z_arr[valid],  lambda_1)
 
     stats_lw = dict(
-        N=N,
+        N=n_hits,       # Changed from N to prevent including hits on voxel surface
         n_hits=n_hits,
         I=n_hits / N if N else 0.0,
         delta_bar=delta[valid].mean() if N else 0.0,
@@ -597,17 +602,18 @@ def simulate_combined_mesh_with_points(scene, leaf_gid, wood_gid,
         var_efpl_free=efpl_f.var(ddof=1) if N > 1 else 0.0,
     )
 
-    hit_m = (gids == leaf_gid) & valid & (dists >= t_near) & (dists <= t_far)
+    leaf_mask = (gids == leaf_gid) & valid & (dists >= t_near) & (dists <= t_far)
 
     delta = np.zeros_like(dists)
     delta[valid] = t_far[valid] - t_near[valid]
     z_arr = delta.copy()
-    z_arr[hit_m] = dists[hit_m] - t_near[hit_m]
+    z_arr[leaf_mask] = dists[leaf_mask] - t_near[leaf_mask]
 
     efpl_d = compute_efpl_array(delta[valid], lambda_1)
     efpl_f = compute_efpl_array(z_arr[valid],  lambda_1)
 
-    n_hits = int(hit_m.sum())
+    N = n_hits
+    n_hits = int(leaf_mask.sum())
     stats_leaf = dict(
         N=N,
         n_hits=n_hits,
@@ -1157,10 +1163,10 @@ if __name__ == "__main__":
     else:
         print(f"Leaf area CSV {leaf_area_csv} already exists. Skipping leaf area calculation.")
         df = pd.read_csv(leaf_area_csv)
-        avg_leaf_area = df['avg_leaf_area']
-        min_leaf_area = df['min_leaf_area']
-        max_leaf_area = df['max_leaf_area']
-        num_leaves = df['num_leaves']
+        avg_leaf_area = df['avg_leaf_area'][0]
+        min_leaf_area = df['min_leaf_area'][0]
+        max_leaf_area = df['max_leaf_area'][0]
+        num_leaves = df['num_leaves'][0]
 
     for voxel_size in voxel_sizes:
         # Batch voxel centers into number of CPUs
@@ -1174,7 +1180,7 @@ if __name__ == "__main__":
         batches = []
         voxel_center_batches = [voxel_centers[i:i + num_cpus] for i in range(0, len(voxel_centers), num_cpus)]
 
-        lambda_1 = avg_leaf_area[0] / (voxel_size ** 3)
+        lambda_1 = avg_leaf_area / (voxel_size ** 3)
 
 
 
