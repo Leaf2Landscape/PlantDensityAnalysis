@@ -54,7 +54,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args": [
-                "/home/capheus/projects/RAJA_TEST/1001_etri_erecto_diamond.obj"
+                "/home/capheus/projects/RAJA_TEST/1011_etri_plano_diamond.obj"
             ]
         }
     ]
