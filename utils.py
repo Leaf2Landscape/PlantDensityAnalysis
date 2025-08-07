@@ -1374,7 +1374,7 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
 # Functions that are used to perform large operations, such as calculating metrics or processing data.
 
 # Prepare data from helios simulations
-def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, debug=True, epsilon=1e-6):
+def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, use_class=False, debug=True, epsilon=1e-6):
     """
     Main function to process helios simulation data.
     
@@ -1510,7 +1510,7 @@ def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, 
 
         # Import all hits into dask dataframe
         leg_hits = dd.read_csv(xyz_file, delimiter=' ', header=None, names=['point_x', 'point_y', 'point_z', 'intensity', 'echo_width', 'return_number', 'number_of_returns', 'ray_id', 'hit_object_id', 'class', 'gps_time'])
-        leg_hits = leg_hits.drop(columns=['intensity', 'echo_width', 'return_number', 'number_of_returns', 'class', 'gps_time'])
+        leg_hits = leg_hits.drop(columns=['intensity', 'echo_width', 'return_number', 'number_of_returns', 'gps_time'])
 
         leg_rays = leg_rays.merge(leg_hits, on='ray_id', how='left')
 
@@ -1561,9 +1561,10 @@ def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, 
             
             logger.info(f"Saving valid rays for leg {leg} to {rays_file}")
             rays['leg_id'] = leg
-            rays['is_leaf'] = rays['hit_object_id'].isin(leaf_object_ids)
+            leaf_key = 'hit_object_id' if not use_class else 'class'
+            rays['is_leaf'] = rays[leaf_key].isin(leaf_object_ids)
 
-            rays = rays.drop(columns=['hit_object_id'])
+            rays = rays.drop(columns=['hit_object_id', 'class'])
             rays['normal_x'] = np.nan
             rays['normal_y'] = np.nan
             rays['normal_z'] = np.nan
