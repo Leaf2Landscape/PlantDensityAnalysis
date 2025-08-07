@@ -325,6 +325,13 @@ def get_clipped_meshes(
             clipped_leaf_faces = np.asarray(clipped_leaf_mesh.faces.reshape((-1, 4))[:, 1:])
 
             print(f"No valid mesh found after clipping for voxel at {voxel_center}.")
+
+            ### DEBUG ###
+            # Save .ply files for debugging
+            # cube = pv.Cube(center=voxel_center, x_length=voxel_size, y_length=voxel_size, z_length=voxel_size)
+            # cube.save(f"voxel_cube_{voxel_center[0]:.2f}_{voxel_center[1]:.2f}_{voxel_center[2]:.2f}.ply")
+            # clipped_leaf_mesh.save(f"clipped_leaf_{voxel_center[0]:.2f}_{voxel_center[1]:.2f}_{voxel_center[2]:.2f}.ply")
+
             del sub_mesh, clipped_leaf_mesh
             gc.collect()
             
@@ -364,13 +371,16 @@ def get_clipped_meshes(
             # Create a PyVista mesh from the trimesh submesh
             sub_mesh = pv.wrap(sub_mesh)
             voxel = pv.Cube(center=voxel_center, x_length=voxel_size, y_length=voxel_size, z_length=voxel_size)
-            clipped_leaf_mesh = sub_mesh.clip_box(voxel, invert=False)
-            if isinstance(clipped_leaf_mesh, pv.UnstructuredGrid):
-                clipped_leaf_mesh = clipped_leaf_mesh.extract_geometry()
-            if not clipped_leaf_mesh.is_all_triangles:
-                clipped_leaf_mesh = clipped_leaf_mesh.triangulate()
-            clipped_leaf_vertices = np.asarray(clipped_leaf_mesh.points)
-            clipped_leaf_faces = np.asarray(clipped_leaf_mesh.faces.reshape((-1, 4))[:, 1:])
+            clipped_wood_mesh = sub_mesh.clip_box(voxel, invert=False)
+            if isinstance(clipped_wood_mesh, pv.UnstructuredGrid):
+                clipped_wood_mesh = clipped_wood_mesh.extract_geometry()
+            if not clipped_wood_mesh.is_all_triangles:
+                clipped_wood_mesh = clipped_wood_mesh.triangulate()
+            clipped_wood_vertices = np.asarray(clipped_wood_mesh.points)
+            clipped_wood_faces = np.asarray(clipped_wood_mesh.faces.reshape((-1, 4))[:, 1:])
+
+            ### DEBUG ###
+            # clipped_wood_mesh.save(f"clipped_wood_{voxel_center[0]:.2f}_{voxel_center[1]:.2f}_{voxel_center[2]:.2f}.ply")
 
     return voxel_center, clipped_leaf_vertices, clipped_leaf_faces, clipped_wood_vertices, clipped_wood_faces
 
@@ -379,7 +389,7 @@ def build_voxel_scene(o3d_leaf, o3d_wood):
     """Return (scene, leaf_id, wood_id)  either id may be None."""
     scene = o3d.t.geometry.RaycastingScene()
     leaf_id = wood_id = None
-    if (o3d_leaf is not None) and (len(o3d_leaf.triangles) > 0):
+    if (o3d_leaf is not None) and (len(o3d_leaf.triangles) > 0) and LEAF_OFF is False:
         leaf_id = scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(o3d_leaf))
 
     if (o3d_wood is not None) and (len(o3d_wood.triangles) > 0):
@@ -545,8 +555,8 @@ def simulate_combined_mesh_with_points(scene, leaf_gid, wood_gid,
     bmax = voxel_center + 0.5 * voxel_size
     t_near, t_far = ray_box_intersection_vectorized(
         ray_origins, ray_dirs, bmin, bmax)
-    valid = (t_near <= t_far) & (t_far >= 0)
-    N = int(valid.sum())
+    valid_rays_mask = (t_near <= t_far) & (t_far >= 0)
+    N = int(valid_rays_mask.sum())
     if N == 0:
         return {k: 0.0 for k in (
             "N","n_hits","I","delta_bar","sum_delta","sum_z","mean_z",
@@ -561,67 +571,68 @@ def simulate_combined_mesh_with_points(scene, leaf_gid, wood_gid,
     gids = hits["geometry_ids"].numpy()
     dists = hits["t_hit"].numpy()
 
+    # Mask infinite t_hits
+    valid_hits_mask = np.isfinite(dists) & (dists >= t_near) & (dists <= t_far) & (dists >= 0) & valid_rays_mask
+
     dist_leaf = np.full_like(dists, np.inf)
     dist_wood = np.full_like(dists, np.inf)
     if leaf_gid is not None:
-        m = (gids == leaf_gid) & valid & (dists >= t_near) & (dists <= t_far)
+        m = (gids == leaf_gid) & valid_hits_mask
         dist_leaf[m] = dists[m]
     if wood_gid is not None:
-        m = (gids == wood_gid) & valid & (dists >= t_near) & (dists <= t_far)
+        m = (gids == wood_gid) & valid_hits_mask
         dist_wood[m] = dists[m]
-    
+
     comb_dist = np.minimum(dist_leaf, dist_wood)
-    hit_any = np.isfinite(comb_dist) & (comb_dist < np.inf)
-    n_hits = int(hit_any.sum())
+    hit_any = np.isfinite(comb_dist) # & (comb_dist < np.inf)
+    n_hits_lw = int(hit_any.sum())
+    hit_leaf = np.isfinite(dist_leaf)
+    n_hits_leaf = int(hit_leaf.sum())
 
     delta = np.zeros_like(dists)
-    delta[valid] = t_far[valid] - t_near[valid]
+    delta[valid_rays_mask] = t_far[valid_rays_mask] - t_near[valid_rays_mask]
     z_arr = delta.copy()
     z_arr[hit_any] = comb_dist[hit_any] - t_near[hit_any]
 
-    efpl_d = compute_efpl_array(delta[valid], lambda_1)
-    efpl_f = compute_efpl_array(z_arr[valid],  lambda_1)
+    efpl_d = compute_efpl_array(delta[valid_rays_mask], lambda_1)
+    efpl_f = compute_efpl_array(z_arr[valid_rays_mask],  lambda_1)
 
     stats_lw = dict(
-        N=n_hits,       # Changed from N to prevent including hits on voxel surface
-        n_hits=n_hits,
-        I=n_hits / N if N else 0.0,
-        delta_bar=delta[valid].mean() if N else 0.0,
-        sum_delta=delta[valid].sum(),
-        sum_z=z_arr[valid].sum(),
-        mean_z=z_arr[valid].mean() if N else 0.0,
+        N=n_hits_lw,       # Changed from N to prevent including hits on voxel surface
+        n_hits=n_hits_lw,
+        I=n_hits_lw / N if N else 0.0,
+        delta_bar=delta[valid_rays_mask].mean() if N else 0.0,
+        sum_delta=delta[valid_rays_mask].sum(),
+        sum_z=z_arr[valid_rays_mask].sum(),
+        mean_z=z_arr[valid_rays_mask].mean() if N else 0.0,
         mean_delta_e=efpl_d.mean() if N else 0.0,
         var_delta_e=efpl_d.var(ddof=1) if N > 1 else 0.0,
         sum_z_e=efpl_f.sum(),
-        sum_hits_z_e=efpl_f[hit_any[valid]].sum() if n_hits else 0.0,
+        sum_hits_z_e=efpl_f[hit_any[valid_rays_mask]].sum() if n_hits_lw else 0.0,
         mean_efpl_free=efpl_f.mean() if N else 0.0,
         var_efpl_free=efpl_f.var(ddof=1) if N > 1 else 0.0,
     )
 
-    leaf_mask = (gids == leaf_gid) & valid & (dists >= t_near) & (dists <= t_far)
-
     delta = np.zeros_like(dists)
-    delta[valid] = t_far[valid] - t_near[valid]
+    delta[valid_rays_mask] = t_far[valid_rays_mask] - t_near[valid_rays_mask]
     z_arr = delta.copy()
-    z_arr[leaf_mask] = dists[leaf_mask] - t_near[leaf_mask]
+    z_arr[hit_leaf] = dists[hit_leaf] - t_near[hit_leaf]
 
-    efpl_d = compute_efpl_array(delta[valid], lambda_1)
-    efpl_f = compute_efpl_array(z_arr[valid],  lambda_1)
+    efpl_d = compute_efpl_array(delta[valid_rays_mask], lambda_1)
+    efpl_f = compute_efpl_array(z_arr[valid_rays_mask],  lambda_1)
 
-    N = n_hits
-    n_hits = int(leaf_mask.sum())
     stats_leaf = dict(
         N=N,
-        n_hits=n_hits,
-        I=n_hits / N if N else 0.0,
-        delta_bar=delta[valid].mean() if N else 0.0,
-        sum_delta=delta[valid].sum(),
-        sum_z=z_arr[valid].sum(),
-        mean_z=z_arr[valid].mean() if N else 0.0,
+        n_hits=n_hits_leaf,
+        I=n_hits_leaf / N if N else 0.0,
+        delta_bar=delta[valid_rays_mask].mean() if N else 0.0,
+        sum_delta=delta[valid_rays_mask].sum(),
+        sum_z=z_arr[valid_rays_mask].sum(),
+        mean_z=z_arr[valid_rays_mask].mean() if N else 0.0,
         mean_delta_e=efpl_d.mean() if N else 0.0,
         var_delta_e=efpl_d.var(ddof=1) if N > 1 else 0.0,
         sum_z_e=efpl_f.sum(),
-        sum_hits_z_e=efpl_f[hit_m[valid]].sum() if n_hits else 0.0,
+        sum_hits_z_e=efpl_f[hit_leaf[valid_rays_mask]].sum() if n_hits_leaf else 0.0,
         mean_efpl_free=efpl_f.mean() if N else 0.0,
         var_efpl_free=efpl_f.var(ddof=1) if N > 1 else 0.0,
     )
@@ -1087,15 +1098,19 @@ def process_voxel(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process voxel batch.")
     parser.add_argument("scene_file", type=str, help="Path to the single .obj scene file. This will automatically extract leaf and wood meshes.")
-    parser.add_argument("--voxel_sizes", type=list, default=[0.2, 0.5, 1.0, 2.0], help="Voxel sizes for processing (default: [0.2, 0.5, 1.0, 2.0]).")
+    parser.add_argument("--voxel_sizes", type=float, nargs='+', default=[0.2, 0.5, 1.0, 2.0], help="Voxel sizes for processing (default: [0.2, 0.5, 1.0, 2.0]).")
     parser.add_argument("--ray_spacing", type=float, default=0.005, help="Ray spacing for ray tracing (default: 0.1).")
     parser.add_argument("--wood_volume_voxel_size", type=float, default=0.01, help="Voxel size for wood volume calculation (default: 0.01).")
     parser.add_argument("--wood_volume_threshold", type=int, default=4, help="Threshold for wood volume calculation (default: 4).")
     parser.add_argument("--cross_section_area", type=float, default=0.003, help="Cross section area for wood volume calculation (default: 0.01).")
+    parser.add_argument("--leaf_off", action='store_true', help="If set, leaf mesh will not be included in raytracing.")
     args = parser.parse_args()
 
     # Clear the joblib.Memory cache to ensure any updates are applied:
     memory.clear(warn=True)
+
+    # Store a global setting for leaf-off
+    LEAF_OFF = args.leaf_off
 
     voxel_sizes = args.voxel_sizes
     ray_spacing = args.ray_spacing
@@ -1275,7 +1290,7 @@ if __name__ == "__main__":
             print(f"No valid voxel centers found for voxel size {voxel_size}. Skipping processing.")
             continue
 
-        grid = _grid(voxel_size, bounds)
+        grid = _grid(voxel_size, ray_spacing)
 
         wood_volume_points = memory.cache(load_wood_volume_file)(wood_volume_file)
 
@@ -1294,12 +1309,9 @@ if __name__ == "__main__":
         print(f"Preprocessing time: {clip_time}")
 
         results = []
-        for i, (voxel_center, leaf_mesh, wood_mesh) in enumerate(tqdm(zip(voxel_centers, valid_clipped_leaf_meshes, valid_clipped_wood_meshes), total=len(voxel_centers), desc="Processing voxels", unit="voxel")):
+        for i, (voxel_center, leaf_mesh, wood_mesh) in enumerate(tqdm(zip(valid_voxel_centers, valid_clipped_leaf_meshes, valid_clipped_wood_meshes), total=len(valid_voxel_centers), desc="Processing voxels", unit="voxel")):
             result, _ = worker(voxel_center, leaf_mesh, wood_mesh)
             df = pd.DataFrame(result)
-            mesh_surface_area = leaf_mesh.get_surface_area() if leaf_mesh else 0.0
-            LAI = (df['LAI_Leaf'].mean()/voxel_size) if not df.empty else 0.0
-            print(f"Voxel {i+1}/{len(voxel_centers)}: Center {voxel_center}, Surface Area: {mesh_surface_area:.2f}, LAI: {LAI:.2f}")
             results.append(df)
 
         total_time = dt.datetime.now() - start
@@ -1311,12 +1323,14 @@ if __name__ == "__main__":
         # Convert results to a DataFrame and save to CSV
         # This csv will ne save in a subfolder to csv_path for preliminary results
         df = pd.concat(results, ignore_index=True)
-        output_path = os.path.join(os.path.dirname(args.scene_file), os.path.basename(args.scene_file).replace('.obj', f'_results_{voxel_size}.csv'))
+        output_basename = os.path.basename(args.scene_file).replace('.obj', f'_results_{voxel_size}.csv') if LEAF_OFF is False else os.path.basename(args.scene_file).replace('.obj', f'_results_{voxel_size}_leaf_off.csv')
+        output_path = os.path.join(os.path.dirname(args.scene_file), output_basename)
         df.to_csv(output_path, index=False)
 
         # Save performance results to a separate CSV file
         perf_df = pd.DataFrame(performance_results)
-        perf_output_path = os.path.join(os.path.dirname(args.scene_file), os.path.basename(args.scene_file).replace('.obj', f'_performance_{voxel_size}.csv'))
+        perf_output_basename = os.path.basename(args.scene_file).replace('.obj', f'_performance_{voxel_size}.csv') if LEAF_OFF is False else os.path.basename(args.scene_file).replace('.obj', f'_performance_{voxel_size}_leaf_off.csv')
+        perf_output_path = os.path.join(os.path.dirname(args.scene_file), perf_output_basename)
         perf_df.to_csv(perf_output_path, index=False)
 
         print(f"Processed {args.scene_file} and saved results to {output_path} in {total_time} seconds.")
