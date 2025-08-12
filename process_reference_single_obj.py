@@ -858,9 +858,9 @@ def generate_voxel_centers(voxel_size, bounds):
     """
     # Generate voxel grid for the combined plot bounds of leaf_mesh and wood_mesh (trimesh version)
     minx, miny, minz, maxx, maxy, maxz = bounds
-    x_centers = np.arange(minx + voxel_size / 2, maxx, voxel_size)
-    y_centers = np.arange(miny + voxel_size / 2, maxy, voxel_size)
-    z_centers = np.arange(minz + voxel_size / 2, maxz, voxel_size)
+    x_centers = np.arange(minx + voxel_size / 2, maxx + voxel_size / 2, voxel_size)
+    y_centers = np.arange(miny + voxel_size / 2, maxy + voxel_size / 2, voxel_size)
+    z_centers = np.arange(minz + voxel_size / 2, maxz + voxel_size / 2, voxel_size)
     voxel_centers = np.array(np.meshgrid(x_centers, y_centers, z_centers, indexing='ij')).reshape(3, -1).T
     coords = ((voxel_centers * 11 + voxel_size * 73)*13).astype(int)
     voxel_ids = np.char.add(
@@ -1123,6 +1123,7 @@ if __name__ == "__main__":
     parser.add_argument("--wood_volume_threshold", type=int, default=4, help="Threshold for wood volume calculation (default: 4).")
     parser.add_argument("--cross_section_area", type=float, default=0.003, help="Cross section area for wood volume calculation (default: 0.01).")
     parser.add_argument("--leaf_off", action='store_true', help="If set, leaf mesh will not be included in raytracing.")
+    parser.add_argument("--debug", action='store_true', help="If set, debug outputs will be saved.")
     args = parser.parse_args()
 
     # Clear the joblib.Memory cache to ensure any updates are applied:
@@ -1130,6 +1131,12 @@ if __name__ == "__main__":
 
     # Store a global setting for leaf-off
     LEAF_OFF = args.leaf_off
+    DEBUG_MODE = args.debug
+    if DEBUG_MODE:
+        DEBUG_PATH = os.path.join(os.path.dirname(args.scene_file), "debug")
+        if os.path.exists(DEBUG_PATH):
+            os.rmdir(DEBUG_PATH)
+        os.makedirs(DEBUG_PATH)
 
     voxel_sizes = args.voxel_sizes
     ray_spacing = args.ray_spacing
@@ -1279,27 +1286,37 @@ if __name__ == "__main__":
         clipped_wood_faces = [clipped_wood_faces[i] for i in valid_indices]
 
         if len(clipped_leaf_vertices) == 0 and len(clipped_wood_vertices) == 0:
-            print(f"No valid clipped meshes found for voxel size {voxel_size} in batch {j}. Skipping processing.")
+            print(f"No valid clipped meshes found for voxel size {voxel_size}. Skipping processing.")
             continue 
 
         # Convert clipped vertices and faces to Open3D meshes
         clipped_leaf_meshes = []
         clipped_wood_meshes = []
-        for leaf_vertices, leaf_faces in zip(clipped_leaf_vertices, clipped_leaf_faces):
+        for vc, leaf_vertices, leaf_faces in zip(clipped_voxel_centres, clipped_leaf_vertices, clipped_leaf_faces):
             if leaf_vertices is not None and leaf_faces is not None:
                 o3d_leaf_mesh = o3d.geometry.TriangleMesh()
                 o3d_leaf_mesh.vertices = o3d.utility.Vector3dVector(leaf_vertices)
                 o3d_leaf_mesh.triangles = o3d.utility.Vector3iVector(leaf_faces)
                 clipped_leaf_meshes.append(o3d_leaf_mesh)
+
+                ## DEBUG ##
+                if DEBUG_MODE:
+                    test_mesh_path = os.path.join(DEBUG_PATH, f"clipped_leaf_mesh_{voxel_size}_{vc}.ply")
+                    o3d.io.write_triangle_mesh(test_mesh_path, o3d_leaf_mesh)
             else:
                 clipped_leaf_meshes.append(None)
 
-        for wood_vertices, wood_faces in zip(clipped_wood_vertices, clipped_wood_faces):
+        for vc, wood_vertices, wood_faces in zip(clipped_voxel_centres, clipped_wood_vertices, clipped_wood_faces):
             if wood_vertices is not None and wood_faces is not None:
                 o3d_wood_mesh = o3d.geometry.TriangleMesh()
                 o3d_wood_mesh.vertices = o3d.utility.Vector3dVector(wood_vertices)
                 o3d_wood_mesh.triangles = o3d.utility.Vector3iVector(wood_faces)
                 clipped_wood_meshes.append(o3d_wood_mesh)
+
+                ## DEBUG ##
+                if DEBUG_MODE:
+                    test_mesh_path = os.path.join(DEBUG_PATH, f"clipped_wood_mesh_{voxel_size}_{vc}.ply")
+                    o3d.io.write_triangle_mesh(test_mesh_path, o3d_wood_mesh)
             else:
                 clipped_wood_meshes.append(None)
 
@@ -1343,21 +1360,22 @@ if __name__ == "__main__":
         df.to_csv(output_path, index=False)
 
         ### DEBUG TOTAL LEAF AREA ###
-        # Compute total leaf area only for unique voxel centers
-        # unique_voxels = df.drop_duplicates(subset=['voxel_cx', 'voxel_cy', 'voxel_cz'])
-        # total_leaf_area = unique_voxels['LAI_Leaf'].sum() * (voxel_size ** 2)
-        # leaf_area_test_path = os.path.join(os.path.dirname(args.scene_file), os.path.basename(args.scene_file).replace('.obj', f'_leaf_area_test.csv'))
-        # debug_df = pd.DataFrame([{
-        #     "voxel_size": voxel_size,
-        #     "measured_leaf_area": total_leaf_area
-        # }])
-        
-        # if os.path.exists(leaf_area_test_path):
-        #     df_exist = pd.read_csv(leaf_area_test_path)
-        #     df_exist = pd.concat([df_exist, debug_df], ignore_index=True)
-        #     df_exist.to_csv(leaf_area_test_path, index=False)
-        # else:
-        #     debug_df.to_csv(leaf_area_test_path, index=False)
+        if DEBUG_MODE:
+            # Compute total leaf area only for unique voxel centers
+            unique_voxels = df.drop_duplicates(subset=['voxel_cx', 'voxel_cy', 'voxel_cz'])
+            total_leaf_area = unique_voxels['LAI_Leaf'].sum() * (voxel_size ** 2)
+            leaf_area_test_path = os.path.join(DEBUG_PATH, os.path.basename(args.scene_file).replace('.obj', f'_leaf_area_test.csv'))
+            debug_df = pd.DataFrame([{
+                "voxel_size": voxel_size,
+                "measured_leaf_area": total_leaf_area
+            }])
+            
+            if os.path.exists(leaf_area_test_path):
+                df_exist = pd.read_csv(leaf_area_test_path)
+                df_exist = pd.concat([df_exist, debug_df], ignore_index=True)
+                df_exist.to_csv(leaf_area_test_path, index=False)
+            else:
+                debug_df.to_csv(leaf_area_test_path, index=False)
 
         # Save performance results to a separate CSV file
         clip_time = clip_time.total_seconds()
@@ -1366,13 +1384,13 @@ if __name__ == "__main__":
         def per_voxel(time):
             return time / len(clipped_voxel_centres) if clipped_voxel_centres else 0
         
-        perf_df = pd.DataFrame({
+        perf_df = pd.DataFrame([{
             "clip_per_voxel": per_voxel(clip_time),
             "clipping": clip_time,
             "raytrace_per_voxel": per_voxel(raytrace_time),
             "raytracing": raytrace_time,
             "total": total_time
-        })
+        }])
         perf_output_basename = os.path.basename(args.scene_file).replace('.obj', f'_performance_{voxel_size}.csv') if LEAF_OFF is False else os.path.basename(args.scene_file).replace('.obj', f'_performance_{voxel_size}_leaf_off.csv')
         perf_output_path = os.path.join(os.path.dirname(args.scene_file), perf_output_basename)
         perf_df.to_csv(perf_output_path, index=False)
