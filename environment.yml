@@ -17,5 +17,6 @@ dependencies:
   - dask
   - distributed
   - open3d
+  - pip
   - pip:
       - fnvhash==0.1.0
