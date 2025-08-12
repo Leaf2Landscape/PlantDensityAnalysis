@@ -202,14 +202,15 @@ def process_leaf_area_file(scene_file: str, leaf_mesh: trimesh.Trimesh) -> None:
     areas = [comp.area for comp in components if comp.faces.shape[0] > 0]
 
     if not areas:
-        avg_area, min_area, max_area, num_leaves = 0.0, 0.0, 0.0, 0
+        avg_area, min_area, max_area, num_leaves, total_leaf_area = 0.0, 0.0, 0.0, 0, 0.0
     else:
         avg_area = float(np.mean(areas))
         min_area = float(np.min(areas))
         max_area = float(np.max(areas))
         num_leaves = len(areas)
+        total_leaf_area = float(np.nansum(areas))
 
-    print(f"Leaf area stats: avg={avg_area:.3f}, min={min_area:.3f}, max={max_area:.3f}, num_leaves={num_leaves}")
+    print(f"Leaf area stats: avg={avg_area:.3f}, min={min_area:.3f}, max={max_area:.3f}, num_leaves={num_leaves}, total_leaf_area={total_leaf_area}")
 
     output_path = os.path.join(os.path.dirname(scene_file), os.path.basename(scene_file).replace(".obj", "_leaf_area.csv"))
 
@@ -218,12 +219,13 @@ def process_leaf_area_file(scene_file: str, leaf_mesh: trimesh.Trimesh) -> None:
         'avg_leaf_area': [avg_area],
         'min_leaf_area': [min_area],
         'max_leaf_area': [max_area],
-        'num_leaves': [num_leaves]
+        'num_leaves': [num_leaves],
+        'total_leaf_area': [total_leaf_area]
     })
     df.to_csv(output_path, index=False)
     print(f"Leaf area saved to {output_path}.")
 
-    return avg_area, min_area, max_area, num_leaves
+    return avg_area, min_area, max_area, num_leaves, total_leaf_area
 
 @contextlib.contextmanager
 def tqdm_joblib(tqdm_object):
@@ -300,7 +302,7 @@ def get_clipped_meshes(
         candidate_triangle_indices = list(leaf_tree.intersection(voxel_bounds.flatten()))
 
         if not candidate_triangle_indices:
-            print(f"No triangles found within voxel bounds {voxel_bounds}.")
+            # print(f"No triangles found within voxel bounds {voxel_bounds}.")
             del leaf_mesh, leaf_tree
             gc.collect()
 
@@ -324,7 +326,7 @@ def get_clipped_meshes(
             clipped_leaf_vertices = np.asarray(clipped_leaf_mesh.points)
             clipped_leaf_faces = np.asarray(clipped_leaf_mesh.faces.reshape((-1, 4))[:, 1:])
 
-            print(f"No valid mesh found after clipping for voxel at {voxel_center}.")
+            # print(f"No valid mesh found after clipping for voxel at {voxel_center}.")
 
             ### DEBUG ###
             # Save .ply files for debugging
@@ -357,7 +359,7 @@ def get_clipped_meshes(
         voxel_bounds = np.stack([min_bound, max_bound], axis=0)
         candidate_triangle_indices = list(wood_tree.intersection(voxel_bounds.flatten()))
         if not candidate_triangle_indices:
-            print(f"No triangles found within voxel bounds {voxel_bounds}.")
+            # print(f"No triangles found within voxel bounds {voxel_bounds}.")
             del wood_mesh, wood_tree
             gc.collect()
 
@@ -1011,70 +1013,72 @@ def process_voxel(
                                 if lw_data["n_hits"] else np.nan)
                 
                 row = {
-                    "voxel_cx": voxel_center[0], "voxel_cy": voxel_center[1], "voxel_cz": voxel_center[2],
+                    "voxel_cx": float(voxel_center[0]), "voxel_cy": float(voxel_center[1]), "voxel_cz": float(voxel_center[2]),
                     "face": face_lbl, "angle_deg": angle,
-                    "dx": dx, "dy": dy, "dz": dz,
+                    "dx": float(dx), "dy": float(dy), "dz": float(dz),
 
                     # per-angle G
-                    "G_leaf_computed": G_leaf_est,
-                    "G_lw_computed":   G_lw_est,
+                    "G_leaf_computed": float(G_leaf_est) if G_leaf_est is not None else np.nan,
+                    "G_lw_computed":  float(G_lw_est) if G_lw_est is not None else np.nan,
 
                     # reference densities
-                    "LAI_Leaf": LAI_leaf, "LAI_lw": LAI_lw,
-                    "LAD_ref":  LAD_ref,  "PAD_ref": PAD_ref,
+                    "LAI_Leaf": float(LAI_leaf) if LAI_leaf is not None else np.nan, 
+                    "LAI_lw": float(LAI_lw) if LAI_lw is not None else np.nan,
+                    "LAD_ref":  float(LAD_ref) if LAD_ref is not None else np.nan,  
+                    "PAD_ref": float(PAD_ref) if PAD_ref is not None else np.nan,
 
                     # CI from true G(ÃÂ¸)
-                    "CI_leaf": CI_leaf,
-                    "CI_lw":   CI_lw,
-                    "alpha":   alpha,
-                    "leaf_fraction": leaf_fraction,
+                    "CI_leaf": float(CI_leaf) if CI_leaf is not None else np.nan,
+                    "CI_lw":   float(CI_lw) if CI_lw is not None else np.nan,
+                    "alpha":   float(alpha) if alpha is not None else np.nan,
+                    "leaf_fraction": float(leaf_fraction) if leaf_fraction is not None else np.nan,
                     # LAD metrics
-                    "LAD_BL":          lad_leaf.get("LAD_BL", np.nan),
-                    "LAD_BL_EPL":      lad_leaf.get("LAD_BL_EPL", np.nan),
-                    "LAD_BL_UEPL":     lad_leaf.get("LAD_BL_UEPL", np.nan),
-                    "LAD_MCF":         lad_leaf.get("LAD_MCF", np.nan),
-                    "LAD_MCF_Corr":    lad_leaf.get("LAD_MCF_Corrected", np.nan),
+                    "LAD_BL":          float(lad_leaf.get("LAD_BL", np.nan)),
+                    "LAD_BL_EPL":      float(lad_leaf.get("LAD_BL_EPL", np.nan)),
+                    "LAD_BL_UEPL":     float(lad_leaf.get("LAD_BL_UEPL", np.nan)),
+                    "LAD_MCF":         float(lad_leaf.get("LAD_MCF", np.nan)),
+                    "LAD_MCF_Corr":    float(lad_leaf.get("LAD_MCF_Corrected", np.nan)),
 
                     # PAD metrics
-                    "PAD_BL":          pad_lw.get("PAD_BL", np.nan),
-                    "PAD_BL_EPL":      pad_lw.get("PAD_BL_EPL", np.nan),
-                    "PAD_BL_UEPL":     pad_lw.get("PAD_BL_UEPL", np.nan),
-                    "PAD_MCF":         pad_lw.get("PAD_MCF", np.nan),
-                    "PAD_MCF_Corr":    pad_lw.get("PAD_MCF_Corrected", np.nan),
-                    "PAD_MLE_pimont_2018": pad_lw.get("PAD_MLE_pimont_2018", np.nan),
+                    "PAD_BL":          float(pad_lw.get("PAD_BL", np.nan)),
+                    "PAD_BL_EPL":      float(pad_lw.get("PAD_BL_EPL", np.nan)),
+                    "PAD_BL_UEPL":     float(pad_lw.get("PAD_BL_UEPL", np.nan)),
+                    "PAD_MCF":         float(pad_lw.get("PAD_MCF", np.nan)),
+                    "PAD_MCF_Corr":    float(pad_lw.get("PAD_MCF_Corrected", np.nan)),
+                    "PAD_MLE_pimont_2018": float(pad_lw.get("PAD_MLE_pimont_2018", np.nan)),
                     # extra LAD estimates that lived in the PAD dict
-                    "LAD_MLE_pimont_2019": pad_lw.get("LAD_MLE_pimont_2019", np.nan),
-                    "LAD_MLE_soma":        pad_lw.get("LAD_MLE_Soma_21",   np.nan),
+                    "LAD_MLE_pimont_2019": float(pad_lw.get("LAD_MLE_pimont_2019", np.nan)),
+                    "LAD_MLE_soma":        float(pad_lw.get("LAD_MLE_Soma_21",   np.nan)),
                     # raw stats
                     # raw ray statistics
-                    "Total_number_of_rays": lw_data.get("N", np.nan),
-                    "sum_path_length":      lw_data.get("sum_delta", np.nan),
-                    "mean_path_length":     lw_data.get("delta_bar", np.nan),
+                    "Total_number_of_rays": int(lw_data.get("N", np.nan)),
+                    "sum_path_length":      float(lw_data.get("sum_delta", np.nan)),
+                    "mean_path_length":     float(lw_data.get("delta_bar", np.nan)),
 
                     # hits
-                    "num_leaf_hits": leaf_data.get("n_hits", np.nan),
-                    "num_lw_hits":   lw_data.get("n_hits", np.nan),
-                    "num_hits":      lw_data.get("N",      np.nan),   # kept for legacy parity
+                    "num_leaf_hits": int(leaf_data.get("n_hits", np.nan)),
+                    "num_lw_hits":   int(lw_data.get("n_hits", np.nan)),
+                    "num_hits":      int(lw_data.get("N", np.nan)),   # kept for legacy parity
 
                     # interception / pgap
-                    "I_leaf": leaf_data.get("I", np.nan),
-                    "I_lw":   lw_data.get("I", np.nan),
-                    "pgap_leaf": 1.0 - leaf_data.get("I", np.nan),
-                    "pgap_lw":   1.0 - lw_data.get("I", np.nan),
+                    "I_leaf": float(leaf_data.get("I", np.nan)),
+                    "I_lw":   float(lw_data.get("I", np.nan)),
+                    "pgap_leaf": 1.0 - float(leaf_data.get("I", np.nan)),
+                    "pgap_lw":   1.0 - float(lw_data.get("I", np.nan)),
 
                     # freepath sums & means
-                    "sum_free_path_length":           lw_data.get("sum_z",             np.nan),
-                    "sum_effective_free_path_length": lw_data.get("sum_z_e",           np.nan),
+                    "sum_free_path_length":           float(lw_data.get("sum_z",             np.nan)),
+                    "sum_effective_free_path_length": float(lw_data.get("sum_z_e",           np.nan)),
                     "sum_effective_free_path_length_hit":
-                        lw_data.get("sum_hits_z_e", np.nan),
+                        float(lw_data.get("sum_hits_z_e", np.nan)),
                     "sum_effective_free_path_length_hit_leaf":
-                        leaf_data.get("sum_hits_z_e", np.nan),
+                        float(leaf_data.get("sum_hits_z_e", np.nan)),
 
-                    "mean_free_path_length":              lw_data.get("mean_z",        np.nan),
-                    "mean_effective_path_length":         lw_data.get("mean_delta_e",  np.nan),
-                    "var_effective_path_length":          lw_data.get("var_delta_e",   np.nan),
-                    "mean_effective_free_path_length":    lw_data.get("mean_efpl_free",np.nan),
-                    "var_effective_free_path_length":     lw_data.get("var_efpl_free", np.nan),
+                    "mean_free_path_length":              float(lw_data.get("mean_z",        np.nan)),
+                    "mean_effective_path_length":         float(lw_data.get("mean_delta_e",  np.nan)),
+                    "var_effective_path_length":          float(lw_data.get("var_delta_e",   np.nan)),
+                    "mean_effective_free_path_length":    float(lw_data.get("mean_efpl_free",np.nan)),
+                    "var_effective_free_path_length":     float(lw_data.get("var_efpl_free", np.nan)),
                 }
 
                 # Add LIAD bins to the row
@@ -1168,7 +1172,7 @@ if __name__ == "__main__":
     leaf_area_csv = os.path.join(os.path.dirname(args.scene_file), os.path.basename(args.scene_file).replace(".obj", "_leaf_area.csv"))
     if not os.path.exists(leaf_area_csv):
         print(f"Leaf area CSV {leaf_area_csv} does not exist. Generating leaf area data.")
-        avg_leaf_area, min_leaf_area, max_leaf_area, num_leaves = process_leaf_area_file(
+        avg_leaf_area, min_leaf_area, max_leaf_area, num_leaves, total_leaf_area = process_leaf_area_file(
             scene_file=args.scene_file,
             leaf_mesh=leaf_mesh
         )
@@ -1180,6 +1184,7 @@ if __name__ == "__main__":
         min_leaf_area = df['min_leaf_area'][0]
         max_leaf_area = df['max_leaf_area'][0]
         num_leaves = df['num_leaves'][0]
+        total_leaf_area = df['total_leaf_area'][0]
 
     for voxel_size in voxel_sizes:
         # Batch voxel centers into number of CPUs
@@ -1207,7 +1212,7 @@ if __name__ == "__main__":
                 traceback.print_exc()
                 return [], []
             
-        def parallel_clip_meshes(voxel_centers, voxel__size, leaf_mesh_file, wood_mesh_file, workers):
+        def parallel_clip_meshes(voxel_centers, voxel_size, leaf_mesh_file, wood_mesh_file, workers):
 
             leaf_mesh = memory.cache(load_mesh_trimesh)(leaf_mesh_file)
             wood_mesh = memory.cache(load_mesh_trimesh)(wood_mesh_file)
@@ -1215,7 +1220,7 @@ if __name__ == "__main__":
             pbar = tqdm(total=len(voxel_centers), desc="Clipping meshes", unit="voxel")
             with tqdm_joblib(pbar):
                 results = Parallel(n_jobs=workers, backend='loky', prefer="processes")(
-                    delayed(get_clipped_meshes)(leaf_mesh, wood_mesh, voxel_center, voxel__size)
+                    delayed(get_clipped_meshes)(leaf_mesh, wood_mesh, voxel_center, voxel_size)
                     for voxel_center in voxel_centers
                 )
             pbar.close()
@@ -1241,10 +1246,10 @@ if __name__ == "__main__":
             # Filter out None results
             vc, clipped_leaf_vertices, clipped_leaf_faces, clipped_wood_vertices, clipped_wood_faces = zip(*batch_clipped_results)
             # Remove None meshes from the lists
-            valid_indices = [i for i, (v, lv, lf, wv, wf) in enumerate(batch_clipped_results) if lv.shape[0] != 0 and lf.shape[0] != 0 and wv.shape[0] != 0 and wf.shape[0] != 0]
+            valid_indices = [i for i, (v, lv, lf, wv, wf) in enumerate(batch_clipped_results) if lv.shape[0] != 0 or lf.shape[0] != 0 or wv.shape[0] != 0 or wf.shape[0] != 0]
             
             if len(valid_indices) == 0:
-                print(f"No valid clipped meshes found for voxel size {voxel_size} in batch {j}. Skipping processing.")
+                # print(f"No valid clipped meshes found for voxel size {voxel_size} in batch {j}. Skipping processing.")
                 continue
             
             vc = [vc[i] for i in valid_indices]
@@ -1309,8 +1314,8 @@ if __name__ == "__main__":
         print(f"Preprocessing time: {clip_time}")
 
         results = []
-        for i, (voxel_center, leaf_mesh, wood_mesh) in enumerate(tqdm(zip(valid_voxel_centers, valid_clipped_leaf_meshes, valid_clipped_wood_meshes), total=len(valid_voxel_centers), desc="Processing voxels", unit="voxel")):
-            result, _ = worker(voxel_center, leaf_mesh, wood_mesh)
+        for i, (vc, lm, wm) in enumerate(tqdm(zip(valid_voxel_centers, valid_clipped_leaf_meshes, valid_clipped_wood_meshes), total=len(valid_voxel_centers), desc="Processing voxels", unit="voxel")):
+            result, _ = worker(vc, lm, wm)
             df = pd.DataFrame(result)
             results.append(df)
 
@@ -1326,6 +1331,23 @@ if __name__ == "__main__":
         output_basename = os.path.basename(args.scene_file).replace('.obj', f'_results_{voxel_size}.csv') if LEAF_OFF is False else os.path.basename(args.scene_file).replace('.obj', f'_results_{voxel_size}_leaf_off.csv')
         output_path = os.path.join(os.path.dirname(args.scene_file), output_basename)
         df.to_csv(output_path, index=False)
+
+        ### DEBUG TOTAL LEAF AREA ###
+        # Compute total leaf area only for unique voxel centers
+        unique_voxels = df.drop_duplicates(subset=['voxel_cx', 'voxel_cy', 'voxel_cz'])
+        total_leaf_area = unique_voxels['LAI_Leaf'].sum() * (voxel_size ** 2)
+        leaf_area_test_path = os.path.join(os.path.dirname(args.scene_file), os.path.basename(args.scene_file).replace('.obj', f'_leaf_area_test.csv'))
+        debug_df = pd.DataFrame([{
+            "voxel_size": voxel_size,
+            "measured_leaf_area": total_leaf_area
+        }])
+        
+        if os.path.exists(leaf_area_test_path):
+            df_exist = pd.read_csv(leaf_area_test_path)
+            df_exist = pd.concat([df_exist, debug_df], ignore_index=True)
+            df_exist.to_csv(leaf_area_test_path, index=False)
+        else:
+            debug_df.to_csv(leaf_area_test_path, index=False)
 
         # Save performance results to a separate CSV file
         perf_df = pd.DataFrame(performance_results)
