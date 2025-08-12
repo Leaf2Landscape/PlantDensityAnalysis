@@ -55,7 +55,7 @@
             "console": "integratedTerminal",
             "args": [
                 "/home/capheus/projects/RAJA_TEST/1011_etri_plano_diamond.obj",
-                "--voxel_sizes", "2.0", "1.0", "0.5", "0.2"
+                "--voxel_sizes", "0.2"
             ]
         },
         {
