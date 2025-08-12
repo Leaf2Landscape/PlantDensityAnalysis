@@ -10,9 +10,11 @@ dependencies:
   - pyarrow
   - pyvista
   - joblib
+  - tqdm
   - numba
   - scikit-learn
   - trimesh
+  - rtree
   - ipykernel
   - dask
   - distributed
