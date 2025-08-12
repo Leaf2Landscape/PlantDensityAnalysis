@@ -1,8 +1,8 @@
 name: plantdensityanalysis_env
 channels:
-  - rios
-  - open3d-admin
   - conda-forge
+  - open3d-admin
+  - rios
   - defaults
 dependencies:
   - numpy
