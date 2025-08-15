@@ -49,7 +49,7 @@ voxel_ray_intersection_schema = pa.schema([
     pa.field('point_x', pa.float32()),
     pa.field('point_y', pa.float32()),
     pa.field('point_z', pa.float32()),
-    pa.field('intensity', pa.float32()),
+    pa.field('echo_intensity', pa.float32()),
     pa.field('return_number', pa.int32()),
     pa.field('number_of_returns', pa.int32()),
     pa.field('normal_x', pa.float32()),
@@ -112,15 +112,14 @@ voxel_metrics_schema_PRECALC = pa.schema([
     pa.field('P_first', pa.float32()),
     pa.field('P_equal', pa.float32()),
     pa.field('P_intensity', pa.float32()),
-    pa.field('P_ideal', pa.float32()),
-    pa.field('P_exact', pa.float32()),
-    pa.field('LAD_first', pa.float32()),
-    pa.field('LAD_equal', pa.float32()),
-    pa.field('LAD_intensity', pa.float32()),
-    pa.field('LAD_ideal', pa.float32()),
-    pa.field('LAD_exact', pa.float32()),
+    pa.field('LAD_BL_first', pa.float32()),
+    pa.field('LAD_BL_equal', pa.float32()),
+    pa.field('LAD_BL_intensity', pa.float32()),
     pa.field('LAD_MLE_geom', pa.float32()),
-    pa.field('LAD_MLE_energy', pa.float32()),
+    pa.field('PAD_BL_first', pa.float32()),
+    pa.field('PAD_BL_equal', pa.float32()),
+    pa.field('PAD_BL_intensity', pa.float32()),
+    pa.field('PAD_MLE_geom', pa.float32()),
     pa.field('LIAD_leaf_bin_2.5', pa.float32()),
     pa.field('LIAD_leaf_bin_7.5', pa.float32()),
     pa.field('LIAD_leaf_bin_12.5', pa.float32()),
@@ -229,7 +228,7 @@ valid_rays_schema = pa.schema([
     pa.field('point_x', pa.float32()),
     pa.field('point_y', pa.float32()),
     pa.field('point_z', pa.float32()),
-    pa.field('intensity', pa.float32()),
+    pa.field('echo_intensity', pa.float32()),
     pa.field('return_number', pa.int32()),
     pa.field('number_of_returns', pa.int32()),
     pa.field('normal_x', pa.float32()),
@@ -243,7 +242,9 @@ valid_rays_schema = pa.schema([
 # Commonly used functions that offer small utilities for components of other scripts.
 
 def compute_normals_weights_from_points(points, knn=6):
+    from tqdm import tqdm
     import open3d as o3d
+    from joblib import Parallel, delayed
     """
     Get normals and weights from points.
     
@@ -261,7 +262,7 @@ def compute_normals_weights_from_points(points, knn=6):
     # Compute the normals with open3d
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
-    voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=5.0)
+    voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=10.0)
 
     normals = np.zeros((len(pcd.points), 3))
     weights = np.zeros(len(pcd.points))
@@ -271,13 +272,16 @@ def compute_normals_weights_from_points(points, knn=6):
     def unique_key_from_voxel_centre(voxel_centre):
         return f"{voxel_centre[0]}_{voxel_centre[1]}_{voxel_centre[2]}"
 
-    for idx, point in enumerate(np.asarray(pcd.points)):
+    # Helper to get voxel id for a point
+    points_array = np.asarray(pcd.points)
+    for idx, point in tqdm(enumerate(points_array), total=len(points_array), desc="Assigning points to voxels"):
         voxel_id = unique_key_from_voxel_centre(voxel_grid.get_voxel(point))
-        if voxel_id not in voxel_dict.keys():
-            voxel_dict[voxel_id] = []        
+        if voxel_id not in voxel_dict:
+            voxel_dict[voxel_id] = []
         voxel_dict[voxel_id].append((idx, point))
 
-    for voxel, points in voxel_dict.items():
+    # Iterate over voxels with progress bar
+    for voxel, points in tqdm(voxel_dict.items(), total=len(voxel_dict), desc="Estimating normals/weights per voxel"):
         idxs, points = zip(*points)
 
         voxel_pcd = o3d.geometry.PointCloud()
@@ -990,7 +994,9 @@ def find_viewing_angles(directions, reference_vector=np.array([0, 0, 1])):
     return viewing_angle
 
 # Function to traverse the voxels and find ray intersections
-def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_dir, epsilon=1e-6):
+def traverse_voxels(voxel_references, ray_partition, voxels_per_compute, temp_dir, epsilon=1e-6):
+    import logging
+    logging.basicConfig(level=logging.INFO)
 
     if ray_partition.empty:
         return pd.DataFrame(columns=voxel_ray_intersection_schema.names)
@@ -1003,6 +1009,7 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
     points = np.asarray(ray_partition[['point_x', 'point_y', 'point_z']].values)
     normals = np.asarray(ray_partition[['normal_x', 'normal_y', 'normal_z']].values)
     point_weights = np.asarray(ray_partition['point_weight'].values)
+    echo_intensities = np.asarray(ray_partition['echo_intensity'].values)
     is_leaf = np.asarray(ray_partition['is_leaf'].values)
 
     num_rays = len(ray_partition)
@@ -1028,6 +1035,7 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
     points = points[np.newaxis, :, :]    
     normals = normals[np.newaxis, :, :]
     point_weights = point_weights[np.newaxis, :]
+    echo_intensities = echo_intensities[np.newaxis, :]
 
     ### TEST DATA ###
     # voxel_mins = np.array([
@@ -1059,115 +1067,66 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
     # - Ray 2 intersects voxel 2
     # - Ray 3 intersects voxel 3
 
-    def broadcasted_ray_tracing(voxel_mins, voxel_maxs, origins, directions, beam_divergence = 0.001, epsilon=np.float32(1e-6)):
-        # Calculate t_min and t_max for each dimension
+    def broadcasted_ray_tracing(voxel_mins, voxel_maxs, origins, directions, beam_divergence=0.001, epsilon=np.float32(1e-6)):
+        # Optimized ray-AABB intersection for masking only
+        
+        # Handle near-zero directions efficiently
         directions = np.where(
             np.abs(directions) <= epsilon,
             np.where(directions == 0, epsilon, np.sign(directions) * epsilon),
             directions
         )
-
-        t_min = (voxel_mins - origins) / directions
-        t_max = (voxel_maxs - origins) / directions
-
-        t_enter = np.max(np.minimum(t_min, t_max), axis=2)
-        t_exit = np.min(np.maximum(t_min, t_max), axis=2)
-
-        # Check if t_enter is less than t_exit
+        
+        # Use inverse directions for faster computation
+        inv_directions = 1.0 / directions
+        
+        # Compute intersection parameters
+        t1 = (voxel_mins - origins) * inv_directions
+        t2 = (voxel_maxs - origins) * inv_directions
+        
+        # Find entry and exit points
+        t_enter = np.maximum.reduce(np.minimum(t1, t2), axis=2)
+        t_exit = np.minimum.reduce(np.maximum(t1, t2), axis=2)
+        
+        # Ray intersects if t_enter <= t_exit and t_exit >= 0
         mask = (t_enter <= t_exit + epsilon) & (t_exit >= -epsilon)
-
-        # Setup arrays for returned values
-        # t_enter_coords = np.full((mask.shape[0], mask.shape[1], origins.shape[2]), np.nan, dtype=np.float32)
-        # t_exit_coords = np.full((mask.shape[0], mask.shape[1], origins.shape[2]), np.nan, dtype=np.float32)
-        # t_entry_radii = np.full_like(mask, np.nan, dtype=np.float32)
-        # t_exit_radii = np.full_like(mask, np.nan, dtype=np.float32)
-
-        # # If there are any true values in mask, run calculations
-        # has_nonzero = np.any(mask, axis=(0,1))
-        # if has_nonzero:
-        #     # Calculate the entry and exit coordinates for valid rays
-        #     origins = np.broadcast_to(origins, (mask.shape[0], mask.shape[1], origins.shape[2]))
-        #     directions = np.broadcast_to(directions, (mask.shape[0], mask.shape[1], directions.shape[2]))
-            
-        #     origins = origins[mask]
-        #     directions = directions[mask]
-        #     t_enter = t_enter[mask]
-        #     t_exit = t_exit[mask]
-            
-        #     t_enter_coords[mask] = origins + t_enter[:, np.newaxis] * directions
-        #     t_exit_coords[mask] = origins + t_exit[:, np.newaxis] * directions
-
-        #     # Calculate the radii from beam divergence using t_enter and t_exit as distances
-        #     t_entry_radii[mask] = (t_enter * np.tan(beam_divergence)).astype(np.float32)
-        #     t_exit_radii[mask] = (t_exit * np.tan(beam_divergence)).astype(np.float32)
         
-        return mask # , t_enter_coords, t_exit_coords, t_entry_radii, t_exit_radii
+        return mask
 
-
-        
-    
     # Calculate mask, t_enter, and t_exit for max voxels that fit into memory
     masks = {}
-    # t_enter_coords = {}
-    # t_exit_coords = {}
-    # t_entry_radiis = {}
-    # t_exit_radiis = {}
 
     temp_dir = tempfile.mkdtemp(dir=temp_dir)
-    os.makedirs(temp_dir, exist_ok=True)
 
     # Generate a unique ID for the process
     process_id = uuid.uuid4().hex
 
-    print(f"Process {process_id}: Start {num_rays} rays, {num_voxels} voxels, in ({int(np.ceil(num_voxels / chunks_per_compute))}) chunks.")
+    print(f"Process {process_id}: Start {num_rays} rays, {num_voxels} voxels, in ({int(np.ceil(num_voxels / voxels_per_compute))}) chunks.")
     
-    for i in range(0, voxel_mins.shape[0], chunks_per_compute):
+    for i in range(0, voxel_mins.shape[0], voxels_per_compute):
 
         # Calculate the number of chunks to process in this iteration
-        chunk_mask = broadcasted_ray_tracing( #, chunk_t_enter_coord, chunk_t_exit_coord, chunk_t_entry_radii, chunk_t_exit_radii = broadcasted_ray_tracing(
-            voxel_mins[i:i+chunks_per_compute, :, :], 
-            voxel_maxs[i:i+chunks_per_compute, :, :], 
+        chunk_mask = broadcasted_ray_tracing(
+            voxel_mins[i:i+voxels_per_compute, :, :], 
+            voxel_maxs[i:i+voxels_per_compute, :, :], 
             origins, 
             directions
         )
 
         # Save chunk_mask, t_enter, and t_exit to disk with unique filenames
         chunk_mask_filename = os.path.join(temp_dir, f"chunk_mask_{i}_{process_id}.npy")
-        # t_enter_filename = os.path.join(temp_dir, f"t_enter_{i}_{process_id}.npy")
-        # t_exit_filename = os.path.join(temp_dir, f"t_exit_{i}_{process_id}.npy")
-        # t_entry_radii_filename = os.path.join(temp_dir, f"t_entry_radii_{i}_{process_id}.npy")
-        # t_exit_radii_filename = os.path.join(temp_dir, f"t_exit_radii_{i}_{process_id}.npy")
 
         # Save arrays to disk
         np.save(chunk_mask_filename, chunk_mask)
-        # np.save(t_enter_filename, chunk_t_enter_coord)
-        # np.save(t_exit_filename, chunk_t_exit_coord)
-        # np.save(t_entry_radii_filename, chunk_t_entry_radii)
-        # np.save(t_exit_radii_filename, chunk_t_exit_radii)
 
         dtype = chunk_mask.dtype
         shape = chunk_mask.shape
         masks[i] = [chunk_mask_filename, dtype, shape]
 
-        # dtype = chunk_t_enter_coord.dtype
-        # shape = chunk_t_enter_coord.shape
-        # t_enter_coords[i] = [t_enter_filename, dtype, shape]
-
-        # dtype = chunk_t_exit_coord.dtype
-        # shape = chunk_t_exit_coord.shape
-        # t_exit_coords[i] = [t_exit_filename, dtype, shape]
-
-        # dtype = chunk_t_entry_radii.dtype
-        # shape = chunk_t_entry_radii.shape
-        # t_entry_radiis[i] = [t_entry_radii_filename, dtype, shape]
-
-        # dtype = chunk_t_exit_radii.dtype
-        # shape = chunk_t_exit_radii.shape
-        # t_exit_radiis[i] = [t_exit_radii_filename, dtype, shape]
-
-
-        del chunk_mask #, chunk_t_enter_coord, chunk_t_exit_coord, chunk_t_entry_radii, chunk_t_exit_radii
+        del chunk_mask
         gc.collect()
+
+        logging.info(f"Chunk {i}: {(i+1) * voxels_per_compute} voxels / {voxel_mins.shape[0]}")
 
     print(f"Process {process_id}: Finished {num_rays} rays, {num_voxels} voxels. Concatenating results...")
 
@@ -1421,7 +1380,7 @@ def traverse_voxels(voxel_references, ray_partition, chunks_per_compute, temp_di
 # Functions that are used to perform large operations, such as calculating metrics or processing data.
 
 # Prepare data from helios simulations
-def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, use_class=False, debug=True, epsilon=1e-6):
+def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, wood_object_ids, use_class=False, debug=False, epsilon=1e-6):
     """
     Main function to process helios simulation data.
     
@@ -1556,10 +1515,10 @@ def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, 
         leg_rays = leg_rays.map_partitions(valid_mask, meta=leg_rays._meta)
 
         # Import all hits into dask dataframe
-        leg_hits = dd.read_csv(xyz_file, delimiter=' ', header=None, names=['point_x', 'point_y', 'point_z', 'intensity', 'echo_width', 'return_number', 'number_of_returns', 'ray_id', 'hit_object_id', 'class', 'gps_time'])
-        leg_hits = leg_hits.drop(columns=['echo_width', 'gps_time'])
+        leg_hits = dd.read_csv(xyz_file, delimiter=' ', header=None, names=['point_x', 'point_y', 'point_z', 'echo_intensity', 'echo_width', 'return_number', 'number_of_returns', 'ray_id', 'hit_object_id', 'class', 'gps_time'])
 
         leg_rays = leg_rays.merge(leg_hits, on='ray_id', how='left')
+        leg_rays = leg_rays.drop(columns=['gps_time', 'echo_width']) # drop gps_time post merge
 
         return leg_rays
     
@@ -1608,8 +1567,13 @@ def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, 
             
             logger.info(f"Saving valid rays for leg {leg} to {rays_file}")
             rays['leg_id'] = leg
-            leaf_key = 'hit_object_id' if not use_class else 'class'
-            rays['is_leaf'] = rays[leaf_key].isin(leaf_object_ids)
+            hit_object_key = 'hit_object_id' if not use_class else 'class'
+            rays['is_leaf'] = rays[hit_object_key].isin(leaf_object_ids)
+            # Filter out points with unknown object ids
+            rays = rays[
+                pd.isna(rays[hit_object_key]) |
+                rays[hit_object_key].isin(wood_object_ids + leaf_object_ids)
+            ]
 
             rays = rays.drop(columns=['hit_object_id', 'class'])
             rays['normal_x'] = np.nan
@@ -1628,6 +1592,52 @@ def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, 
             total_points += int(num_points)
             logger.info(f"Updated totals: {total_rays} rays and {total_points} points.")
     
+    if debug:
+        print("Debugging output...")
+        import pyvista as pv
+        import matplotlib.pyplot as plt
+        # Plot a side on image of one leg of valid_rays with leaf_hits being green and wood_hits brown
+        valid_ray_parquets = glob.glob(os.path.join(output_dir, '*valid_rays.parquet'))
+        test_file = valid_ray_parquets[0] if valid_ray_parquets else None
+
+        if test_file:
+            df = pd.read_parquet(test_file)
+            leg_id = df['leg_id'].iloc[0] if 'leg_id' in df.columns else 0
+            # First, create the mask for non-NaN point_x, then filter the dataframe
+            df = df[~df['point_x'].isna()][['point_x', 'point_y', 'point_z', 'is_leaf']]
+            leaf_df = df[df['is_leaf']]
+            wood_df = df[~df['is_leaf']]
+
+            # Extract points and plot using matplotlib
+            leaf_points = leaf_df[['point_x', 'point_y', 'point_z']].values
+            del leaf_df, df  # Free up memory
+            wood_points = wood_df[['point_x', 'point_y', 'point_z']].values
+            del wood_df
+
+            fig = plt.figure(figsize=(10, 6))
+            ax = fig.add_subplot(111)
+
+            # Plot leaf points in green
+            ax.scatter(leaf_points[:, 0], leaf_points[:, 2], c='green', s=1, label='Leaf')
+
+            # Plot wood points in brown
+            ax.scatter(wood_points[:, 0], wood_points[:, 2], c='saddlebrown', s=1, label='Wood')
+
+            print("Plotting leaf and wood points to check classification...")
+            ax.set_xlabel('X')
+            ax.set_ylabel('Z')
+            ax.set_title(f'Leaf and Wood Point Check - Leg {leg_id}')
+            ax.legend()
+            plt.show()
+            plt.savefig(os.path.join(output_dir, f'leg_{leg_id}_leaf_wood_check.png'))
+
+            # Save 3d .ply
+            print("Saving leaf and wood point clouds...")
+            pcd_leaf = pv.PolyData(leaf_points)
+            pcd_leaf.save(os.path.join(output_dir, f'leg_{leg_id}_leaf_points_test.ply'))
+            pcd_wood = pv.PolyData(wood_points)
+            pcd_wood.save(os.path.join(output_dir, f'leg_{leg_id}_wood_points_test.ply'))
+
     statement= "Helios data preparation complete."
     print(statement)
     logger.info(statement)
@@ -2188,12 +2198,12 @@ def get_voxel_metrics(intersections_files, lambda_1, is_leaf_true=True, debug=Tr
         LAD_first = LAD_equal = LAD_int = LAD_ideal = LAD_exact = np.nan
         LAD_MLE_g = LAD_MLE_e = np.nan
 
-        if {"echo_type", "echo_intensity", "alpha_energy"}.issubset(voxel_df.columns):
+        if {"echo_type", "echo_intensity"}.issubset(voxel_df.columns):
 
             pivot = voxel_df.pivot_table(
                 index='ray_id',
                 columns='echo_type',
-                values=['echo_intensity', 'alpha_energy'],
+                values='echo_intensity',
                 aggfunc='sum',
                 fill_value=0,
                 observed=True
@@ -2205,8 +2215,7 @@ def get_voxel_metrics(intersections_files, lambda_1, is_leaf_true=True, debug=Tr
                     return pd.Series(0.0, index=pivot.index, dtype=float)
                 
             I_bef, I_in, I_aft = (_col(pivot, "echo_intensity", k) for k in (0, 1, 2))
-            R_bef, R_in, R_aft = (_col(pivot, "alpha_energy", k) for k in (0, 1, 2))
-            R_miss = 1.0 - (R_bef + R_in + R_aft)
+           
 
             E_bef, E_in, E_aft = (s.astype(int) for s in (I_bef, I_in, I_aft))
 
@@ -2253,14 +2262,6 @@ def get_voxel_metrics(intersections_files, lambda_1, is_leaf_true=True, debug=Tr
             LAD_MLE_g = LAD_MLE_geom_corr(
                 num_leaf_hits, ubeam_leaf, ubeam_lw, ufree,
                 G_leaf, CI=CI_vox, k1=k1_vox, bias_corr=True,
-            )
-
-            alpha_e   = voxel_df["alpha_energy"].values
-            alpha_tot = np.nan_to_num(alpha_e) + np.nan_to_num(1.0 - alpha_e)
-
-            LAD_MLE_e = LAD_MLE_energy_corr(
-                alpha_e[leaf_mask], alpha_tot, ubeam_leaf, ubeam_lw,
-                ufree, G_leaf, CI=CI_vox, k1=k1_vox, bias_corr=True,
             )
 
         data = {
@@ -2774,7 +2775,7 @@ def convert_parquet_to_csv(parquet_file, output_file):
 
     df.to_csv(output_file, index=False)
 
-def add_normals_weights_to_valid_rays(files, knn=6):
+def add_normals_weights_to_valid_rays(files, knn=6, debug=False):
     """
     Add normals and weights to the points in the valid rays files.
     """
@@ -2782,6 +2783,8 @@ def add_normals_weights_to_valid_rays(files, knn=6):
     import numpy as np
     from sklearn.neighbors import NearestNeighbors
     import os
+    import shutil
+    from dask.diagnostics import ProgressBar
 
     # Read the valid rays files
     dfs = []
@@ -2799,48 +2802,44 @@ def add_normals_weights_to_valid_rays(files, knn=6):
     # Combine all dataframes into one
     valid_rays_df = dd.concat(dfs, axis=0, ignore_index=True)
     valid_rays_df = valid_rays_df.reset_index(drop=True)
+    with ProgressBar():
+        valid_rays_df = valid_rays_df.compute()
 
-    # Filter out leaf hits (that definitely hit something)
-    leaf_df = valid_rays_df[(valid_rays_df['is_leaf'] == True)]
-    leaf_df = leaf_df.compute()
-    leaf_points = leaf_df[['point_x', 'point_y', 'point_z']].values
+        leaf_idx = valid_rays_df[valid_rays_df['is_leaf'] == True].index
+        leaf_points = valid_rays_df.loc[leaf_idx, ['point_x', 'point_y', 'point_z']].values
 
     # Calculate normals and weights on all leaf hits
     normals, weights = compute_normals_weights_from_points(points=leaf_points, knn=knn)
     del leaf_points
+    
+    with ProgressBar():
+        valid_rays_df.loc[leaf_idx, 'normal_x'] = normals[:, 0].astype(np.float32)
+        valid_rays_df.loc[leaf_idx, 'normal_y'] = normals[:, 1].astype(np.float32)
+        valid_rays_df.loc[leaf_idx, 'normal_z'] = normals[:, 2].astype(np.float32)
+        valid_rays_df.loc[leaf_idx, 'point_weight'] = weights.astype(np.float32)
 
-    leaf_df["normal_x"] = normals[:, 0]
-    leaf_df["normal_y"] = normals[:, 1]
-    leaf_df["normal_z"] = normals[:, 2]
-    leaf_df["point_weight"] = weights
-    del normals, weights
+        # Save updated valid_rays parquet files per leg
+        output_files = []
 
-    valid_rays_df = valid_rays_df.compute()
+        grouped_df = valid_rays_df.groupby('leg_id')
+        DEBUG_PRINT = False
+        def save_group(group):
+            nonlocal DEBUG_PRINT
+            leg_id = group['leg_id'].iloc[0]
+            output_file = os.path.join(valid_ray_dir, f"leg_{leg_id}_valid_rays.parquet")
 
-    valid_rays_df = valid_rays_df.merge(
-        leaf_df[['ray_id', 'point_x', 'point_y', 'point_z', 'normal_x', 'normal_y', 'normal_z', 'point_weight']],
-        on=['ray_id', 'point_x', 'point_y', 'point_z'],
-        how='left',
-        suffixes=('_OLD', '')
-    )
-    del leaf_df
+            if debug and not DEBUG_PRINT:
+                print("Debugging enabled:")
+                DEBUG_PRINT = True
+                print(group[~group['point_x'].isna() & group['is_leaf'] == True].head())
 
-    valid_rays_df.drop(columns=['normal_x_OLD', 'normal_y_OLD', 'normal_z_OLD', 'point_weight_OLD'], inplace=True, errors='ignore')
+            group.to_parquet(output_file, engine='pyarrow', index=False, schema=valid_rays_schema)
+            output_files.append(output_file)
+            print(f"Saved {output_file}")
 
-    # Save updated valid_rays parquet files per leg
-    output_files = []
-    grouped_df = valid_rays_df.groupby('leg_id')
-    for leg_id, group in grouped_df:
-        output_file = os.path.join(valid_ray_dir, f"leg_{leg_id}_valid_rays.parquet")
-        old_file = output_file.replace('.parquet', '_old.parquet')
-        if os.path.exists(output_file):
-            os.rename(output_file, old_file)
+        grouped_df.apply(save_group, include_groups=True)
 
-        group.to_parquet(output_file, engine='pyarrow', index=False)
-        output_files.append(output_file)
-        print(f"Saved {output_file}")
-
-    print(f"Saved {len(output_files)} valid rays files with normals and weights.")
+        print(f"Saved {len(output_files)} valid rays files with normals and weights.")
 
 def add_normals_weights_from_intersection_files(files, knn=6):
     """
@@ -2850,6 +2849,7 @@ def add_normals_weights_from_intersection_files(files, knn=6):
     import numpy as np
     from sklearn.neighbors import NearestNeighbors
     import os
+
 
     # Read the intersection files
     dfs = []
