@@ -35,9 +35,9 @@ Each index corresponds to a ray that intersects a voxel.
 """
 voxel_ray_intersection_schema = pa.schema([
     pa.field('voxel_size', pa.float32()),
-    pa.field('voxel_id', pa.int32()),
-    pa.field('leg_id', pa.int64()),
-    pa.field('ray_id', pa.int64()),
+    pa.field('voxel_id', pa.uint64()),
+    pa.field('leg_id', pa.uint64()),
+    pa.field('ray_id', pa.uint64()),
     pa.field('t_entry_x', pa.float32()),
     pa.field('t_entry_y', pa.float32()),
     pa.field('t_entry_z', pa.float32()),
@@ -68,7 +68,7 @@ Since this one is only used to store to a csv file (for final output), it is not
 
 """
 voxel_metrics_schema_old = pa.schema([
-    pa.field('voxel_id', pa.uint32()),
+    pa.field('voxel_id', pa.uint64()),
     pa.field('num_rays', pa.uint32()),
     pa.field('num_hits', pa.uint32()),
     pa.field('num_leaf_hits', pa.uint32()),
@@ -97,7 +97,7 @@ voxel_metrics_schema_old = pa.schema([
 ])
 
 voxel_metrics_schema_PRECALC = pa.schema([
-    pa.field('voxel_id', pa.uint32()),
+    pa.field('voxel_id', pa.uint64()),
     pa.field('num_rays', pa.uint32()),
     pa.field('num_hits', pa.uint32()),
     pa.field('num_leaf_hits', pa.uint32()),
@@ -163,7 +163,7 @@ TEST ONLY at this stage.
 
 # Create occlusion metrics dataframe
 voxel_occ_schema = pa.schema([
-    pa.field('voxel_id', pa.uint32()),
+    pa.field('voxel_id', pa.uint64()),
     pa.field('voxel_cx', pa.float32()),
     pa.field('voxel_cy', pa.float32()),
     pa.field('voxel_cz', pa.float32()),
@@ -204,7 +204,7 @@ voxel_occ_schema = pa.schema([
 This schema is used to store the reference data for each voxel.
 """
 reference_schema = pa.schema([
-    pa.field('voxel_id', pa.uint32()),
+    pa.field('voxel_id', pa.uint64()),
     pa.field('voxel_size', pa.float32()),
     pa.field('CI', pa.float32()),
     pa.field('woody_vol_proportion', pa.float32()),
@@ -216,8 +216,8 @@ reference_schema = pa.schema([
 
 # Valid Rays Schema
 valid_rays_schema = pa.schema([
-    pa.field('leg_id', pa.int64()),
-    pa.field('ray_id', pa.int64()),
+    pa.field('leg_id', pa.uint64()),
+    pa.field('ray_id', pa.uint64()),
     pa.field('origin_x', pa.float32()),
     pa.field('origin_y', pa.float32()),
     pa.field('origin_z', pa.float32()),
@@ -993,7 +993,7 @@ def find_viewing_angles(directions, reference_vector=np.array([0, 0, 1])):
     return viewing_angle
 
 # Function to traverse the voxels and find ray intersections
-def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir, epsilon=1e-6):
+def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir, debug=False, epsilon=1e-6):
     import logging
     logging.basicConfig(level=logging.INFO)
 
@@ -1013,9 +1013,11 @@ def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir,
     return_numbers = np.asarray(ray_partition['return_number'].values)
     number_of_returns = np.asarray(ray_partition['number_of_returns'].values)
 
+    # print(f"Max Return Number: {np.nanmax(return_numbers)} Max Number of Returns: {np.nanmax(number_of_returns)} Num of points: {np.count_nonzero(~np.isnan(points).any(axis=1))}")
+
     num_rays = len(ray_partition)
     num_voxels = len(voxel_references)
-    
+
     voxel_ids = voxel_references['voxel_id'].values
     voxel_sizes = voxel_references['voxel_size'].values
     voxel_mins = np.asarray(voxel_references[['voxel_min_x', 'voxel_min_y', 'voxel_min_z']].values) - epsilon
@@ -1198,15 +1200,34 @@ def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir,
     # 2: current hit (point in voxel)
     # 3: post hit (point > max voxel)
     unbound = np.isnan(filtered_points).any(axis=1)
-    in_voxel = np.all((filtered_points >= filtered_voxel_mins) & (filtered_points <= filtered_voxel_maxs), axis=1)
-    before_voxel = np.all(filtered_points < filtered_voxel_mins, axis=1)
-    after_voxel = np.all(filtered_points > filtered_voxel_maxs, axis=1)
+    in_voxel = np.all((filtered_points >= filtered_voxel_mins - epsilon) & (filtered_points <= filtered_voxel_maxs + epsilon), axis=1)
+    before_voxel = np.any(filtered_points < filtered_voxel_mins, axis=1) & ~in_voxel & ~unbound
+    after_voxel = np.any(filtered_points > filtered_voxel_maxs, axis=1) & ~in_voxel & ~unbound
 
     hit_type = np.full(filtered_points.shape[0], -1, dtype=np.int32)
     hit_type[unbound] = 0
     hit_type[before_voxel] = 1
     hit_type[in_voxel] = 2
     hit_type[after_voxel] = 3
+
+    if debug:
+        invalid_points_mask = hit_type == -1
+        invalid_points = filtered_points[invalid_points_mask]
+        import pyvista as pv
+        pcd = pv.PolyData(invalid_points)
+        pcd.save("invalid_points.ply")
+        in_points = filtered_points[hit_type == 2]
+        pcd = pv.PolyData(in_points)
+        pcd.save("in_points.ply")
+        bef_points = filtered_points[hit_type == 1]
+        pcd = pv.PolyData(bef_points)
+        pcd.save("bef_points.ply")
+        aft_points = filtered_points[hit_type == 3]
+        pcd = pv.PolyData(aft_points)
+        pcd.save("aft_points.ply")
+        unbound_origins = filtered_origins[hit_type == 0]
+        pcd = pv.PolyData(unbound_origins)
+        pcd.save("unbound_origins.ply")
 
     # Filter out rays which have previously hit a voxel (and therefore do not continue into this next one)
     # Also keep any NAN points (i.e. unbound rays)
@@ -1236,41 +1257,45 @@ def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir,
     del t_enter, t_exit, filtered_origins, filtered_directions, filtered_voxel_centres, filtered_voxel_maxs, filtered_voxel_mins
     gc.collect()
 
-    data = [
-        pa.array(filtered_voxel_sizes),
-        pa.array(filtered_voxel_ids),
-        pa.array(filtered_leg_ids),
-        pa.array(filtered_ray_ids),
-        pa.array(filtered_entry_coords[:, 0]),
-        pa.array(filtered_entry_coords[:, 1]),
-        pa.array(filtered_entry_coords[:, 2]),
-        pa.array(filtered_exit_coords[:, 0]),
-        pa.array(filtered_exit_coords[:, 1]),
-        pa.array(filtered_exit_coords[:, 2]),
-        pa.array(filtered_distances_to_voxel_centre),
-        pa.array(filtered_points[:, 0]),
-        pa.array(filtered_points[:, 1]),
-        pa.array(filtered_points[:, 2]),
-        pa.array(filtered_echo_intensities),
-        pa.array(filtered_return_numbers),
-        pa.array(filtered_number_of_returns),
-        pa.array(filtered_normals[:, 0]),
-        pa.array(filtered_normals[:, 1]),
-        pa.array(filtered_normals[:, 2]),
-        pa.array(filtered_point_weights),
-        pa.array(filtered_viewing_angles),
-        pa.array(hit_type),
-        pa.array(filtered_is_leaf)
-    ]
-    result = pa.Table.from_arrays(data, schema=voxel_ray_intersection_schema)
-    result = result.to_pandas()
+    # print(f"return_numbers: {np.nanmax(filtered_return_numbers)} number_of_returns: {np.nanmax(filtered_number_of_returns)} hit_type: {np.max(hit_type)}")
+
+    # Create an empty DataFrame with columns and dtypes from voxel_ray_intersection_schema
+    data_df = pd.DataFrame({field.name: pd.Series(dtype=(
+        'Int64' if field.type.to_pandas_dtype() == 'int64' else 'Int32' if field.type.to_pandas_dtype() == 'int32' else field.type.to_pandas_dtype()
+        ))
+        for field in voxel_ray_intersection_schema
+    })
+    data_df['voxel_size'] = filtered_voxel_sizes
+    data_df['voxel_id'] = filtered_voxel_ids
+    data_df['leg_id'] = filtered_leg_ids
+    data_df['ray_id'] = filtered_ray_ids
+    data_df['t_entry_x'] = filtered_entry_coords[:, 0]
+    data_df['t_entry_y'] = filtered_entry_coords[:, 1]
+    data_df['t_entry_z'] = filtered_entry_coords[:, 2]
+    data_df['t_exit_x'] = filtered_exit_coords[:, 0]
+    data_df['t_exit_y'] = filtered_exit_coords[:, 1]
+    data_df['t_exit_z'] = filtered_exit_coords[:, 2]
+    data_df['distance_to_centre'] = filtered_distances_to_voxel_centre
+    data_df['point_x'] = filtered_points[:, 0]
+    data_df['point_y'] = filtered_points[:, 1]
+    data_df['point_z'] = filtered_points[:, 2]
+    data_df['echo_intensity'] = filtered_echo_intensities
+    data_df['return_number'] = filtered_return_numbers
+    data_df['number_of_returns'] = filtered_number_of_returns
+    data_df['normal_x'] = filtered_normals[:, 0]
+    data_df['normal_y'] = filtered_normals[:, 1]
+    data_df['normal_z'] = filtered_normals[:, 2]
+    data_df['point_weight'] = filtered_point_weights
+    data_df['viewing_angle'] = filtered_viewing_angles
+    data_df['hit_type'] = hit_type
+    data_df['is_leaf'] = filtered_is_leaf
 
     del filtered_voxel_sizes, filtered_voxel_ids, filtered_leg_ids, filtered_ray_ids, filtered_entry_coords, filtered_exit_coords, filtered_distances_to_voxel_centre, filtered_points, filtered_viewing_angles, hit_type, filtered_is_leaf
     gc.collect()
 
     print(f"Process {process_id}. Returning results...")
 
-    return result
+    return data_df
 
 
     
@@ -1635,7 +1660,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
 
         # Calculate the partition size that fits into memory alongside optimal voxel chunk size
         avail_cpu = os.environ.get('SLURM_CPUS_PER_TASK', psutil.cpu_count(logical=False))
-        avail_mem = os.environ.get('SLURM_MEM_PER_CPU', psutil.virtual_memory().available) * 0.8
+        avail_mem = os.environ.get('SLURM_MEM_PER_CPU', psutil.virtual_memory().available) * 0.7
         mem_per_worker = avail_mem // avail_cpu
 
         num_rays = df.shape[0].compute()
@@ -2033,14 +2058,19 @@ def get_voxel_metrics_multireturn(intersections_files, lambda_1, is_leaf_true=Tr
             print(statement)
             return pd.DataFrame(columns=voxel_metrics_schema_PRECALC.names)
         
-        hit_mask = voxel_df['hit_ray'].values
-        leaf_mask = hit_mask & voxel_df['is_leaf'].values if is_leaf_true else hit_mask & ~voxel_df['is_leaf'].values
-        num_hits = hit_mask.sum()
+        hit_types = voxel_df['hit_type'].values
+        unbound = hit_types == 0
+        previous_hit = hit_types == 1
+        current_hit = hit_types == 2
+        yet_to_hit = hit_types == 3
+
+        leaf_mask = current_hit & voxel_df['is_leaf'].values if is_leaf_true else current_hit & ~voxel_df['is_leaf'].values
+        num_hits = current_hit.sum()
         num_leaf_hits = leaf_mask.sum()
 
         # Calculate mean viewing angles
         ### DO WE NEED THIS ###
-        mean_angle_all = np.nanmean(voxel_df['viewing_angle'][hit_mask].values)
+        mean_angle_all = np.nanmean(voxel_df['viewing_angle'][current_hit].values)
         mean_angle_leaf = np.nanmean(voxel_df['viewing_angle'][leaf_mask].values)
 
         # Calculate pgap_lw and I
@@ -2049,23 +2079,17 @@ def get_voxel_metrics_multireturn(intersections_files, lambda_1, is_leaf_true=Tr
         I_lw, I_leaf = 1.0 - pgap_lw, 1.0 - pgap_leaf
 
         # Calculate path lengths
-        ent = voxel_df[['t_entry_x', 't_entry_y', 't_entry_z']].values
-        ext = voxel_df[['t_exit_x', 't_exit_y', 't_exit_z']].values
-        path_lengths = np.linalg.norm(ext - ent, axis=1)
-
-        # Calculate free path lengths
-        # This needs to be the distance from voxel entry to first hit, distance between subsequent hits within voxel,
-        # And remaining distance to voxel exit if it continues, or stop at last hit if it is the last_echo
-        last_echo_mask = hit_mask & (
-            voxel_df["return_number"] == voxel_df["number_of_returns"]
-        ) if 'return_number' in voxel_df.columns and 'number_of_returns' in voxel_df.columns else hit_mask
-
-        points = voxel_df[['point_x', 'point_y', 'point_z']].values
+        # Exclude rays that have no current hits or yet_to_hits
+        valid_path_length_mask = unbound | current_hit | yet_to_hit
+        ent = voxel_df[['t_entry_x', 't_entry_y', 't_entry_z']].values[valid_path_length_mask]
+        ext = voxel_df[['t_exit_x', 't_exit_y', 't_exit_z']].values[valid_path_length_mask]
+        path_lengths = np.full(len(voxel_df), np.nan, dtype=np.float32)
+        path_lengths[valid_path_length_mask] = np.linalg.norm(ext[valid_path_length_mask] - ent[valid_path_length_mask], axis=1)
 
         # Calculate free path lengths for multi-return rays
         # For each ray, if return_number is the minimum for that ray, use entry to point
         # Otherwise, use distance from previous point to current point
-        free_path_lengths = np.empty(len(voxel_df), dtype=np.float32)
+        free_path_lengths = np.full(len(voxel_df), np.nan, dtype=np.float32)
         ray_ids = voxel_df['ray_id'].values
         return_numbers = voxel_df['return_number'].values if 'return_number' in voxel_df.columns else np.ones(len(voxel_df), dtype=int)
         points = voxel_df[['point_x', 'point_y', 'point_z']].values
@@ -2075,7 +2099,8 @@ def get_voxel_metrics_multireturn(intersections_files, lambda_1, is_leaf_true=Tr
         # Group indices by ray_id
         ray_indices = defaultdict(list)
         for idx, ray_id in enumerate(ray_ids):
-            ray_indices[ray_id].append(idx)
+            if hit_types[idx] == 2:
+                ray_indices[ray_id].append(idx)
 
         for indices in ray_indices.values():
             # Sort indices by return_number
@@ -2090,7 +2115,9 @@ def get_voxel_metrics_multireturn(intersections_files, lambda_1, is_leaf_true=Tr
                     prev_idx = sorted_indices[i - 1]
                     free_path_lengths[idx] = np.linalg.norm(points[prev_idx] - points[idx])
         # For rays that did not hit, use path_length
-        free_path_lengths[~hit_mask] = path_lengths[~hit_mask]
+        free_path_lengths[unbound] = path_lengths[unbound]
+        free_path_lengths[previous_hit] = path_lengths[previous_hit] # Should be NAN
+        free_path_lengths[yet_to_hit] = path_lengths[yet_to_hit]
 
         # Effective path lengths
         eff_path_lengths = calculate_effective_path_length(
@@ -2098,7 +2125,7 @@ def get_voxel_metrics_multireturn(intersections_files, lambda_1, is_leaf_true=Tr
             lambda_1=lambda_1
         )
         eff_free_path_lengths = calculate_effective_path_length(
-            free_path_lengths=free_path_lengths, 
+            path_lengths=free_path_lengths, 
             lambda_1=lambda_1
         )
 
@@ -2120,76 +2147,69 @@ def get_voxel_metrics_multireturn(intersections_files, lambda_1, is_leaf_true=Tr
         if not np.isfinite(G_leaf):
             G_leaf = 0.5
 
+        # If Multi-return, calculate probabilities and use appropriate LAD/PAD calcs
+
+
         # Kent & Bailey probabilities
         P_first = P_equal = P_int = P_ideal = P_exact = np.nan
         LAD_first = LAD_equal = LAD_int = LAD_ideal = LAD_exact = np.nan
         LAD_MLE_g = LAD_MLE_e = np.nan
 
-        if {"echo_type", "echo_intensity"}.issubset(voxel_df.columns):
+        echo_intensities = voxel_df['echo_intensity'].values
+        intensity_before = np.nansum(echo_intensities[previous_hit])
+        intensity_during = np.nansum(echo_intensities[current_hit])
+        intensity_after = np.nansum(echo_intensities[yet_to_hit])
+        echoes_before = np.count_nonzero(previous_hit)
+        echoes_during = np.count_nonzero(current_hit)
+        echoes_after = np.count_nonzero(yet_to_hit)
 
-            pivot = voxel_df.pivot_table(
-                index='ray_id',
-                columns='echo_type',
-                values='echo_intensity',
-                aggfunc='sum',
-                fill_value=0,
-                observed=True
-            )
+        # Establish the Tk and Wk values for first_hit, equal_hit, and intensity_hit weighting probability functions
+        def _collapse(T, W):
+            tot = W.sum()
+            return float((T * W).sum() / tot) if tot else np.nan
+        
+        first_hit = voxel_df['return_number'] == 1
+        current_first_hit = current_hit & first_hit
+        Tk_first = np.nansum(current_first_hit)
+        Wk_first = Tk_first.copy()
 
-            def _col(arr, lvl1, lvl2):
-                try: return arr[(lvl1, lvl2)]
-                except KeyError:
-                    return pd.Series(0.0, index=pivot.index, dtype=float)
-                
-            I_bef, I_in, I_aft = (_col(pivot, "echo_intensity", k) for k in (0, 1, 2))
-           
+            # Tk_equal = E_aft / (E_in + E_aft).clip(lower=1)
+            # Wk_equal = (E_in + E_aft) / (E_bef + E_in + E_aft)
 
-            E_bef, E_in, E_aft = (s.astype(int) for s in (I_bef, I_in, I_aft))
+            # Tk_int   = I_aft / (I_in + I_aft).replace(0, np.nan)
+            # Wk_int   = (I_in + I_aft) / (I_bef + I_in + I_aft)
 
-            def _collapse(T, W):
-                tot = W.sum()
-                return float((T * W).sum() / tot) if tot else np.nan
-            
-            Tk_first = pd.Series(1.0, index=pivot.index)
-            Wk_first = Tk_first.copy()
+            # Tk_ideal = R_aft / (R_in + R_aft).replace(0, np.nan)
+            # Wk_ideal = (R_bef + R_in + R_aft)
 
-            Tk_equal = E_aft / (E_in + E_aft).clip(lower=1)
-            Wk_equal = (E_in + E_aft) / (E_bef + E_in + E_aft)
+            # Tk_exact = (R_aft + R_miss) / (R_in + R_aft + R_miss).replace(0, np.nan)
+            # Wk_exact = (R_bef + R_in + R_aft + R_miss)
 
-            Tk_int   = I_aft / (I_in + I_aft).replace(0, np.nan)
-            Wk_int   = (I_in + I_aft) / (I_bef + I_in + I_aft)
+            # P_first, P_equal, P_int, P_ideal, P_exact = (
+            #     _collapse(*args) for args in [
+            #         (Tk_first, Wk_first), (Tk_equal, Wk_equal),
+            #         (Tk_int,   Wk_int),   (Tk_ideal, Wk_ideal),
+            #         (Tk_exact, Wk_exact)
+            #     ]
+            # )
 
-            Tk_ideal = R_aft / (R_in + R_aft).replace(0, np.nan)
-            Wk_ideal = (R_bef + R_in + R_aft)
+            # # LAD_BL suite
+            # LAD_first, LAD_equal, LAD_int, LAD_ideal, LAD_exact = lad_bl_suite(
+            #     num_rays, mean_path_length, G_leaf,
+            #     P_first, P_equal, P_int, P_ideal, P_exact
+            # )
 
-            Tk_exact = (R_aft + R_miss) / (R_in + R_aft + R_miss).replace(0, np.nan)
-            Wk_exact = (R_bef + R_in + R_aft + R_miss)
+            # # -------- Vincent-2021 & Bai-2024 MLEs --------------------
+            # CI_vox, k1_vox = 1.0, 0.0
 
-            P_first, P_equal, P_int, P_ideal, P_exact = (
-                _collapse(*args) for args in [
-                    (Tk_first, Wk_first), (Tk_equal, Wk_equal),
-                    (Tk_int,   Wk_int),   (Tk_ideal, Wk_ideal),
-                    (Tk_exact, Wk_exact)
-                ]
-            )
+            # beam_all = voxel_df['beam_area_vox_center'].values
+            # beam_leaf = beam_all[leaf_mask]
+            # ubeam_lw, ubeam_leaf = beam_all[uhit_mask], beam_leaf[uleaf_mask]
 
-            # LAD_BL suite
-            LAD_first, LAD_equal, LAD_int, LAD_ideal, LAD_exact = lad_bl_suite(
-                num_rays, mean_path_length, G_leaf,
-                P_first, P_equal, P_int, P_ideal, P_exact
-            )
-
-            # -------- Vincent-2021 & Bai-2024 MLEs --------------------
-            CI_vox, k1_vox = 1.0, 0.0
-
-            beam_all = voxel_df['beam_area_vox_center'].values
-            beam_leaf = beam_all[leaf_mask]
-            ubeam_lw, ubeam_leaf = beam_all[uhit_mask], beam_leaf[uleaf_mask]
-
-            LAD_MLE_g = LAD_MLE_geom_corr(
-                num_leaf_hits, ubeam_leaf, ubeam_lw, ufree,
-                G_leaf, CI=CI_vox, k1=k1_vox, bias_corr=True,
-            )
+            # LAD_MLE_g = LAD_MLE_geom_corr(
+            #     num_leaf_hits, ubeam_leaf, ubeam_lw, ufree,
+            #     G_leaf, CI=CI_vox, k1=k1_vox, bias_corr=True,
+            # )
 
         data = {
             'voxel_id': voxel_id,
