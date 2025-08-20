@@ -141,7 +141,9 @@ voxel_metrics_schema_multireturn = pa.schema([
     pa.field('LAD_BL_first', pa.float64()),
     pa.field('LAD_BL_equal', pa.float64()),
     pa.field('LAD_BL_intensity', pa.float64()),
-    pa.field('LAD_MLE_geom', pa.float64()),
+    pa.field('LAD_MLE_nocorr', pa.float64()),
+    pa.field('LAD_MLE_lambda1', pa.float64()),
+    pa.field('LAD_MLE_lambda1_biascorr', pa.float64()), 
     pa.field('LIAD_leaf_bin_2.5', pa.float32()),
     pa.field('LIAD_leaf_bin_7.5', pa.float32()),
     pa.field('LIAD_leaf_bin_12.5', pa.float32()),
@@ -273,9 +275,11 @@ def _gen_dataframe(schema):
     df = pd.DataFrame({name: pd.Series(dtype=dtype) for name, dtype in fields})
     return df
 
-def compute_normals_weights_from_points(points, knn=6):
+def compute_normals_weights_from_points(points, voxel_size=10.0, knn=6):
     from tqdm import tqdm
     import open3d as o3d
+    import numpy as np
+    from collections import defaultdict
     from joblib import Parallel, delayed
     """
     Get normals and weights from points.
@@ -291,15 +295,54 @@ def compute_normals_weights_from_points(points, knn=6):
     if len(points) < knn:
         return np.ones(len(points)), np.ones(len(points))
 
-    # Compute the normals with open3d
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=10.0)
+    # Fast voxel indexing
+    print("Initialising voxels")
+    voxel_indices = (points / voxel_size).astype(int)
+    voxel_keys = np.char.add(
+    np.char.add(voxel_indices[:, 0].astype(str), '_'),
+    np.char.add(voxel_indices[:, 1].astype(str), '_')
+    )
+    voxel_keys = np.char.add(voxel_keys, voxel_indices[:, 2].astype(str))
 
-    normals = np.zeros((len(pcd.points), 3))
-    weights = np.zeros(len(pcd.points))
+    voxel_dict = defaultdict(list)
 
-    voxel_dict = {}
+    def add_to_voxel_dict(idx_key_tuple):
+        idx, key = idx_key_tuple
+        return key, (idx, points[idx])
+
+    # Use joblib to parallelize the assignment
+    results = Parallel(n_jobs=-1)(
+        delayed(add_to_voxel_dict)(item) for item in tqdm(enumerate(voxel_keys), total=len(voxel_keys), desc="Indexing voxels")
+    )
+
+    for key, value in results:
+        voxel_dict[key].append(value)
+
+    # # Compute the normals with open3d
+    # pcd = o3d.geometry.PointCloud()
+    # pcd.points = o3d.utility.Vector3dVector(points)
+    # voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=10.0)
+
+    normals = np.zeros((len(points), 3))
+    weights = np.zeros(len(points))
+
+    def process_voxel(voxel_data):
+        idxs, pts = zip(*voxel_data)
+        voxel_pcd = o3d.geometry.PointCloud()
+        voxel_pcd.points = o3d.utility.Vector3dVector(pts)
+        voxel_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=knn))
+        distances = np.asarray(voxel_pcd.compute_nearest_neighbor_distance())
+        voxel_normals = np.asarray(voxel_pcd.normals)
+        voxel_weights = 1 / (distances + 1e-9)
+        return idxs, voxel_normals, voxel_weights
+
+    for key in tqdm(voxel_dict.keys(), desc="Processing voxels"):
+        idxs, voxel_normals, voxel_weights = process_voxel(voxel_dict[key])
+        for i, idx in enumerate(idxs):
+            normals[idx] = voxel_normals[i]
+            weights[idx] = voxel_weights[i]
+
+    return normals, weights
 
     def unique_key_from_voxel_centre(voxel_centre):
         return f"{voxel_centre[0]}_{voxel_centre[1]}_{voxel_centre[2]}"
@@ -328,25 +371,6 @@ def compute_normals_weights_from_points(points, knn=6):
             weights[idx] = voxel_weights[i]
 
     return normals, weights
-
-
-    # Compute the point density weights
-    nbrs = NearestNeighbors(n_neighbors=knn).fit(points)
-    distances, _ = nbrs.kneighbors(points)
-    # Inverse of the distance to the k nearest neighbours as weight
-    weights = 1 / (distances[:, -1] + 1e-9) # Add a small value to avoid division by zero
-
-    return weights
-    # Compute the point density weights
-    if len(points) < knn:
-        weights = np.ones(len(points))
-    else:
-        nbrs = NearestNeighbors(n_neighbors=knn).fit(points)
-        distances, _ = nbrs.kneighbors(points)
-        # Inverse of the distance to the k nearest neighbours as weight
-        weights = 1 / (distances[:, -1] + 1e-9) # Add a small value to avoid division by zero
-    
-    return weights
 
 # Create a unique ID for a voxel
 def create_voxel_id(voxel_size, x, y, z):
@@ -965,40 +989,36 @@ def PAD_MLE(value):
     ### INSERT ###
     pass
 
-def MLE_multi_geom_corr(num_hits, beam_areas_hit, beam_areas_all, fpl_all, G, CI=1.0, k1=0.0, bias_corr=True, eps=1e-9):
+# Multi-return MLE from AMAPvox
+def MLE_vincent_2021(sum_sa_hit, sum_sa_all, G=0.5, CI=1.0, bias_corr=None, eps=1e-9):
     """
     Calculate the Maximum Likelihood Estimation (MLE) using the formula for multi-geometry correction.
     This code requires:
     - num_hits: The number of hits detected.          
-    - beam_areas_hit: The areas of the beams that hit the target.
-    - beam_areas_all: The total areas of all beams.
-    - fpl_all: The free-path lengths for all beams.
-    - G: The geometric factor.
-    - CI: The confidence interval.
-    - k1: The first-order correction factor.
-    - bias_corr: A boolean indicating whether to apply bias correction.
+    - sum_ba_all: Sum of expected beam areas for unique pulses at voxel centre.
+    - sum_ray_fraction_h: Sum of fraction of unique pulses that hit inside voxel
+    - sum_fpl_h: Sum of fractional free-path lengths for hits inside voxel
+    - sum_pl_e: Sum of fractional path lengths for rays exiting the voxel (i.e. unbound rays weighted 1, yet_to_hit rays weighted according to fraction of pulse)
+    - G: G function
+    - CI: Clumping index
+    - lambda_1: Vegetation element size value (average leaf area * voxel_volume)
+    - bias_corr: The hit vs explored ratio outlined in Vincent 2021 (i.e. -(sum(ba_all * fraction_enter)/num_rays))
+        If there is a value supplied, the correction will be applied
     - eps: A small value to avoid division by zero.
 
-    For LAD:
-        - num_leaf_hits --> leaf_hits, 
-        - beam_areas_hit_leaf --> beam_areas_hit, 
-        - G_leaf --> G,
-        - CI_leaf --> CI
+    To apply vegetation element size corrections, use the sum_eff_free_path_length_hit and sum_eff_path_length_exit values in the sum_fpl_h and sum_pl_e
     """
-    # Check for valid input
-    if num_hits == 0 or beam_areas_all.size == 0:
-        return np.nan # No valid hits
+
+    """Initial k_hat formula
     
-    if k1 > 0:
-        fpl_all = -np.log(1 - k1*np.clip(fpl_all, 0, 1-eps)) / k1
+    """
 
-    k_hat = beam_areas_hit.sum() / (beam_areas_all * fpl_all).sum()
+    k_hat = sum_sa_hit / sum_sa_all
 
-    if bias_corr:
-        N = beam_areas_all.size
-        k_hat -= (beam_areas_all.sum()/N) * (beam_areas_hit.sum() / (beam_areas_all * fpl_all).sum())
+    if bias_corr is not None:
+        k_hat -= bias_corr
 
-    return k_hat / G / CI
+    return k_hat / G / CI       # NOT CONVINCED ON G CORRECTION HERE
 
 # def LAD_MLE_geom_corr(num_hits,
 #                       beam_areas_hit, beam_areas_all,       # scannerÃÂvoxel-centre ranges
@@ -1090,13 +1110,6 @@ def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir,
     voxel_sizes = voxel_references['voxel_size'].values
     voxel_centres = voxel_references[['voxel_cx', 'voxel_cy', 'voxel_cz']].values
 
-    del voxel_references, ray_partition
-    # gc.collect()
-
-    voxel_ids = voxel_ids[:, np.newaxis]
-    voxel_sizes = voxel_sizes[:, np.newaxis]
-    voxel_centres = voxel_centres[:, np.newaxis, :]
-
     leg_ids = leg_ids[np.newaxis, :]
     ray_ids = ray_ids[np.newaxis, :]
     is_leaf = is_leaf[np.newaxis, :]
@@ -1108,6 +1121,9 @@ def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir,
     echo_intensities = echo_intensities[np.newaxis, :]
     return_numbers = return_numbers[np.newaxis, :]
     number_of_returns = number_of_returns[np.newaxis, :]
+
+    del voxel_references, ray_partition
+    # gc.collect()
 
     ### TEST DATA ###
     # voxel_mins = np.array([
@@ -1139,27 +1155,64 @@ def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir,
     # - Ray 2 intersects voxel 2
     # - Ray 3 intersects voxel 3
 
-    def broadcasted_ray_tracing(voxel_mins, voxel_maxs, origins, directions, beam_divergence=0.001, epsilon=np.float32(1e-6)):
-        # Optimized ray-AABB intersection for masking only
-        small_dir = np.abs(directions) <= epsilon
-        directions[small_dir] = np.where(
-            directions[small_dir] == 0, 
-            epsilon, 
-            np.sign(directions[small_dir]) * epsilon
-        )
-        inv_directions = 1.0 / directions
-        
-        # Compute intersection parameters
-        t1 = (voxel_mins - origins) * inv_directions
-        t2 = (voxel_maxs - origins) * inv_directions
-        
-        # Find entry and exit points
-        t_enter = np.maximum.reduce(np.minimum(t1, t2), axis=2)
-        t_exit = np.minimum.reduce(np.maximum(t1, t2), axis=2)
-        
-        # Ray intersects if t_enter <= t_exit and t_exit >= 0
-        mask = (t_enter <= t_exit + epsilon) & (t_exit >= -epsilon)
-        
+    def broadcasted_ray_tracing(voxel_centres, voxel_sizes, origins, directions, epsilon=np.float32(1e-6)):
+        # Establish empty mask for no-hit cases
+        mask = np.zeros((voxel_centres.shape[0], origins.shape[1]), dtype=bool)
+
+        voxel_radii = voxel_sizes * np.sqrt(3) * 0.5  # Diagonal radius for a cube
+
+        oc = origins - voxel_centres
+        b = 2.0 * np.sum(oc * directions, axis=2)
+        c = np.sum(oc * oc, axis=2) - voxel_radii**2
+        discriminant = b**2 - 4 * c
+        hit = discriminant >= 0
+
+        if np.any(hit):
+            del oc, b, c, discriminant
+            # Find min and max bounds
+            voxel_mins = voxel_centres - (voxel_sizes[..., None] / 2)
+            voxel_maxs = voxel_centres + (voxel_sizes[..., None] / 2)
+
+            # Find indices where hit is True
+            voxel_idx, ray_idx = np.nonzero(hit)
+
+            # del hit, voxel_centres, voxel_sizes
+
+            # Select only the voxel/ray pairs where hit is True
+            selected_voxel_mins = voxel_mins[voxel_idx, 0]
+            selected_voxel_maxs = voxel_maxs[voxel_idx, 0]
+            selected_origins = origins[0, ray_idx]
+            selected_directions = directions[0, ray_idx]
+
+            del voxel_mins, voxel_maxs, origins, directions
+
+            # Optimized ray-AABB intersection for masking only
+            small_dir = np.abs(selected_directions) <= epsilon
+            selected_directions[small_dir] = np.where(
+                selected_directions[small_dir] == 0, 
+                epsilon, 
+                np.sign(selected_directions[small_dir]) * epsilon
+            )
+            inv_directions = 1.0 / selected_directions
+
+            del selected_directions
+
+            # Compute intersection parameters
+            t1 = (selected_voxel_mins - selected_origins) * inv_directions
+            t2 = (selected_voxel_maxs - selected_origins) * inv_directions
+
+            del selected_voxel_mins, selected_voxel_maxs, selected_origins, inv_directions
+
+            # Find entry and exit points
+            t_enter = np.max(np.minimum(t1, t2), axis=1)
+            t_exit = np.min(np.maximum(t1, t2), axis=1)
+
+            # Ray intersects if t_enter <= t_exit and t_exit >= 0
+            valid = (t_enter <= t_exit + epsilon) & (t_exit >= -epsilon)
+
+            # Set mask for valid voxel-ray pairs
+            mask[voxel_idx[valid], ray_idx[valid]] = True
+
         return mask
 
     # Calculate mask, t_enter, and t_exit for max voxels that fit into memory
@@ -1178,33 +1231,34 @@ def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir,
     unique_origins = origins[:, unique_ray_idx, :]
     unique_directions = directions[:, unique_ray_idx, :]
 
-    # For each chunk, compute mask only for unique rays, then map back to all rays
+    # Find unique ray_ids and their indices
+    _, unique_ray_idx, inverse_ray_idx = np.unique(ray_ids, return_index=True, return_inverse=True)
+    # Get unique origins and directions
+    unique_origins = origins[:, unique_ray_idx, :]
+    unique_directions = directions[:, unique_ray_idx, :]
+
     for i in range(0, voxel_centres.shape[0], voxels_per_chunk):
-        # Calculate mask for unique rays
-        voxel_mins = voxel_centres[i:i+voxels_per_chunk, :] - (voxel_sizes[i:i+voxels_per_chunk][:, np.newaxis] / 2 - epsilon)
-        voxel_maxs = voxel_centres[i:i+voxels_per_chunk, :] + (voxel_sizes[i:i+voxels_per_chunk][:, np.newaxis] / 2 + epsilon)
+        chunk_centres = voxel_centres[i:i + voxels_per_chunk, np.newaxis, :]
+        chunk_sizes = voxel_sizes[i:i + voxels_per_chunk, np.newaxis]
         chunk_mask_unique = broadcasted_ray_tracing(
-            voxel_mins,
-            voxel_maxs,
-            unique_origins,
-            unique_directions
+            voxel_centres=chunk_centres,
+            voxel_sizes=chunk_sizes,
+            origins=unique_origins,
+            directions=unique_directions
         )
+
         # Map mask back to all rays using inverse_ray_idx
-        # chunk_mask_unique shape: (num_voxels_chunk, num_unique_rays)
-        # We want chunk_mask shape: (num_voxels_chunk, num_all_rays)
         chunk_mask = chunk_mask_unique[:, inverse_ray_idx]
 
-        # Save chunk_mask to disk with unique filenames
+        # Save chunk_mask and chunk_indices to disk with unique filenames
         chunk_mask_filename = os.path.join(temp_dir, f"chunk_mask_{i}_{process_id}.npy")
         np.save(chunk_mask_filename, chunk_mask)
+        masks[i] = [chunk_mask_filename, chunk_mask.dtype, chunk_mask.shape]
 
-        dtype = chunk_mask.dtype
-        shape = chunk_mask.shape
-        masks[i] = [chunk_mask_filename, dtype, shape]
-
-        del chunk_mask, chunk_mask_unique
+        del chunk_mask, chunk_mask_unique, chunk_centres, chunk_sizes
         gc.collect()
 
+    # Flatten mask and retrieve idx for rays and voxels
     # Combine masks into single array for further processing
     chunk_masks = []
     for key in sorted(masks.keys()):
@@ -1221,13 +1275,9 @@ def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir,
         gc.collect()
         shutil.rmtree(temp_dir, ignore_errors=True)
         return pd.DataFrame(columns=voxel_ray_intersection_schema.names)
-    
+
     del mask, chunk_masks, chunk
     gc.collect()
-
-    # Delete the temporary folder and its contents
-    shutil.rmtree(temp_dir, ignore_errors=True)
-    
 
     # Flatten all values to match the mask
     filtered_voxel_ids = voxel_ids[voxel_ref_idx].reshape(-1)
@@ -1258,8 +1308,8 @@ def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir,
     # 1: previous hit (point < min voxel)
     # 2: current hit (point in voxel)
     # 3: post hit (point > max voxel)
-    filtered_voxel_mins = filtered_voxel_centres - (filtered_voxel_sizes / 2 - epsilon)
-    filtered_voxel_maxs = filtered_voxel_centres + (filtered_voxel_sizes / 2 + epsilon)
+    filtered_voxel_mins = filtered_voxel_centres - (filtered_voxel_sizes[:, np.newaxis] / 2 - epsilon)
+    filtered_voxel_maxs = filtered_voxel_centres + (filtered_voxel_sizes[:, np.newaxis] / 2 + epsilon)
     unbound = np.isnan(filtered_points).any(axis=1)
     in_voxel = np.all((filtered_points >= filtered_voxel_mins - epsilon) & (filtered_points <= filtered_voxel_maxs + epsilon), axis=1)
     before_voxel = np.any(filtered_points < filtered_voxel_mins, axis=1) & ~in_voxel & ~unbound
@@ -1699,8 +1749,8 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
 
         # Calculate the partition size that fits into memory alongside optimal voxel chunk size
         avail_cpu = os.environ.get('SLURM_CPUS_PER_TASK', psutil.cpu_count(logical=False))
-        avail_mem = os.environ.get('SLURM_MEM_PER_CPU', psutil.virtual_memory().available) * 0.7
-        mem_per_worker = avail_mem // avail_cpu
+        avail_mem = os.environ.get('SLURM_MEM_PER_CPU', psutil.virtual_memory().available)
+        mem_per_worker = avail_mem // avail_cpu if not os.environ.get('SLURM_MEM_PER_CPU') else avail_mem
 
         num_rays = df['ray_id'].nunique().compute()
         num_voxels = len(voxel_references)
@@ -1708,7 +1758,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
 
         # Estimate the max elements that fit in memory per worker
         # Calculate bytes per ray from valid_rays_schema
-        bytes_per_ray = sum(field.type.bit_width // 4 for field in valid_rays_schema)  # bit_width to bytes
+        bytes_per_ray = 6 * 4 # sum(field.type.bit_width // 4 for field in valid_rays_schema)  # bit_width to bytes
         bytes_per_voxel = 6 * 4  # 6 float32 values per voxel (min/max for x, y, z), 4 bytes each
         max_elements_per_chunk = int(mem_per_worker // (bytes_per_voxel + bytes_per_ray))
         rays_per_chunk = max(1, int(np.sqrt(max_elements_per_chunk * ratio)))
@@ -1719,8 +1769,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
 
         dd_results = []
 
-        print("Queuing map_partitions tasks...")
-        print(f"Number of partitions: {df.npartitions}, Number of rays: {num_rays}, Number of voxels: {num_voxels}, Rays per chunk: {rays_per_chunk}, Voxels per chunk: {voxels_per_chunk}, Number of chunks: {num_voxels//voxels_per_chunk}")
+        print(f"Initialising leg {leg_id} - {df.npartitions} partitions, {num_rays} rays, {num_voxels} voxels, {rays_per_chunk} rays/partition, {voxels_per_chunk} voxels/chunk, {num_voxels//voxels_per_chunk} chunks")
 
         result = df.map_partitions(
             map_ray_partition_to_function,
@@ -1759,7 +1808,8 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
             results = results.compute()
 
             print(f"Saving results for leg {leg_id}...")
-            results = results.groupby('voxel_size').apply(lambda x: save_task(x, leg_id), include_groups=True)
+            # Explicitly select the grouping column 'voxel_size' after groupby to silence the warning
+            results = results.groupby('voxel_size', group_keys=False)[results.columns].apply(lambda x: save_task(x, leg_id), include_groups=True)
 
             del results
             gc.collect()
@@ -2133,8 +2183,6 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
         ext = voxel_df[['t_exit_x', 't_exit_y', 't_exit_z']].values
         path_lengths = np.full(len(voxel_df), np.nan, dtype=np.float32)
         path_lengths[valid_path_length_mask] = np.linalg.norm(ext[valid_path_length_mask] - ent[valid_path_length_mask], axis=1)
-        mean_path_length = np.nanmean(path_lengths)
-        sum_path_length = np.nansum(path_lengths)
 
         # Calculate free path lengths for multi-return rays
         # For each ray, if return_number is the minimum for that ray, use entry to point
@@ -2191,11 +2239,7 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
                             break
                     if next_idx is not None:
                         free_path_lengths[next_idx] = np.linalg.norm(points[idx] - ext[idx])
-        mean_free_path_length = np.nanmean(free_path_lengths)
-        sum_free_path_length = np.nansum(free_path_lengths)
-        sum_free_path_length_hit = np.nansum(free_path_lengths[current_hit])
-        sum_free_path_length_hit_leaf = np.nansum(free_path_lengths[current_leaf_mask])
-
+        
         # Effective path lengths
         eff_path_lengths = calculate_effective_path_length(
             path_lengths=path_lengths, 
@@ -2207,11 +2251,35 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
             path_lengths=free_path_lengths, 
             lambda_1=lambda_1
         )
+
+        # For each unique ray_id, calculate the fraction for echoes inside and leaving the voxel
+        # The fraction arrays (fraction_hit, fraction_leaving) are indexed by the same indices as ray_ids,
+        # so you can apply them directly to path_lengths, free_path_lengths, etc.
+        path_lengths = path_lengths
+        free_path_lengths = free_path_lengths
+        eff_path_lengths = eff_path_lengths
+        eff_free_path_lengths = eff_free_path_lengths
+
+        # Create aggregrate values
+        mean_path_length = np.nanmean(path_lengths)
+        sum_path_length = np.nansum(path_lengths)
+
+        mean_free_path_length = np.nanmean(free_path_lengths)
+        sum_free_path_length = np.nansum(free_path_lengths)
+        sum_free_path_length_hit = np.nansum(free_path_lengths[current_hit])
+        sum_free_path_length_exit = np.nansum(free_path_lengths[yet_to_hit])
+        sum_free_path_length_hit_leaf = np.nansum(free_path_lengths[current_leaf_mask])
+
+        mean_eff_path_length = np.nanmean(eff_path_lengths)
+        var_eff_path_length = np.nanvar(eff_path_lengths)
+
         mean_eff_free_path_length = np.nanmean(eff_free_path_lengths)
         sum_eff_free_path_length = np.nansum(eff_free_path_lengths)
         var_eff_free_path_length = np.nanvar(eff_free_path_lengths)
         sum_eff_free_path_length_hit = np.nansum(eff_free_path_lengths[current_hit])
+        sum_eff_free_path_length_exit = np.nansum(eff_free_path_lengths[yet_to_hit])
         sum_eff_free_path_length_hit_leaf = np.nansum(eff_free_path_lengths[current_leaf_mask])
+
 
         # ------ LIAD & G(.) -------- #
         leaf_normals = voxel_df[['normal_x', 'normal_y', 'normal_z']].values[current_leaf_mask]
@@ -2268,14 +2336,14 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
             echoes_before_lw = np.count_nonzero(previous_hit)
             echoes_during_lw = np.count_nonzero(current_hit)
             echoes_after_lw = np.count_nonzero(yet_to_hit)
-            Tk_equal_lw = echoes_after_lw / (echoes_during_lw + echoes_after_lw).clip(lower=1)
-            Wk_equal_lw = (echoes_during_lw + echoes_after_lw) / (echoes_before_lw + echoes_during_lw + echoes_after_lw)
+            Tk_equal_lw = echoes_after_lw / np.clip((echoes_during_lw + echoes_after_lw), 1, None)
+            Wk_equal_lw = (echoes_during_lw + echoes_after_lw) / np.clip((echoes_before_lw + echoes_during_lw + echoes_after_lw), 1, None)
 
             echoes_before_leaf = np.count_nonzero(previous_hit & leaf_mask)
             echoes_during_leaf = np.count_nonzero(current_hit & leaf_mask)
             echoes_after_leaf = np.count_nonzero(yet_to_hit & leaf_mask)
-            Tk_equal_leaf = echoes_after_leaf / (echoes_during_leaf + echoes_after_leaf).clip(lower=1)
-            Wk_equal_leaf = (echoes_during_leaf + echoes_after_leaf) / (echoes_before_leaf + echoes_during_leaf + echoes_after_leaf)
+            Tk_equal_leaf = echoes_after_leaf / np.clip((echoes_during_leaf + echoes_after_leaf), 1, None)
+            Wk_equal_leaf = (echoes_during_leaf + echoes_after_leaf) / np.clip((echoes_before_leaf + echoes_during_leaf + echoes_after_leaf), 1, None)
 
             # -- Intensity Hit Weighting -- #
             echo_intensities = voxel_df['echo_intensity'].values
@@ -2283,14 +2351,16 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
             intensity_during_lw = np.nansum(echo_intensities[current_hit])
             intensity_after_lw = np.nansum(echo_intensities[yet_to_hit])
             del echo_intensities
-            Tk_int_lw = intensity_after_lw / (intensity_during_lw + intensity_after_lw).replace(0, np.nan)
+            denom_lw = intensity_during_lw + intensity_after_lw
+            Tk_int_lw = intensity_after_lw / denom_lw if denom_lw != 0 else np.nan
             Wk_int_lw = (intensity_during_lw + intensity_after_lw) / (intensity_before_lw + intensity_during_lw + intensity_after_lw)
 
             intensity_before_leaf = np.nansum(echo_intensities[previous_hit & leaf_mask])
             intensity_during_leaf = np.nansum(echo_intensities[current_hit & leaf_mask])
             intensity_after_leaf = np.nansum(echo_intensities[yet_to_hit & leaf_mask])
             del echo_intensities
-            Tk_int_leaf = intensity_after_leaf / (intensity_during_leaf + intensity_after_leaf).replace(0, np.nan)
+            denom_leaf = intensity_during_leaf + intensity_after_leaf
+            Tk_int_leaf = intensity_after_leaf / denom_leaf if denom_leaf != 0 else np.nan
             Wk_int_leaf = (intensity_during_leaf + intensity_after_leaf) / (intensity_before_leaf + intensity_during_leaf + intensity_after_leaf)
 
             P_first_lw, P_equal_lw, P_int_lw, P_first_leaf, P_equal_leaf, P_int_leaf = (
@@ -2342,25 +2412,97 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
             #     G_leaf, CI=CI_vox, k1=k1_vox, bias_corr=True,
             # )
 
+
             distance_to_centre = voxel_df['distance_to_centre'].values
+            ray_weights = 1.0 / voxel_df['number_of_returns'].values
             # Calculate the surface area of the beam cross section at the distance to the voxel centre
             # Surface area = π * (radius)^2, where radius = distance_to_centre * beam_divergence
             beam_surface_area_all = np.full(distance_to_centre.shape, np.nan, dtype=np.float32)
             beam_divergence_rad = beam_divergence * 1e-3  # Convert mrad to rad
             beam_radius = distance_to_centre[valid_path_length_mask] * beam_divergence_rad
             beam_surface_area_all[valid_path_length_mask] = np.pi * np.square(beam_radius)
-            beam_surface_area_leaf = beam_surface_area_all.copy()
-            beam_surface_area_leaf[~leaf_mask] = np.nan
+            beam_surface_area_weighted = beam_surface_area_all * ray_weights
 
-            LAD_MLE_g = MLE_multi_geom_corr(
-                num_leaf_hits=num_leaf_hits,
-                beam_surface_area_leaf=beam_surface_area_leaf,
-                beam_surface_area_all=beam_surface_area_all,
-                free_path_lengths=free_path_lengths,
+            unique_rays_mask = np.unique(ray_ids, return_index=True)[1]
+            unique_surface_area = beam_surface_area_all[unique_rays_mask]
+            # Aggregate sum of weights per unique ray (for rays with current hits)
+            unique_weights_hit = np.array([
+                ray_weights[(ray_ids == ray_id) & current_hit].sum()
+                for ray_id in ray_ids[unique_rays_mask]
+            ])
+            unique_weights_exit = np.array([
+                ray_weights[(ray_ids == ray_id) & yet_to_hit].sum()
+                for ray_id in ray_ids[unique_rays_mask]
+            ])
+            unique_weights_enter = unique_weights_hit + unique_weights_exit
+
+            # Per unique ray, multiple path length by ray_weight exit only
+            u_w_pl = np.array([
+                np.sum(path_lengths[(ray_ids == ray_id) & yet_to_hit] * ray_weights[(ray_ids == ray_id) & yet_to_hit])
+                for ray_id in ray_ids[unique_rays_mask]
+            ])
+            # Per unique ray, multiply free path length by hit only
+            u_w_fpl = np.array([
+                np.sum(free_path_lengths[(ray_ids == ray_id) & current_hit] * ray_weights[(ray_ids == ray_id) & current_hit])
+                for ray_id in ray_ids[unique_rays_mask]
+            ])
+
+            # Weighted surface area for hit rays (the numerator of MLE (Vincent et al (2021)))
+            u_w_sa_hit = np.array([
+                np.sum(beam_surface_area_all[(ray_ids == ray_id) & current_hit] * ray_weights[(ray_ids == ray_id) & current_hit])
+                for ray_id in ray_ids[unique_rays_mask]
+            ])
+
+            u_w_eff_pl = np.array([
+                np.sum(eff_path_lengths[(ray_ids == ray_id) & current_hit] * ray_weights[(ray_ids == ray_id) & current_hit])
+                for ray_id in ray_ids[unique_rays_mask]
+            ])
+
+            u_w_eff_fpl = np.array([
+                np.sum(eff_path_lengths[(ray_ids == ray_id) & yet_to_hit] * ray_weights[(ray_ids == ray_id) & yet_to_hit])
+                for ray_id in ray_ids[unique_rays_mask]
+            ])
+
+            u_w_sa_all = u_w_sa_all * (u_w_fpl + u_w_pl)
+            u_w_sa_eff_all = u_w_sa_eff_all * (u_w_eff_fpl + u_w_eff_pl)     # With lambda_1 correction
+            u_w_sa_biascorr = u_w_sa_all * (u_w_eff_fpl)
+
+            sum_surface_all = np.nansum(beam_surface_area_all)
+            sum_weights_hit = np.nan
+
+            # Calculate the bias correction factor
+            # Weighted surface area for enter rays (the numerator of bias_corr in MLE (Vincent et al (2021)))
+            u_w_sa_enter = np.array([
+                np.sum(beam_surface_area_all[(ray_ids == ray_id) & (current_hit | yet_to_hit)] * ray_weights[(ray_ids == ray_id) & (current_hit | yet_to_hit)])
+                for ray_id in ray_ids[unique_rays_mask]
+            ])
+            num_unique_rays = unique_rays_mask.size
+            bias_corr_factor = u_w_sa_enter / num_unique_rays
+            bias_corr_brackets = u_w_sa_biascorr / u_w_sa_eff_all
+            bias_corr = bias_corr_factor - bias_corr_brackets
+
+            LAD_MLE_nocorr = MLE_vincent_2021(
+                sum_ba_hit=u_w_sa_hit,      # Numerator
+                sum_ba_all=u_w_sa_all,      # Denominator
                 G=G_leaf,
                 CI=1.0,
-                lambda_1=lambda_1,
-                bias_corr=True
+                bias_corr=None
+            )
+            
+            LAD_MLE_lambda1 = MLE_vincent_2021(
+                sum_ba_hit = u_w_sa_hit,        # Numerator
+                sum_ba_all = u_w_sa_eff_all,    # Denominator
+                G=G_leaf,
+                CI=1.0,
+                bias_corr=None
+            )
+
+            LAD_MLE_lambda1_biascorr = MLE_vincent_2021(
+                sum_ba_all=u_w_sa_hit,          # Numerator
+                sum_ba_hit=u_w_sa_eff_all,      # Denominator
+                G=G_leaf,
+                CI=1.0,
+                bias_corr=bias_corr
             )
 
             data_df.loc[0, 'P_first'] = P_first
@@ -2369,8 +2511,10 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
             data_df.loc[0, 'LAD_first'] = LAD_first
             data_df.loc[0, 'LAD_equal'] = LAD_equal
             data_df.loc[0, 'LAD_intensity'] = LAD_int
-            data_df.loc[0, 'LAD_MLE_geom'] = LAD_MLE_g
-            
+            data_df.loc[0, 'LAD_MLE_nocorr'] = LAD_MLE_nocorr
+            data_df.loc[0, 'LAD_MLE_lambda1'] = LAD_MLE_lambda1
+            data_df.loc[0, 'LAD_MLE_lambda1_biascorr'] = LAD_MLE_lambda1_biascorr
+
         # Add values for both single and multi-return
         data_df.loc[0, 'voxel_id'] = voxel_id
         data_df.loc[0, 'voxel_cx'] = voxel_cx
@@ -2406,19 +2550,19 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
         data_df.loc[0, 'LIAD_leaf_bin_87.5'] = liad_vals[17] if liad_vals.size > 0 else np.nan
         data_df.loc[0, 'mean_angle_leaf'] = mean_angle_leaf
         data_df.loc[0, 'mean_angle_all'] = mean_angle_all
-        data_df.loc[0, 'mean_path_length'] = mean_path_length
-        data_df.loc[0, 'sum_path_length'] = sum_path_length
-        data_df.loc[0, 'mean_free_path_length'] = mean_free_path_length
-        data_df.loc[0, 'sum_free_path_length'] = sum_free_path_length
-        data_df.loc[0, 'sum_free_path_length_hit'] = sum_free_path_length_hit
-        data_df.loc[0, 'sum_free_path_length_hit_leaf'] = sum_free_path_length_hit_leaf
-        data_df.loc[0, 'mean_eff_path_length'] = mean_eff_path_length
-        data_df.loc[0, 'var_eff_path_length'] = var_eff_path_length
-        data_df.loc[0, 'mean_eff_free_path_length'] = mean_eff_free_path_length
-        data_df.loc[0, 'var_eff_free_path_length'] = var_eff_free_path_length
-        data_df.loc[0, 'sum_eff_free_path_length'] = sum_eff_free_path_length
-        data_df.loc[0, 'sum_eff_free_path_length_hit'] = sum_eff_free_path_length_hit
-        data_df.loc[0, 'sum_eff_free_path_length_hit_leaf'] = sum_eff_free_path_length_hit_leaf
+        data_df.loc[0, 'mean_path_length'] = mean_path_length.astype(np.float32)
+        data_df.loc[0, 'sum_path_length'] = np.float32(sum_path_length)
+        data_df.loc[0, 'mean_free_path_length'] = np.float32(mean_free_path_length)
+        data_df.loc[0, 'sum_free_path_length'] = np.float32(sum_free_path_length)
+        data_df.loc[0, 'sum_free_path_length_hit'] = np.float32(sum_free_path_length_hit)
+        data_df.loc[0, 'sum_free_path_length_hit_leaf'] = np.float32(sum_free_path_length_hit_leaf)
+        data_df.loc[0, 'mean_eff_path_length'] = np.float32(mean_eff_path_length)
+        data_df.loc[0, 'var_eff_path_length'] = np.float32(var_eff_path_length)
+        data_df.loc[0, 'mean_eff_free_path_length'] = np.float32(mean_eff_free_path_length)
+        data_df.loc[0, 'var_eff_free_path_length'] = np.float32(var_eff_free_path_length)
+        data_df.loc[0, 'sum_eff_free_path_length'] = np.float32(sum_eff_free_path_length)
+        data_df.loc[0, 'sum_eff_free_path_length_hit'] = np.float32(sum_eff_free_path_length_hit)
+        data_df.loc[0, 'sum_eff_free_path_length_hit_leaf'] = np.float32(sum_eff_free_path_length_hit_leaf)
 
         return data_df
 
@@ -2872,7 +3016,7 @@ def convert_parquet_to_csv(parquet_file, output_file):
 
     df.to_csv(output_file, index=False)
 
-def add_normals_weights_to_valid_rays(files, knn=6, debug=False):
+def add_normals_weights_to_valid_rays(valid_rays_dir, knn=6, debug=False):
     """
     Add normals and weights to the points in the valid rays files.
     """
@@ -2880,10 +3024,12 @@ def add_normals_weights_to_valid_rays(files, knn=6, debug=False):
     import numpy as np
     from sklearn.neighbors import NearestNeighbors
     import os
+    import glob
     import shutil
     from dask.diagnostics import ProgressBar
 
     # Read the valid rays files
+    files = glob.glob(os.path.join(valid_rays_dir, "*valid_rays.parquet"))
     dfs = []
     for file in files:
         df = dd.read_parquet(file, engine='pyarrow')
@@ -2901,22 +3047,35 @@ def add_normals_weights_to_valid_rays(files, knn=6, debug=False):
     valid_rays_df = valid_rays_df.reset_index(drop=True)
     with ProgressBar():
         valid_rays_df = valid_rays_df.compute()
+        valid_rays_df = valid_rays_df.reset_index(drop=True)  # Ensure indices are unique and sequential
 
-        leaf_idx = valid_rays_df[valid_rays_df['is_leaf'] == True].index
-        leaf_points = valid_rays_df.loc[leaf_idx, ['point_x', 'point_y', 'point_z']].values
+        # Select only leaf points (where is_leaf is True and point_x is not NaN)
+        leaf_mask = valid_rays_df['is_leaf'].values & ~valid_rays_df['point_x'].isna().values
+        leaf_points = valid_rays_df.loc[leaf_mask, ['point_x', 'point_y', 'point_z']].to_numpy()
+        leaf_idx = valid_rays_df.index[leaf_mask]
 
-    # Calculate normals and weights on all leaf hits
-    normals, weights = compute_normals_weights_from_points(points=leaf_points, knn=knn)
-    del leaf_points
-    
-    with ProgressBar():
-        valid_rays_df.loc[leaf_idx, 'normal_x'] = normals[:, 0].astype(np.float32)
-        valid_rays_df.loc[leaf_idx, 'normal_y'] = normals[:, 1].astype(np.float32)
-        valid_rays_df.loc[leaf_idx, 'normal_z'] = normals[:, 2].astype(np.float32)
-        valid_rays_df.loc[leaf_idx, 'point_weight'] = weights.astype(np.float32)
+        # Check for duplicate leaf_idx
+        if leaf_idx.duplicated().any():
+            print("Duplicate indices found in leaf_idx. This may cause assignment errors.")
+            raise ValueError("Duplicate indices found in leaf_idx. Please check your data for duplicates.")
 
+        # Calculate normals and weights on all leaf hits
+        normals, weights = compute_normals_weights_from_points(points=leaf_points, knn=knn)
+        del leaf_points
+
+        with ProgressBar():
+            # Add normals and weights to the valid rays dataframe (only for leaf points)
+            leaf_df = pd.DataFrame({
+                'normal_x': normals[:, 0].astype(np.float32()),
+                'normal_y': normals[:, 1].astype(np.float32()),
+                'normal_z': normals[:, 2].astype(np.float32()),
+                'point_weight': weights.astype(np.float32())
+            }, index=leaf_idx)
+            valid_rays_df.update(leaf_df)                                  
         # Save updated valid_rays parquet files per leg
         output_files = []
+
+        print("Saving results...")
 
         grouped_df = valid_rays_df.groupby('leg_id')
         DEBUG_PRINT = False
