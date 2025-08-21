@@ -2164,6 +2164,148 @@ def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, 
     print(statement)
     logger.info(statement)
 
+def potential_valid_rays_debug():
+    import os
+    import glob
+    import pandas as pd
+    import numpy as np
+
+    helios_files = glob.glob(os.path.join(helios_dir, '*.xyz'))
+    pulses = glob.glob(os.path.join(helios_dir, '*_pulse.txt'))
+    valid_rays_files = glob.glob(os.path.join(valid_rays_dir, '*valid_rays.parquet'))
+
+    total_helios_points = 0
+    helios_points_comb = []
+    for file in helios_files:
+        # Read only the first three columns (point_x, point_y, point_z) using numpy for efficiency
+        arr = np.loadtxt(file, usecols=(0, 1, 2))
+        total_helios_points += arr.shape[0]
+        helios_points_comb.append(arr)
+
+    helios_points_comb = np.concatenate(helios_points_comb, axis=0)
+
+    valid_rays_dfs = []
+    for file in valid_rays_files:
+        df = pd.read_parquet(file)
+        valid_rays_dfs.append(df)
+
+    valid_rays_df = pd.concat(valid_rays_dfs)
+    valid_rays_points = valid_rays_df[['point_x', 'point_y', 'point_z']][valid_rays_df['point_x'].notna()].values
+
+    total_valid_points = valid_rays_points.shape[0]
+
+    print(f"Total Helios points: {total_helios_points}")
+    print(f"Total valid rays points: {total_valid_points}")
+
+    # Use matching logic similar to missing_valid_wood_points
+    # Instead of looping, use broadcasting for efficiency
+    missing_mask = np.array([
+        not np.any(np.all(np.isclose(valid_rays_points.astype(np.float32), hp.astype(np.float32), atol=1e-6), axis=1))
+        for hp in helios_points_comb
+    ])
+    missing_points = helios_points_comb[missing_mask]
+    print(f"Number of missing points: {len(missing_points)}")
+    if len(missing_points) > 0:
+        print("Saving missing points to 'missing_points.xyz'")
+        missing_points_file = os.path.join(valid_rays_dir, "missing_points.xyz")
+        np.savetxt(missing_points_file, missing_points, fmt="%.6f")
+    else:
+        print("No missing points found.")
+
+def potential_intersections_debug():
+    import os
+    import glob
+    import numpy as np
+    import pandas as pd
+
+    voxel_sizes = 'all'
+
+    if voxel_sizes == 'all':
+        intersection_files = glob.glob(os.path.join(valid_rays_dir, '*_intersections.parquet'))
+    else:
+        intersection_files = []
+        for vs in voxel_sizes:
+            files = glob.glob(os.path.join(valid_rays_dir, f'*{vs}_intersections.parquet'))
+            intersection_files.extend(files)
+
+    for file in intersection_files:
+        df = pd.read_parquet(file)
+        leg_id = df['leg_id'].iloc[0]
+        voxel_size = round(df['voxel_size'].iloc[0], 1)
+        valid_rays = os.path.join(valid_rays_dir, f"leg_{leg_id}_valid_rays.parquet")
+        
+        reference = "/home/capheus/projects/51_tree_test/1001_etri_uniform_diamond/references/1001_etri_uniform_diamond_results_0.2.csv"
+
+        if os.path.exists(valid_rays):
+            print(f"Leg {leg_id}")
+            valid_rays = pd.read_parquet(valid_rays, engine='pyarrow')
+            hit_mask = valid_rays['point_x'].notna()
+            leaf_hit_mask = valid_rays['is_leaf'] & hit_mask
+            pre_num_hits = hit_mask.sum()
+            pre_num_leaf_hits = leaf_hit_mask.sum()
+            print(f"Pre-hits: {pre_num_hits}, Pre-leaf hits: {pre_num_leaf_hits}")
+
+            hit_mask = df['hit_type'] == 2
+            leaf_hit_mask = df['is_leaf'] & hit_mask
+            post_num_hits = hit_mask.sum()
+            post_num_leaf_hits = leaf_hit_mask.sum()
+            print(f"Post-hits: {post_num_hits}, Post-leaf hits: {post_num_leaf_hits}")
+
+            # Find ray_ids that have hits (any hit_type > 0) but never hit_type == 2
+            rays_with_hits = df.loc[df['hit_type'] > 0, 'ray_id'].unique()
+            rays_with_type2 = df.loc[df['hit_type'] == 2, 'ray_id'].unique()
+            rays_with_hits_not_type2 = np.setdiff1d(rays_with_hits, rays_with_type2)
+
+            rays_info = df[df['ray_id'].isin(rays_with_hits_not_type2)][['ray_id', 'point_x', 'point_y', 'point_z']]
+            rays_info.drop_duplicates(subset=['ray_id', 'point_x', 'point_y', 'point_z'], inplace=True)
+            print(f"Number of rays with hits but never hit_type == 2: {len(rays_with_hits_not_type2)}")
+            if len(rays_with_hits_not_type2) > 0:
+                points = rays_info[['point_x', 'point_y', 'point_z', 'ray_id']].values
+
+                if reference is not None:
+                    if os.path.exists(reference):
+                        reference_df = pd.read_csv(reference)
+                        reference_df.drop_duplicates(subset=['voxel_cx', 'voxel_cy', 'voxel_cz'], inplace=True)
+
+                        # To fix, only append once:
+                        points_meant_to_be_in_voxel = []
+                        for point in points:
+                            found_in_voxel = False
+                            ray_id = point[3]
+                            for _, voxel_row in reference_df.iterrows():
+                                min_bound = np.array([voxel_row['voxel_cx'], voxel_row['voxel_cy'], voxel_row['voxel_cz']]) - voxel_size / 2.0 - 1e-6
+                                max_bound = np.array([voxel_row['voxel_cx'], voxel_row['voxel_cy'], voxel_row['voxel_cz']]) + voxel_size / 2.0 + 1e-6
+                                pt_xyz = point[:3]
+                                # Check if point is inside voxel bounds
+                                if np.all((pt_xyz > min_bound) & (pt_xyz < max_bound)):
+                                    # Also check if ray_id is present in the voxel in df
+                                    voxel_mask = (
+                                        (df['voxel_cx'] == voxel_row['voxel_cx']) &
+                                        (df['voxel_cy'] == voxel_row['voxel_cy']) &
+                                        (df['voxel_cz'] == voxel_row['voxel_cz'])
+                                    )
+                                    if ray_id in df.loc[voxel_mask, 'ray_id'].values:
+                                        found_in_voxel = True
+                                        break
+                            if found_in_voxel:
+                                points_meant_to_be_in_voxel.append(point)
+                        
+                        if len(points_meant_to_be_in_voxel) > 0:
+                            # Check if the ray_id is assigned to the voxel
+                            print(f"Number of points meant to be in voxel: {len(points_meant_to_be_in_voxel)}")
+                            out_file = os.path.join(valid_rays_dir, f"leg_{leg_id}_vs_{voxel_size}_hits_not_type2_points.xyz")
+                            points = points_meant_to_be_in_voxel
+                        else:
+                            print("All missing points are not in reference voxels.")
+                            out_file = None
+                else:
+                    out_file = os.path.join(valid_rays_dir, f"leg_{leg_id}_vs_{voxel_size}_hits_not_type2_points.xyz")
+                
+                if out_file is not None:
+                    np.savetxt(out_file, points, fmt="%.6f")
+
+
+
 # Function used for taking valid_rays parquet files and references to establish voxel_ray intersections per valid_rays file
 def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug=False, epsilon=1e-6):
     import os
@@ -2241,7 +2383,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
         avail_mem *= 0.9
         def _mem_per_worker(partitions):
             return avail_mem // partitions
-        mem_per_worker = avail_mem // avail_cpu if not os.environ.get('SLURM_MEM_PER_CPU') else avail_mem
+        mem_per_worker = avail_mem // avail_cpu
 
         num_rays = df['ray_id'].nunique().compute()
         num_voxels = len(voxel_references)
@@ -2252,19 +2394,15 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
         bytes_per_ray = 12 * 8 # sum(field.type.bit_width // 4 for field in valid_rays_schema)  # bit_width to bytes
         bytes_per_voxel = 6 * 8  # 6 float32 values per voxel (min/max for x, y, z), 4 bytes each
         max_elements_per_chunk = int(mem_per_worker // (bytes_per_voxel + bytes_per_ray))
-        rays_per_chunk = max(1, int(np.sqrt(max_elements_per_chunk * ratio)))
-        voxels_per_chunk = max(1, int(max_elements_per_chunk // rays_per_chunk))
 
-        npartitions = max(1, int(np.ceil(num_rays / rays_per_chunk)))
-        if npartitions < avail_cpu:
-            npartitions = avail_cpu
-            mem_per_worker = _mem_per_worker(npartitions)
-            if mem_per_worker < 0:
-                raise ValueError("Not enough memory available")
-            max_elements_per_chunk = int(mem_per_worker // (bytes_per_voxel + bytes_per_ray))
-            rays_per_chunk = num_rays // npartitions
+        if avail_cpu * max_elements_per_chunk > avail_mem:
+            rays_per_chunk = max(1, int(np.sqrt(max_elements_per_chunk * ratio)))
             voxels_per_chunk = max(1, int(max_elements_per_chunk // rays_per_chunk))
-
+        else:
+            rays_per_chunk = max(1, num_rays // avail_cpu)
+            voxels_per_chunk = max(1, int(max_elements_per_chunk // rays_per_chunk))
+        
+        npartitions = max(1, int(np.ceil(num_rays / rays_per_chunk)))
         df = df.repartition(npartitions=npartitions)
 
         dd_results = []
@@ -3602,7 +3740,7 @@ def add_normals_weights_to_valid_rays(valid_rays_dir, knn=6, debug=False):
     if len(dfs) == 0:
         raise ValueError("No valid voxel_ray_intersection files found.")
     
-    print(f"Adding normals and weights to {len(dfs)} files...")
+    print(f"Loading {len(dfs)} files...")
     
     # Combine all dataframes into one
     valid_rays_df = dd.concat(dfs, axis=0, ignore_index=True)
