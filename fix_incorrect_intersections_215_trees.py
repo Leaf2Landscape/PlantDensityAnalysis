@@ -155,8 +155,7 @@ def main():
         print(f"[RUNNING] prepare_helios_data for scene {scene_id}")
         try:
             utils.fix_incorrect_intersections(
-                valid_rays_dir=str(valid_rays_dir),
-                references_dir=str(refs_dir)
+                valid_rays_dir=str(valid_rays_dir)
             )
 
             print(f"[OK]     {scene_id}\n")
