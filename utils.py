@@ -1318,7 +1318,7 @@ def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir,
     filtered_viewing_angles = find_viewing_angles(directions=filtered_directions)
 
     # Cleanup memory
-    del voxel_ids, voxel_sizes, voxel_centres, leg_ids, ray_ids, is_leaf, points, all_indices, origins, directions, echo_intensities
+    del voxel_ids, voxel_sizes, voxel_centres, leg_ids, ray_ids, is_leaf, points, origins, directions, echo_intensities
 
     # Filter out points that are within each respective voxel  
     # Create hit_type variable
