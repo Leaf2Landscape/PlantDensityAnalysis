@@ -11,7 +11,7 @@ import argparse
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fix incorrect intersections in ray data.")
-    parser.add_argument("--valid_rays_dir", type=str, required=True, help="Directory containing valid rays and intersection files.")
+    parser.add_argument("valid_rays_dir", type=str, help="Directory containing valid rays and intersection files.")
     parser.add_argument("--num_jobs", type=int, default=8, help="Number of parallel jobs.")
     args = parser.parse_args()
 
