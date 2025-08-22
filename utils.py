@@ -113,6 +113,8 @@ voxel_metrics_schema_singlereturn = pa.schema([
     pa.field('sum_free_path_length_hit_leaf', pa.float64()),
     pa.field('mean_eff_path_length', pa.float64()),
     pa.field('var_eff_path_length', pa.float64()),
+    pa.field('sum_eff_path_length', pa.float64()),
+    pa.field('mean_eff_free_path_length', pa.float64()),
     pa.field('mean_eff_free_path_length', pa.float64()),
     pa.field('var_eff_free_path_length', pa.float64()),
     pa.field('sum_eff_free_path_length', pa.float64()),
@@ -172,6 +174,7 @@ voxel_metrics_schema_multireturn = pa.schema([
     pa.field('sum_free_path_length_hit_leaf', pa.float64()),
     pa.field('mean_eff_path_length', pa.float64()),
     pa.field('var_eff_path_length', pa.float64()),
+    pa.field('sum_eff_path_length', pa.float64()),
     pa.field('mean_eff_free_path_length', pa.float64()),
     pa.field('var_eff_free_path_length', pa.float64()),
     pa.field('sum_eff_free_path_length', pa.float64()),
@@ -706,7 +709,7 @@ def BL_pimont_2018(P, mean_path_length, G=0.5, CI=1.0, epsilon=1e-9):
 
         ADeff = np.where(
             (~np.isnan(P) & ~np.isnan(mean_path_length)),
-            -(np.log(1 - P) / (G * mean_path_length)),
+            -(np.log(P) / (G * mean_path_length)),
             np.nan
         )  
 
@@ -826,7 +829,7 @@ def MCF_beland_2011(I, mean_free_path_length, G=0.5, CI=1.0, epsilon=1e-9):
     
     INPUTS:
         mean_free_path_lengths: The mean z value
-        I: The relative density index (num_hits/num_rays)
+        I: = 1.0 - pgap
         G: The G function value
         epsilon: A condition to avoid issues with zero division
 
@@ -1081,7 +1084,7 @@ def find_viewing_angles(directions, reference_vector=np.array([0, 0, 1])):
     return viewing_angle
 
 # Function to traverse the voxels and find ray intersections
-def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir, debug=False, epsilon=1e-5):
+def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir, debug=False, epsilon=1e-6):
     import logging
     logging.basicConfig(level=logging.INFO)
 
@@ -1362,8 +1365,6 @@ def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir,
     # Classify hit types
     before_voxel = (dist_to_entry_sq > dist_to_point_sq) & ~in_voxel & ~unbound
     after_voxel = (dist_to_exit_sq < dist_to_point_sq) & ~in_voxel & ~unbound
-    missed_in_voxel = (dist_to_entry_sq < dist_to_point_sq) & (dist_to_exit_sq > dist_to_point_sq) & ~in_voxel & ~unbound
-    in_voxel = in_voxel | missed_in_voxel
 
     hit_type = np.full(filtered_points.shape[0], -1, dtype=np.int32)
     hit_type[unbound] = 0
@@ -2455,7 +2456,7 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
         num_unbound_rays = unbound.sum()
 
 
-        num_rays = voxel_df['ray_id'][valid_ray_mask].count()
+        num_rays = voxel_df['ray_id'][valid_ray_mask].nunique()
         if num_rays <= 0:
             statement= f"Voxel {voxel_df['voxel_id'].values[0]} has no rays."
             print(statement)
@@ -2542,8 +2543,7 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
             path_lengths=path_lengths, 
             lambda_1=lambda_1
         )
-        mean_eff_path_length = np.nanmean(eff_path_lengths)
-        var_eff_path_length = np.nanvar(eff_path_lengths)
+
         eff_free_path_lengths = calculate_effective_path_length(
             path_lengths=free_path_lengths, 
             lambda_1=lambda_1
@@ -2561,6 +2561,7 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
 
         mean_eff_path_length = np.nanmean(eff_path_lengths)
         var_eff_path_length = np.nanvar(eff_path_lengths)
+        sum_eff_path_length = np.nansum(eff_path_lengths)
 
         mean_eff_free_path_length = np.nanmean(eff_free_path_lengths)
         sum_eff_free_path_length = np.nansum(eff_free_path_lengths)
@@ -2847,6 +2848,7 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
         data_df.loc[0, 'sum_free_path_length_hit_leaf'] = np.float64(sum_free_path_length_hit_leaf)
         data_df.loc[0, 'mean_eff_path_length'] = np.float64(mean_eff_path_length)
         data_df.loc[0, 'var_eff_path_length'] = np.float64(var_eff_path_length)
+        data_df.loc[0, 'sum_eff_path_length'] = np.float64(sum_eff_path_length)
         data_df.loc[0, 'mean_eff_free_path_length'] = np.float64(mean_eff_free_path_length)
         data_df.loc[0, 'var_eff_free_path_length'] = np.float64(var_eff_free_path_length)
         data_df.loc[0, 'sum_eff_free_path_length'] = np.float64(sum_eff_free_path_length)
@@ -3455,7 +3457,7 @@ def fix_incorrect_intersections(valid_rays_dir, num_jobs=-1):
         voxel_size = df['voxel_size'].iloc[0]
         valid_rays_file = os.path.join(valid_rays_dir, f'leg_{leg_id}_valid_rays.parquet')
         valid_rays_dd = dd.read_parquet(valid_rays_file, engine='pyarrow')
-        valid_rays_dd = valid_rays_dd[['ray_id', 'origin_x', 'origin_y', 'origin_z']]
+        valid_rays_dd = valid_rays_dd[['ray_id', 'origin_x', 'origin_y', 'origin_z', 'direction_x', 'direction_y', 'direction_z']]
         valid_rays_dd = valid_rays_dd.compute()
 
         df = df.merge(valid_rays_dd, on='ray_id', how='left')
@@ -3463,10 +3465,44 @@ def fix_incorrect_intersections(valid_rays_dir, num_jobs=-1):
         del valid_rays_dd
 
         voxel = df[['voxel_cx', 'voxel_cy', 'voxel_cz']].values
+        if 'origin_x_x' in df.columns:
+            origin = df[['origin_x_x', 'origin_y_x', 'origin_z_x']].values
+            direction = df[['direction_x_x', 'direction_y_x', 'direction_z_x']].values
+        else:
+            origin = df[['origin_x', 'origin_y', 'origin_z']].values
+            direction = df[['direction_x', 'direction_y', 'direction_z']].values
+
+        # Redo voxel-ray AABB intersection to remove any unwanted rays due to tolerance
+        epsilon = 1e-6
+        voxel_min = voxel - (voxel_size / 2) - epsilon
+        voxel_max = voxel + (voxel_size / 2) + epsilon
+
+        direction = np.where(
+            np.abs(direction) <= epsilon,
+            epsilon,
+            direction
+        )
+        inv_direction = 1.0 / direction
+
+        # Compute the intersection points
+        t_ent_arr = (voxel_min - origin) * inv_direction
+        t_ex_arr = (voxel_max - origin) * inv_direction
+        t_ent = np.max(np.minimum(t_ent_arr, t_ex_arr), axis=1)
+        t_ex = np.min(np.maximum(t_ent_arr, t_ex_arr), axis=1)
+
+        # Mask out invalid rays 
+        valid_ray_mask = (t_ent <= t_ex + epsilon) & (t_ex >= -epsilon)
+        num_invalid_rays = len(valid_ray_mask) - valid_ray_mask.sum()
+        print(f"Number of invalid rays: {num_invalid_rays}")
+        df = df[valid_ray_mask]
+
+        del t_ent, t_ex, direction
+
+        origin = origin[valid_ray_mask]
+        voxel = voxel[valid_ray_mask]
         entry = df[['t_entry_x', 't_entry_y', 't_entry_z']].values
         exit = df[['t_exit_x', 't_exit_y', 't_exit_z']].values
         point = df[['point_x', 'point_y', 'point_z']].values
-        origin = df[['origin_x', 'origin_y', 'origin_z']].values
 
         # Identify rows where point_x, point_y, or point_z is nan (unbound rays)
         unbound_mask = np.isnan(point).any(axis=1)
@@ -3488,12 +3524,25 @@ def fix_incorrect_intersections(valid_rays_dir, num_jobs=-1):
         df.loc[hit_mask, 'hit_type'] = 2
         df.loc[after_mask, 'hit_type'] = 3
 
+        for col in [
+            'origin_x', 'origin_y', 'origin_z', 
+            'direction_x', 'direction_y', 'direction_z',
+            'origin_x_x', 'origin_y_x', 'origin_z_x',
+            'direction_x_x', 'direction_y_x', 'direction_z_x',
+            'origin_x_y', 'origin_y_y', 'origin_z_y',
+            'direction_x_y', 'direction_y_y', 'direction_z_y'
+        ]:
+            if col in df.columns:
+                df.drop(columns=col, inplace=True)
+
         # Save backup and overwrite
         old_file = os.path.join(valid_rays_dir, os.path.basename(file).replace(".parquet", "_old.parquet"))
         shutil.copy2(file, old_file)
         output_file = os.path.join(valid_rays_dir, os.path.basename(file))
         df.to_parquet(output_file, engine='pyarrow')
 
-    Parallel(n_jobs=num_jobs, prefer="threads")(
-        delayed(process_file)(file) for file in tqdm(intersection_files, desc="Processing intersection files")
+    results = Parallel(n_jobs=num_jobs, prefer="threads")(
+        delayed(process_file)(file) for file in intersection_files
     )
+    for _ in tqdm(results, desc="Processing intersection files"):
+        pass
