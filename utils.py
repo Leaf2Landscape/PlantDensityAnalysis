@@ -1765,8 +1765,8 @@ def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir,
 
     # Use squared distances for faster computation on large datasets
     # All points should be in some voxel, but we need to classify their hit type
-    dist_to_entry_sq = np.sum((filtered_origins -(filtered_entry_coords - epsilon)) ** 2, axis=1)
-    dist_to_exit_sq = np.sum((filtered_origins - (filtered_exit_coords - epsilon)) ** 2, axis=1)
+    dist_to_entry_sq = np.sum((filtered_origins -(filtered_entry_coords)) ** 2, axis=1)
+    dist_to_exit_sq = np.sum((filtered_origins - (filtered_exit_coords)) ** 2, axis=1)
     dist_to_point_sq = np.sum((filtered_points - filtered_origins) ** 2, axis=1)
 
     # Classify hit types
@@ -3118,8 +3118,8 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
             # Surface area = π * (radius)^2, where radius = distance_to_centre * beam_divergence
             beam_surface_area_all = np.full(distance_to_centre.shape, np.nan, dtype=np.float64)
             beam_divergence_rad = beam_divergence * 1e-3  # Convert mrad to rad
-            beam_radius = distance_to_centre[valid_path_length_mask] * beam_divergence_rad
-            beam_surface_area_all[valid_path_length_mask] = np.pi * np.square(beam_radius)
+            beam_radius = distance_to_centre[valid_ray_mask] * beam_divergence_rad
+            beam_surface_area_all[valid_ray_mask] = np.pi * np.square(beam_radius)
             beam_surface_area_weighted = beam_surface_area_all * ray_weights
 
             unique_rays_mask = np.unique(ray_ids, return_index=True)[1]
@@ -3229,27 +3229,27 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
         data_df.loc[0, 'G_lw'] = G_lw
         data_df.loc[0, 'G_leaf'] = G_leaf
         data_df.loc[0, 'lambda_1'] = lambda_1
-        data_df.loc[0, 'LIAD_leaf_bin_2.5'] = liad_vals[0].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_7.5'] = liad_vals[1].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_12.5'] = liad_vals[2].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_17.5'] = liad_vals[3].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_22.5'] = liad_vals[4].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_27.5'] = liad_vals[5].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_32.5'] = liad_vals[6].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_37.5'] = liad_vals[7].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_42.5'] = liad_vals[8].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_47.5'] = liad_vals[9].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_52.5'] = liad_vals[10].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_57.5'] = liad_vals[11].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_62.5'] = liad_vals[12].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_67.5'] = liad_vals[13].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_72.5'] = liad_vals[14].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_77.5'] = liad_vals[15].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_82.5'] = liad_vals[16].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_87.5'] = liad_vals[17].astype(np.float32) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'mean_angle_leaf'] = mean_angle_leaf.astype(np.float32)
-        data_df.loc[0, 'mean_angle_all'] = mean_angle_all.astype(np.float32)
-        data_df.loc[0, 'mean_path_length'] = mean_path_length.astype(np.float64)
+        data_df.loc[0, 'LIAD_leaf_bin_2.5'] = np.float32(liad_vals[0]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'LIAD_leaf_bin_7.5'] = np.float32(liad_vals[1]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'LIAD_leaf_bin_12.5'] = np.float32(liad_vals[2]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'LIAD_leaf_bin_17.5'] = np.float32(liad_vals[3]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'LIAD_leaf_bin_22.5'] = np.float32(liad_vals[4]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'LIAD_leaf_bin_27.5'] = np.float32(liad_vals[5]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'LIAD_leaf_bin_32.5'] = np.float32(liad_vals[6]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'LIAD_leaf_bin_37.5'] = np.float32(liad_vals[7]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'LIAD_leaf_bin_42.5'] = np.float32(liad_vals[8]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'LIAD_leaf_bin_47.5'] = np.float32(liad_vals[9]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'LIAD_leaf_bin_52.5'] = np.float32(liad_vals[10]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'LIAD_leaf_bin_57.5'] = np.float32(liad_vals[11]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'LIAD_leaf_bin_62.5'] = np.float32(liad_vals[12]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'LIAD_leaf_bin_67.5'] = np.float32(liad_vals[13]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'LIAD_leaf_bin_72.5'] = np.float32(liad_vals[14]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'LIAD_leaf_bin_77.5'] = np.float32(liad_vals[15]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'LIAD_leaf_bin_82.5'] = np.float32(liad_vals[16]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'LIAD_leaf_bin_87.5'] = np.float32(liad_vals[17]) if liad_vals.size > 0 else np.nan
+        data_df.loc[0, 'mean_angle_leaf'] = np.float32(mean_angle_leaf)
+        data_df.loc[0, 'mean_angle_all'] = np.float32(mean_angle_all)
+        data_df.loc[0, 'mean_path_length'] = np.float64(mean_path_length)
         data_df.loc[0, 'sum_path_length'] = np.float64(sum_path_length)
         data_df.loc[0, 'mean_free_path_length'] = np.float64(mean_free_path_length)
         data_df.loc[0, 'sum_free_path_length'] = np.float64(sum_free_path_length)
