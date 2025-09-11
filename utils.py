@@ -1090,30 +1090,20 @@ def PAD_MLE(value):
     pass
 
 # Multi-return MLE from AMAPvox
-def MLE_vincent_2021(sum_sa_hit, sum_sa_all, G=0.5, CI=1.0, bias_corr=None, eps=1e-9):
+def MLE_vincent_2021(sum_ba_hit, sum_pl_all, G=0.5, CI=1.0, bias_corr=None):
     """
     Calculate the Maximum Likelihood Estimation (MLE) using the formula for multi-geometry correction.
     This code requires:
-    - num_hits: The number of hits detected.          
-    - sum_ba_all: Sum of expected beam areas for unique pulses at voxel centre.
-    - sum_ray_fraction_h: Sum of fraction of unique pulses that hit inside voxel
-    - sum_fpl_h: Sum of fractional free-path lengths for hits inside voxel
-    - sum_pl_e: Sum of fractional path lengths for rays exiting the voxel (i.e. unbound rays weighted 1, yet_to_hit rays weighted according to fraction of pulse)
+    - sum_ba_hit: Sum of expected beam areas for unique pulses at voxel centre that hit vegetation elements.         
+    - sum_pl_all: Sum of expected beam areas for unique pulses at voxel centre.
+    - bias_corr: The hit vs explored ratio outlined in Vincent 2021 (i.e. -(sum(ba_all * fraction_enter)/num_rays))
     - G: G function
     - CI: Clumping index
-    - lambda_1: Vegetation element size value (average leaf area * voxel_volume)
-    - bias_corr: The hit vs explored ratio outlined in Vincent 2021 (i.e. -(sum(ba_all * fraction_enter)/num_rays))
-        If there is a value supplied, the correction will be applied
-    - eps: A small value to avoid division by zero.
 
     To apply vegetation element size corrections, use the sum_eff_free_path_length_hit and sum_eff_path_length_exit values in the sum_fpl_h and sum_pl_e
     """
 
-    """Initial k_hat formula
-    
-    """
-
-    k_hat = sum_sa_hit / sum_sa_all
+    k_hat = sum_ba_hit / sum_pl_all
 
     if bias_corr is not None:
         k_hat -= bias_corr
@@ -3083,11 +3073,21 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
     """
     import os
     import glob
+    import psutil
     import pandas as pd
     import numpy as np
     import dask.dataframe as dd
     from dask.diagnostics import ProgressBar
+    from dask.distributed import Client
     from collections import defaultdict
+
+    avail_cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', psutil.cpu_count(logical=True)))
+    threads = 1 if not os.environ.get('SLURM_CPUS_PER_TASK') else 2
+    avail_mem = int(os.environ.get('SLURM_MEM_PER_NODE', psutil.virtual_memory().available // (1024 * 1024))) # in MB
+    avail_mem = avail_mem * 0.9 // 1024 # Use 80% of available memory and convert to GB
+    mem_limit = avail_mem // avail_cpus
+    mem_limit = f"{mem_limit}GB"
+    client = Client(n_workers=avail_cpus, threads_per_worker=threads, memory_limit=mem_limit)
 
     # Per voxel function
     def calculate_voxel_metrics_per_voxel(voxel_df, min_rays=6, epsilon=1e-9):
@@ -3380,95 +3380,164 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
 
 
             distance_to_centre = voxel_df['distance_to_centre'].values
-            ray_weights = 1.0 / voxel_df['number_of_returns'].values
+            ray_weights = 1.0 / voxel_df['number_of_returns'].values    # NOTE: unbound rays should have weight of 0, so any unbound ratio needs to ignore weights
             # Calculate the surface area of the beam cross section at the distance to the voxel centre
             # Surface area = π * (radius)^2, where radius = distance_to_centre * beam_divergence
             beam_surface_area_all = np.full(distance_to_centre.shape, np.nan, dtype=np.float64)
             beam_divergence_rad = beam_divergence * 1e-3  # Convert mrad to rad
             beam_radius = distance_to_centre[valid_ray_mask] * beam_divergence_rad
             beam_surface_area_all[valid_ray_mask] = np.pi * np.square(beam_radius)
-            beam_surface_area_weighted = beam_surface_area_all * ray_weights
 
+            # Mask unique ray_ids (i.e. pulses)
             unique_rays_mask = np.unique(ray_ids, return_index=True)[1]
-            unique_surface_area = beam_surface_area_all[unique_rays_mask]
-            # Aggregate sum of weights per unique ray (for rays with current hits)
-            unique_weights_hit = np.array([
-                ray_weights[(ray_ids == ray_id) & current_hit].sum()
-                for ray_id in ray_ids[unique_rays_mask]
-            ])
-            unique_weights_exit = np.array([
-                ray_weights[(ray_ids == ray_id) & yet_to_hit].sum()
-                for ray_id in ray_ids[unique_rays_mask]
-            ])
-            unique_weights_enter = unique_weights_hit + unique_weights_exit
 
-            # Per unique ray, multiple path length by ray_weight exit only
-            u_w_pl = np.array([
-                np.sum(path_lengths[(ray_ids == ray_id) & yet_to_hit] * ray_weights[(ray_ids == ray_id) & yet_to_hit])
-                for ray_id in ray_ids[unique_rays_mask]
-            ])
-            # Per unique ray, multiply free path length by hit only
-            u_w_fpl = np.array([
-                np.sum(free_path_lengths[(ray_ids == ray_id) & current_hit] * ray_weights[(ray_ids == ray_id) & current_hit])
-                for ray_id in ray_ids[unique_rays_mask]
-            ])
+            ### CALCULATE NUMERATOR FOR MLE ###
+            # Find sum(Sq * sum(αjq))
 
-            # Weighted surface area for hit rays (the numerator of MLE (Vincent et al (2021)))
-            u_w_sa_hit = np.array([
-                np.sum(beam_surface_area_all[(ray_ids == ray_id) & current_hit] * ray_weights[(ray_ids == ray_id) & current_hit])
-                for ray_id in ray_ids[unique_rays_mask]
-            ])
+            ## Sq is unique_pulse_area
+            unique_pulse_area = beam_surface_area_all[unique_rays_mask]
 
-            u_w_eff_pl = np.array([
-                np.sum(eff_path_lengths[(ray_ids == ray_id) & current_hit] * ray_weights[(ray_ids == ray_id) & current_hit])
-                for ray_id in ray_ids[unique_rays_mask]
-            ])
+            # Precompute unique_ray_ids and sorter for mapping
+            unique_ray_ids = ray_ids[unique_rays_mask]
+            sorter = np.argsort(unique_ray_ids)
 
-            u_w_eff_fpl = np.array([
-                np.sum(eff_path_lengths[(ray_ids == ray_id) & yet_to_hit] * ray_weights[(ray_ids == ray_id) & yet_to_hit])
-                for ray_id in ray_ids[unique_rays_mask]
-            ])
+            # Precompute indices for each hit type
+            idx_current_hit = np.searchsorted(unique_ray_ids, ray_ids[current_hit], sorter=sorter)
+            idx_yet_to_hit = np.searchsorted(unique_ray_ids, ray_ids[yet_to_hit], sorter=sorter)
+            idx_unbound = np.searchsorted(unique_ray_ids, ray_ids[unbound], sorter=sorter)
+            idx_current_or_yet = np.searchsorted(unique_ray_ids, ray_ids[current_hit | yet_to_hit], sorter=sorter)
 
-            u_w_sa_all = u_w_sa_all * (u_w_fpl + u_w_pl)
-            u_w_sa_eff_all = u_w_sa_eff_all * (u_w_eff_fpl + u_w_eff_pl)     # With lambda_1 correction
-            u_w_sa_biascorr = u_w_sa_all * (u_w_eff_fpl)
+            # Precompute ray_weights for each hit type
+            ray_weights_current_hit = ray_weights[current_hit]
+            ray_weights_yet_to_hit = ray_weights[yet_to_hit]
+            ray_weights_unbound = ray_weights[unbound]
+            ray_weights_current_or_yet = ray_weights[current_hit | yet_to_hit]
 
-            sum_surface_all = np.nansum(beam_surface_area_all)
-            sum_weights_hit = np.nan
+            # Precompute path_lengths and free_path_lengths for each hit type
+            path_lengths_yet_to_hit = path_lengths[yet_to_hit]
+            path_lengths_unbound = path_lengths[unbound]
+            free_path_lengths_current_hit = free_path_lengths[current_hit]
+            eff_free_path_lengths_current_hit = eff_free_path_lengths[current_hit]
+            eff_path_lengths_yet_to_hit = eff_path_lengths[yet_to_hit]
+            eff_path_lengths_unbound = eff_path_lengths[unbound]
 
-            # Calculate the bias correction factor
-            # Weighted surface area for enter rays (the numerator of bias_corr in MLE (Vincent et al (2021)))
-            u_w_sa_enter = np.array([
-                np.sum(beam_surface_area_all[(ray_ids == ray_id) & (current_hit | yet_to_hit)] * ray_weights[(ray_ids == ray_id) & (current_hit | yet_to_hit)])
-                for ray_id in ray_ids[unique_rays_mask]
-            ])
-            num_unique_rays = unique_rays_mask.size
-            bias_corr_factor = u_w_sa_enter / num_unique_rays
-            bias_corr_brackets = u_w_sa_biascorr / u_w_sa_eff_all
-            bias_corr = bias_corr_factor - bias_corr_brackets
+            # 1. sum(αjq) is hit_weights_per_pulse
+            unique_weights_hit = np.bincount(idx_current_hit, weights=ray_weights_current_hit, minlength=unique_ray_ids.size)
+
+            # Sq * sum(αjq) is sum_ba_hit
+            sum_ba_hit = np.nansum(unique_pulse_area * unique_weights_hit)
+
+            # 2. sum(αjq * FPLjq) is unique_fpl_hit
+            unique_fpl_hit = np.bincount(
+                idx_current_hit,
+                weights=free_path_lengths_current_hit * ray_weights_current_hit,
+                minlength=unique_ray_ids.size
+            )
+
+            # 3. αoutq * plq is unique_pl_exit
+            sum_yet_to_hit = np.bincount(
+                idx_yet_to_hit,
+                weights=path_lengths_yet_to_hit * ray_weights_yet_to_hit,
+                minlength=unique_ray_ids.size
+            )
+            sum_unbound = np.bincount(
+                idx_unbound,
+                weights=path_lengths_unbound * 1.0,
+                minlength=unique_ray_ids.size
+            )
+            unique_pl_exit = sum_yet_to_hit + sum_unbound
+
+            # sum(αjq * FPLjq) + αoutq * plq is sum_pl_all
+            sum_pl_all = np.nansum(unique_pulse_area * (unique_fpl_hit + unique_pl_exit))
+
+            # 4. sum(αjq * eff_FPLjq) is unique_eff_fpl_hit
+            unique_eff_fpl_hit = np.bincount(
+                idx_current_hit,
+                weights=eff_free_path_lengths_current_hit * ray_weights_current_hit,
+                minlength=unique_ray_ids.size
+            )
+
+            # 5. αoutq * eff_plq is unique_eff_pl_exit
+            sum_yet_to_hit_eff = np.bincount(
+                idx_yet_to_hit,
+                weights=eff_path_lengths_yet_to_hit * ray_weights_yet_to_hit,
+                minlength=unique_ray_ids.size
+            )
+            sum_unbound_eff = np.bincount(
+                idx_unbound,
+                weights=eff_path_lengths_unbound * 1.0,
+                minlength=unique_ray_ids.size
+            )
+            unique_eff_pl_exit = sum_yet_to_hit_eff + sum_unbound_eff
+
+            # sum(αjq * eff_FPLjq) + αoutq * eff_plq is sum_pl_all_eff
+            sum_pl_all_eff = np.nansum(unique_pulse_area * (unique_eff_fpl_hit + unique_eff_pl_exit))
+
+            # 6. sum(αinq) is unique_weights_enter
+            sum_current_or_yet = np.bincount(
+                idx_current_or_yet,
+                weights=ray_weights_current_or_yet,
+                minlength=unique_ray_ids.size
+            )
+            sum_unbound_enter = np.bincount(
+                idx_unbound,
+                weights=np.ones_like(idx_unbound, dtype=np.float64),
+                minlength=unique_ray_ids.size
+            )
+            unique_weights_enter = sum_current_or_yet + sum_unbound_enter
+
+            ## First part: sum(Sq * sum(αinq)) / num_rays is bias_pt_1
+            bias_pt_1 = np.nansum(unique_pulse_area * unique_weights_enter) / num_rays
+
+            ## Calculate Second Part: sum(Sq * (sum(αjq * FPLjq)) / sum(Sq * (sum(αjq * FPLjq) + αoutq * plq)))
+            # This is simply (sum(pulse_area * unique_fpl_hit) / sum_pl_all from above
+            bias_pt_2 = np.nansum(unique_pulse_area * unique_fpl_hit) / sum_pl_all if sum_pl_all != 0 else np.nan
+
+            bias_corr = bias_pt_1 * bias_pt_2
+
+            ### CALCULATE BIAS CORRECTION (with lambda_1 correction) ###
+            # Find (sum(Sq * sum(αinq)) / num_rays) * (sum(Sq * (sum(αjq * eff_FPLjq)) / sum(Sq * (sum(αjq * eff_FPLjq) + αoutq * eff_plq)))
+            # Sq is unique_pulse_area (as above)
+            # num_rays is already calculated above
+            
+            ## bias_pt_1 is the same as above
+
+            ## Calculate Second Part: sum(Sq * (sum(αjq * eff_FPLjq)) / sum(Sq * (sum(αjq * eff_FPLjq) + αoutq * eff_plq)))
+            # This is simply (sum(pulse_area * unique_eff_fpl_hit) / sum_pl_all_eff from above
+            bias_pt_2_eff = np.nansum(unique_pulse_area * unique_eff_fpl_hit) / sum_pl_all_eff if sum_pl_all_eff != 0 else np.nan
+
+            bias_corr_eff = bias_pt_1 * bias_pt_2_eff
 
             LAD_MLE_nocorr = MLE_vincent_2021(
-                sum_ba_hit=u_w_sa_hit,      # Numerator
-                sum_ba_all=u_w_sa_all,      # Denominator
+                sum_ba_hit=sum_ba_hit,      # Numerator
+                sum_pl_all=sum_pl_all,      # Denominator
                 G=G_leaf,
                 CI=1.0,
                 bias_corr=None
             )
             
             LAD_MLE_lambda1 = MLE_vincent_2021(
-                sum_ba_hit = u_w_sa_hit,        # Numerator
-                sum_ba_all = u_w_sa_eff_all,    # Denominator
+                sum_ba_hit = sum_ba_hit,        # Numerator. No change for lambda_1 correction
+                sum_pl_all = sum_pl_all_eff,    # Denominator
                 G=G_leaf,
                 CI=1.0,
                 bias_corr=None
             )
 
-            LAD_MLE_lambda1_biascorr = MLE_vincent_2021(
-                sum_ba_all=u_w_sa_hit,          # Numerator
-                sum_ba_hit=u_w_sa_eff_all,      # Denominator
+            LAD_MLE_bias = MLE_vincent_2021(
+                sum_ba_hit=sum_ba_hit,          # Numerator
+                sum_pl_all=sum_pl_all,          # Denominator
                 G=G_leaf,
                 CI=1.0,
                 bias_corr=bias_corr
+            )
+
+            LAD_MLE_lambda1_bias = MLE_vincent_2021(
+                sum_ba_hit=sum_ba_hit,          # Numerator
+                sum_pl_all=sum_pl_all_eff,      # Denominator
+                G=G_leaf,
+                CI=1.0,
+                bias_corr=bias_corr_eff         # Bias correction with lambda_1 correction
             )
 
             data_df.loc[0, 'P_first'] = P_first
@@ -3483,7 +3552,7 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
             data_df.loc[0, 'LAD_MLE_nocorr'] = LAD_MLE_nocorr
             data_df.loc[0, 'LAD_MLE_lambda1'] = LAD_MLE_lambda1
             data_df.loc[0, 'LAD_MLE_bias'] = LAD_MLE_bias
-            data_df.loc[0, 'LAD_MLE_lambda1_bias'] = LAD_MLE_lambda1_biascorr
+            data_df.loc[0, 'LAD_MLE_lambda1_bias'] = LAD_MLE_lambda1_bias
 
         # Add values for both single and multi-return
         data_df.loc[0, 'voxel_id'] = voxel_id
@@ -3537,6 +3606,10 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
 
         return data_df
 
+    # Extract requisite information for density calculations
+    schema = voxel_metrics_schema_singlereturn if not is_multireturn else voxel_metrics_schema_multireturn
+    meta = _gen_dataframe(schema)
+
     # Read all parquets into dask dataframe
     dfs = []
     for file in intersections_files:
@@ -3550,19 +3623,19 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
     
     # Combine all dataframes into one
     voxel_intersections_df = dd.concat(dfs, axis=0, ignore_index=True)
-    voxel_intersections_df = voxel_intersections_df.groupby('voxel_id')
-    # unique_voxel_ids = voxel_intersections_df['voxel_id'].unique().compute()
-    # num_voxels = len(unique_voxel_ids)
-
-    # Extract requisite information for density calculations
-    schema = voxel_metrics_schema_singlereturn if not is_multireturn else voxel_metrics_schema_multireturn
-    meta = _gen_dataframe(schema)
-    voxel_metrics_df = voxel_intersections_df.apply(calculate_voxel_metrics_per_voxel, meta=meta)
+    voxel_intersections_df = voxel_intersections_df.set_index('voxel_id')
+    # Map partitions to voxel metrics calculation
+    voxel_metrics_df = voxel_intersections_df.map_partitions(
+        lambda df: df.groupby('voxel_id').apply(calculate_voxel_metrics_per_voxel), 
+        meta=meta
+    )
 
     # Return the calculated metrics
     with ProgressBar():
         voxel_metrics_df = voxel_metrics_df.compute()
         voxel_metrics_df = voxel_metrics_df.reset_index(drop=True)
+
+    client.close()
     return voxel_metrics_df
 
 def calculate_occlusion_metrics(intersections_files, reference_file, max_beam_distance=50, heat_map_resolution=0.01, debug=True, epsilon=1e-9):
