@@ -3083,7 +3083,7 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
 
     avail_cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', psutil.cpu_count(logical=True)))
     threads = 1 if not os.environ.get('SLURM_CPUS_PER_TASK') else 2
-    avail_mem = int(os.environ.get('SLURM_MEM_PER_NODE', psutil.virtual_memory().available // (1024 * 1024))) # in MB
+    avail_mem = int(float(os.environ.get('SLURM_MEM_PER_NODE', psutil.virtual_memory().available // (1024 * 1024)))) # in MB
     avail_mem = avail_mem * 0.9 // 1024 # Use 80% of available memory and convert to GB
     mem_limit = avail_mem // avail_cpus
     mem_limit = f"{mem_limit}GB"
