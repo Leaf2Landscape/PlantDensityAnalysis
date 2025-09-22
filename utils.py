@@ -10,11 +10,13 @@ import numpy as np
 from sklearn.neighbors import NearestNeighbors
 import gc
 import dask
+from dask.distributed import progress, get_client
 import os
 import tempfile
 import uuid
 import shutil
 from scipy.sparse.csgraph import connected_components
+import time
 
 
 ### CONSTANTS ###
@@ -364,6 +366,51 @@ valid_rays_schema = pa.schema([
 
 ### HELPER FUNCTIONS ###
 # Commonly used functions that offer small utilities for components of other scripts.
+
+DASK_CLIENT = None
+
+def _start_dask_client(memory_limit='4GB', n_workers=None, threads_per_worker=1):
+    global DASK_CLIENT
+    from dask.distributed import Client, LocalCluster
+    import psutil
+    import os
+
+    try:
+        running_dask_client = get_client()
+        if running_dask_client is not None and not running_dask_client.status == 'closed':
+            _close_dask_client(client=running_dask_client)
+    except ValueError:
+        running_dask_client = None
+
+    if n_workers is None:
+        n_workers = int(os.environ.get('SLURM_CPUS_PER_TASK', psutil.cpu_count(logical=False)))
+
+    # On some HPCs, Dask's LocalCluster expects memory_limit as an int (bytes), not a string.
+    # Try to convert memory_limit to int if it's a string ending with 'GB' or 'MB'.
+    if isinstance(memory_limit, str):
+        mem = memory_limit.upper().strip()
+        if mem.endswith('GB'):
+            memory_limit = int(float(mem[:-2]) * 1024 ** 3)
+        elif mem.endswith('MB'):
+            memory_limit = int(float(mem[:-2]) * 1024 ** 2)
+        else:
+            try:
+                memory_limit = int(memory_limit)
+            except Exception:
+                pass  # fallback to string if conversion fails
+
+    cluster = LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker, memory_limit=memory_limit)
+    DASK_CLIENT = Client(cluster)
+    return DASK_CLIENT
+
+def _close_dask_client(client=None):
+    global DASK_CLIENT
+    if client is None:
+        client = DASK_CLIENT
+    if client is not None and not client.status == 'closed':
+        client.close()
+        gc.collect()
+        DASK_CLIENT = None
 
 def _gen_dataframe(schema):
     fields = []
@@ -1464,7 +1511,8 @@ def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir,
 
     invalid_points_mask = hit_type == -1
     if invalid_points_mask.sum() > 0:
-        print("Invalid points found")
+        # print("Invalid points found")
+        pass
 
     if debug:
         invalid_points_mask = hit_type == -1
@@ -2428,6 +2476,14 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
     import dask.dataframe as dd
     from dask.diagnostics import ProgressBar
 
+    # Calculate the partition size that fits into memory alongside optimal voxel chunk size
+    avail_cpu = int(os.environ.get('SLURM_CPUS_PER_TASK', psutil.cpu_count(logical=False)))
+    avail_mem = int(float(os.environ.get('SLURM_MEM_PER_NODE', psutil.virtual_memory().available // (1024 * 1024))))
+    avail_mem *= 0.9  # Use 90% of available memory to be safe
+
+    avail_mem_string_for_dask = f"{int(avail_mem)}MB"
+    _start_dask_client(memory_limit=avail_mem_string_for_dask, n_workers=avail_cpu)
+
     # Compile the references files to establish a voxel dataframe of size and voxel_id
     voxel_references = glob.glob(os.path.join(references_dir, '*.csv'))
 
@@ -2483,16 +2539,6 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
         # Map partitions to traverse voxels
         meta = pd.DataFrame(columns=voxel_ray_intersection_schema.names)
 
-        # Calculate the partition size that fits into memory alongside optimal voxel chunk size
-        avail_cpu = os.environ.get('SLURM_CPUS_PER_TASK', psutil.cpu_count(logical=False))
-        slurm_mem_mb = os.environ.get('SLURM_MEM_PER_NODE')
-        if slurm_mem_mb:
-            avail_mem = slurm_mem_mb * 1024 * 1024
-        else:
-            avail_mem = psutil.virtual_memory().available
-        avail_mem *= 0.9
-        def _mem_per_worker(partitions):
-            return avail_mem // partitions
         mem_per_worker = avail_mem // avail_cpu
 
         num_rays = df['ray_id'].nunique().compute()
@@ -2513,6 +2559,10 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
             voxels_per_chunk = max(1, int(max_elements_per_chunk // rays_per_chunk))
         
         npartitions = max(1, int(np.ceil(num_rays / rays_per_chunk)))
+        df = df.repartition(npartitions=npartitions)
+
+        #### TEST
+        npartitions = avail_cpu
         df = df.repartition(npartitions=npartitions)
 
         dd_results = []
@@ -2572,8 +2622,18 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
         for leg_id, results in voxel_ray_intersections.items():
 
             print(f"Processing leg {leg_id}...")
+            start_time = time.time()
 
-            results = results.compute()
+            future = DASK_CLIENT.compute(results)
+            # Show progress bar in Jupyter notebooks
+            with ProgressBar():
+                results = future.result()
+
+            # results = results.compute()
+
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            print(f"Leg {leg_id} processed in {elapsed_time:.2f} seconds.")
 
             print(f"Saving results for leg {leg_id}...")
             # Process and save each partition individually to release memory
@@ -3087,7 +3147,7 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
     avail_mem = avail_mem * 0.9 // 1024 # Use 80% of available memory and convert to GB
     mem_limit = avail_mem // avail_cpus
     mem_limit = f"{mem_limit}GB"
-    client = Client(n_workers=avail_cpus, threads_per_worker=threads, memory_limit=mem_limit)
+    _start_dask_client(memory_limit=mem_limit, n_workers=avail_cpus)
 
     # Per voxel function
     def calculate_voxel_metrics_per_voxel(voxel_df, min_rays=6, epsilon=1e-9):
@@ -3631,11 +3691,17 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
     )
 
     # Return the calculated metrics
+    # with ProgressBar():
+    #     voxel_metrics_df = voxel_metrics_df.compute()
+    #     voxel_metrics_df = voxel_metrics_df.reset_index(drop=True)
+
+    future = DASK_CLIENT.compute(voxel_metrics_df)
     with ProgressBar():
-        voxel_metrics_df = voxel_metrics_df.compute()
+        voxel_metrics_df = future.result()
         voxel_metrics_df = voxel_metrics_df.reset_index(drop=True)
 
-    client.close()
+    _close_dask_client(client=DASK_CLIENT)
+
     return voxel_metrics_df
 
 def calculate_occlusion_metrics(intersections_files, reference_file, max_beam_distance=50, heat_map_resolution=0.01, debug=True, epsilon=1e-9):
@@ -4200,6 +4266,7 @@ def fix_incorrect_intersections(valid_rays_dir, num_jobs=-1):
     from joblib import Parallel, delayed
     from tqdm import tqdm
     import shutil
+    from dask.diagnostics import ProgressBar
     import dask.dataframe as dd
 
     intersection_files = glob.glob(os.path.join(valid_rays_dir, "*_intersections.parquet"))
