@@ -412,6 +412,13 @@ def _close_dask_client(client=None):
         gc.collect()
         DASK_CLIENT = None
 
+    # Delete any worker temp scratch space if it is present
+    tmp_dir = os.environ.get("TMPDIR", "/tmp")
+    dask_scratch_space = os.path.join(tmp_dir, "dask-scratch-space")
+    if os.path.isdir(dask_scratch_space):
+        shutil.rmtree(dask_scratch_space, ignore_errors=True)
+        print(f"Deleted Dask worker scratch space at {dask_scratch_space}")
+
 def _gen_dataframe(schema):
     fields = []
     for field in schema:
@@ -1405,11 +1412,14 @@ def traverse_voxels(voxel_references, ray_partition, voxels_per_chunk, temp_dir,
 
     # Flatten mask and retrieve idx for rays and voxels
     voxel_ref_idx, _, ray_ref_idx = np.nonzero(mask[:,:])
+
+    # Delete temp_dir
+    shutil.rmtree(temp_dir, ignore_errors=True)
+
     if len(voxel_ref_idx) == 0:
         del mask, voxel_ref_idx, ray_ref_idx
         del voxel_ids, voxel_sizes, voxel_centres, leg_ids, ray_ids, is_leaf, points, origins, directions
         gc.collect()
-        shutil.rmtree(temp_dir, ignore_errors=True)
         return pd.DataFrame(columns=voxel_ray_intersection_schema.names)
 
     del mask, chunk_masks, chunk
@@ -2649,32 +2659,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
 
             print(f"Completed leg {leg_id}!")
 
-            # # Save the results to parquet
-            # save_task(results, leg_id, voxel_size)
-        
-        # for leg_id, voxel_sizes in voxel_ray_intersections.items():
-
-        #     for voxel_size, results in voxel_sizes.items():
-
-        #         # print(f"Processing leg {leg_id} with voxel size {voxel_size}...")
-        #         # results = list(dask.compute(*results, scheduler='processes', num_workers=n_workers))
-
-        #         # print(f"Saving {len(results)} results for leg {leg_id} with voxel size {voxel_size}...")
-        #         # results = pd.concat(results, ignore_index=True)
-
-        #         df_results = []
-        #         for i, result in enumerate(results):
-        #             # for r in result:
-
-        #             print(f"Processing chunk {i+1} of {len(results)} for leg {leg_id} and voxel size {voxel_size}")
-        #             result = result.compute()
-        #             df_results.append(result)
-
-        #         results = pd.concat(df_results, ignore_index=True)
-
-        #         save_task(results, leg_id, voxel_size)
-
-        #         gc.collect()
+    _close_dask_client(DASK_CLIENT)
 
 # Function used for taking valid_rays parquet files and references to establish voxel_ray intersections per valid_rays file
 def voxel_ray_intersections_oldcode(valid_rays_dir, references_dir, temp_dir, cpus=None, mem=None, debug=True, epsilon=1e-6):
