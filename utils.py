@@ -408,6 +408,7 @@ def _close_dask_client(client=None):
     if client is None:
         client = DASK_CLIENT
     if client is not None and not client.status == 'closed':
+        client.shutdown()
         client.close()
         gc.collect()
         DASK_CLIENT = None
@@ -2487,12 +2488,21 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
     from dask.diagnostics import ProgressBar
 
     # Calculate the partition size that fits into memory alongside optimal voxel chunk size
-    avail_cpu = int(os.environ.get('SLURM_CPUS_PER_TASK', psutil.cpu_count(logical=False)))
+    avail_cpu = 1
+    if os.environ.get('SLURM_CPUS_PER_TASK') is not None:
+        avail_cpu = max(avail_cpu, int(os.environ.get('SLURM_CPUS_PER_TASK')))
+        num_threads = 2
+    else:
+        avail_cpu = max(avail_cpu, psutil.cpu_count(logical=True))
+        num_threads = 1
     avail_mem = int(float(os.environ.get('SLURM_MEM_PER_NODE', psutil.virtual_memory().available // (1024 * 1024))))
     avail_mem *= 0.9  # Use 90% of available memory to be safe
 
+    if temp_dir is None:
+        temp_dir = os.environ.get("TMPDIR", "/tmp")
+
     avail_mem_string_for_dask = f"{int(avail_mem)}MB"
-    _start_dask_client(memory_limit=avail_mem_string_for_dask, n_workers=avail_cpu)
+    _start_dask_client(memory_limit=avail_mem_string_for_dask, n_workers=avail_cpu, threads_per_worker=num_threads)
 
     # Compile the references files to establish a voxel dataframe of size and voxel_id
     voxel_references = glob.glob(os.path.join(references_dir, '*.csv'))
@@ -2627,38 +2637,35 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
         return True
 
 
-    with ProgressBar():
+    # Schedule legs
+    futures = []
+    for leg_id, results in voxel_ray_intersections.items():
+        future = DASK_CLIENT.compute(results)
+        futures.append((leg_id, future))
 
-        for leg_id, results in voxel_ray_intersections.items():
+    # Process legs
+    start_time = time.time()
+    for leg_id, future in futures:
+        with ProgressBar():
+            results = future.result()
 
-            print(f"Processing leg {leg_id}...")
-            start_time = time.time()
-
-            future = DASK_CLIENT.compute(results)
-            # Show progress bar in Jupyter notebooks
-            with ProgressBar():
-                results = future.result()
-
-            # results = results.compute()
-
-            end_time = time.time()
-            elapsed_time = end_time - start_time
-            print(f"Leg {leg_id} processed in {elapsed_time:.2f} seconds.")
-
-            print(f"Saving results for leg {leg_id}...")
-            # Process and save each partition individually to release memory
-            for voxel_size, group_df in results.groupby('voxel_size', group_keys=True):
-                save_task(group_df, leg_id)
-                del group_df
-                gc.collect()
-
-            del results
+        # Process and save each partition individually to release memory
+        for voxel_size, group_df in results.groupby('voxel_size', group_keys=True):
+            save_task(group_df, leg_id)
+            del group_df
             gc.collect()
 
+        del results
+        gc.collect()
 
+        print(f"Saved leg {leg_id}!")
 
-            print(f"Completed leg {leg_id}!")
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"Voxel ray intersection processing complete in {elapsed_time:.2f} seconds.")
 
+    # brief pause to ensure filesystem/dask flushes before shutting down
+    time.sleep(1)
     _close_dask_client(DASK_CLIENT)
 
 # Function used for taking valid_rays parquet files and references to establish voxel_ray intersections per valid_rays file
