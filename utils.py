@@ -3342,26 +3342,25 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
             
             # -- First Hit Weighting -- #
             first_hit = voxel_df['return_number'] == 1
-            current_first_hit = current_hit & first_hit
-            Tk_first_lw = np.nansum(current_first_hit)
-            Wk_first_lw = np.nansum(current_hit)        ### CHECK THIS. Might be rays rather than hits in the voxel
+            yet_first_hit = yet_to_hit & first_hit
+            Tk_first_lw = np.nansum(yet_first_hit)
+            BWk_first = 1
 
             current_first_hit_leaf = current_hit & leaf_mask
             Tk_first_leaf = np.nansum(current_first_hit_leaf)
-            Wk_first_leaf = Wk_first_lw                 ### CHECK THIS
 
             # -- Equal Hit Weighting -- #
             echoes_before_lw = np.count_nonzero(previous_hit)
             echoes_during_lw = np.count_nonzero(current_hit)
             echoes_after_lw = np.count_nonzero(yet_to_hit)
             Tk_equal_lw = echoes_after_lw / np.clip((echoes_during_lw + echoes_after_lw), 1, None)
-            Wk_equal_lw = (echoes_during_lw + echoes_after_lw) / np.clip((echoes_before_lw + echoes_during_lw + echoes_after_lw), 1, None)
+            BWk_equal_lw = (echoes_during_lw + echoes_after_lw) / np.clip((echoes_before_lw + echoes_during_lw + echoes_after_lw), 1, None)
 
             echoes_before_leaf = np.count_nonzero(previous_hit & leaf_mask)
             echoes_during_leaf = np.count_nonzero(current_hit & leaf_mask)
             echoes_after_leaf = np.count_nonzero(yet_to_hit & leaf_mask)
             Tk_equal_leaf = echoes_after_leaf / np.clip((echoes_during_leaf + echoes_after_leaf), 1, None)
-            Wk_equal_leaf = (echoes_during_leaf + echoes_after_leaf) / np.clip((echoes_before_leaf + echoes_during_leaf + echoes_after_leaf), 1, None)
+            BWk_equal_leaf = (echoes_during_leaf + echoes_after_leaf) / np.clip((echoes_before_leaf + echoes_during_leaf + echoes_after_leaf), 1, None)
 
             # -- Intensity Hit Weighting -- #
             echo_intensities = voxel_df['echo_intensity'].values
@@ -3371,7 +3370,7 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
 
             denom_lw = intensity_during_lw + intensity_after_lw
             Tk_int_lw = intensity_after_lw / denom_lw if denom_lw != 0 else np.nan
-            Wk_int_lw = (intensity_during_lw + intensity_after_lw) / (intensity_before_lw + intensity_during_lw + intensity_after_lw)
+            BWk_int_lw = (intensity_during_lw + intensity_after_lw) / (intensity_before_lw + intensity_during_lw + intensity_after_lw)
 
             intensity_before_leaf = np.nansum(echo_intensities[previous_hit & leaf_mask])
             intensity_during_leaf = np.nansum(echo_intensities[current_hit & leaf_mask])
@@ -3379,16 +3378,16 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
             del echo_intensities
             denom_leaf = intensity_during_leaf + intensity_after_leaf
             Tk_int_leaf = intensity_after_leaf / denom_leaf if denom_leaf != 0 else np.nan
-            Wk_int_leaf = (intensity_during_leaf + intensity_after_leaf) / (intensity_before_leaf + intensity_during_leaf + intensity_after_leaf)
+            BWk_int_leaf = (intensity_during_leaf + intensity_after_leaf) / (intensity_before_leaf + intensity_during_leaf + intensity_after_leaf)
 
             P_first_lw, P_equal_lw, P_int_lw, P_first_leaf, P_equal_leaf, P_int_leaf = (
                 _collapse(*args) for args in [
-                    (Tk_first_lw, Wk_first_lw), 
-                    (Tk_equal_lw, Wk_equal_lw),
-                    (Tk_int_lw,   Wk_int_lw),
-                    (Tk_first_leaf, Wk_first_leaf),
-                    (Tk_equal_leaf, Wk_equal_leaf),
-                    (Tk_int_leaf,   Wk_int_leaf)
+                    (Tk_first_lw, BWk_first), 
+                    (Tk_equal_lw, BWk_equal_lw),
+                    (Tk_int_lw,   BWk_int_lw),
+                    (Tk_first_leaf, BWk_first),
+                    (Tk_equal_leaf, BWk_equal_leaf),
+                    (Tk_int_leaf,   BWk_int_leaf)
                 ]
             )
 
