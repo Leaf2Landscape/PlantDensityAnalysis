@@ -17,6 +17,8 @@ import uuid
 import shutil
 from scipy.sparse.csgraph import connected_components
 import time
+import dask.dataframe as dd
+from dask import delayed
 
 
 ### CONSTANTS ###
@@ -465,7 +467,8 @@ def _start_dask_client(memory_limit='4GB',
         n_workers=n_workers,
         threads_per_worker=threads_per_worker,
         memory_limit=memory_limit,
-        local_directory=temp_dir
+        local_directory=temp_dir,
+        processes=True
     )
     DASK_CLIENT = Client(cluster)
     return DASK_CLIENT
@@ -2541,30 +2544,25 @@ def potential_intersections_debug():
                     np.savetxt(out_file, points, fmt="%.6f")
 
 
-
 # Function used for taking valid_rays parquet files and references to establish voxel_ray intersections per valid_rays file
 def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug=False, epsilon=1e-6):
     import os
     import glob
     import pandas as pd
-    import numpy as np
     import psutil
-    import dask
     import dask.dataframe as dd
-    from dask.diagnostics import ProgressBar
     import tempfile
     import time
-    from collections import defaultdict
 
     print("Starting voxel ray intersection processing...")
     avail_cpu = int(os.environ.get('SLURM_CPUS_PER_TASK', psutil.cpu_count(logical=True)))
-    avail_mem = int(float(os.environ.get('SLURM_MEM_PER_NODE', psutil.virtual_memory().available // (1024 * 1024)))) # in MB
+    avail_mem = int(float(os.environ.get('SLURM_MEM_PER_NODE', psutil.virtual_memory().available // (1024 * 1024))) * 0.8) # in MB
 
     # Use fewer workers with more threads to give each worker more memory
-    # optimal_workers = max(1, avail_cpu // 2)  # 2 threads per worker
-    # threads_per_worker = min(2, avail_cpu // optimal_workers)
-    optimal_workers = avail_cpu
-    threads_per_worker = 1
+    # optimal_workers = max(1, avail_cpu // 4)  # 4 threads per worker
+    # threads_per_worker = min(4, avail_cpu // optimal_workers)
+    threads_per_worker = 4
+    optimal_workers = avail_cpu // threads_per_worker
     
     # Use Dask LocalCluster for memory management and spill configuration
     if temp_dir is None:
@@ -2584,11 +2582,12 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
                 temp_dir = "/tmp"
                 print("Using fallback temporary directory: /tmp")
 
-    avail_mem_string_for_dask = f"{int(avail_mem)}MB"
-    print(f"Starting Dask client with memory limit: {avail_mem_string_for_dask}")
+    avail_mem_worker_mb = avail_mem // optimal_workers 
+    avail_mem_worker_string = f"{avail_mem_worker_mb}MB"
+    print(f"Starting Dask client with memory limit: {avail_mem_worker_string}")
 
     client = _start_dask_client(
-        memory_limit=avail_mem_string_for_dask,
+        memory_limit=avail_mem_worker_string,
         n_workers=optimal_workers,
         threads_per_worker=threads_per_worker,
         memory_target_fraction=0.6,
@@ -2624,239 +2623,371 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
     voxel_references = pd.concat(dfs)
     print(f"Compiled voxel references with {voxel_references.shape[0]} entries.")
 
-    # Build octree for spatial indexing
-    print("Building octree for voxel spatial indexing...")
-    octree = build_octree(voxel_references)
-    print("Octree built successfully.")
-
     valid_rays_files = glob.glob(os.path.join(valid_rays_dir, '*_valid_rays.parquet'))
     print(f"Found {len(valid_rays_files)} valid rays files.")
 
-    def map_ray_partition_to_function(ray_partition, octree, temp_dir):
-        print(f"Processing ray partition with {ray_partition.shape[0]} rays.")
-        return traverse_voxels_octree(ray_partition=ray_partition, octree=octree, temp_dir=temp_dir, debug=debug)
+    # def map_ray_partition_to_function(ray_partition, voxel_group, temp_dir):
+    #     print(f"Processing ray partition with {ray_partition.shape[0]} rays.")
+    #     return traverse_voxels(ray_partition=ray_partition, voxel_references=voxel_group, debug=debug)
 
-    voxel_ray_intersections = {}
+    # voxel_ray_intersections = {}
 
     for file in valid_rays_files:
-        file_size_mb = os.path.getsize(file) / (1024 * 1024)
+        # file_size_mb = os.path.getsize(file) / (1024 * 1024)
+        # target_partition_mb = 128 # Target partition size in MB
+        # min_partition_mb = 25  # Minimum partition size in MB
+
+        # # Estimate broadcast (unmanaged) memory usage
+        # def est_broadcast_bytes(num_voxels, num_rays, bytes_per_pair=64, safety_factor=1.5):
+        #     compute_memory = num_voxels * num_rays * bytes_per_pair
+        #     serialization_overhead = compute_memory * 2.0 # overhead for serialization
+        #     buffer_memory = compute_memory * 0.5    # buffer for other operations
+        #     return (compute_memory + serialization_overhead + buffer_memory) * safety_factor
         
-        # Calculate optimal partition size based on file size and available workers
-        if file_size_mb > 500:
-            partition_size = 50
-        elif file_size_mb > 200:
-            partition_size = 100
-        else:
-            partition_size = 200
+        # df = dd.read_parquet(file, engine='pyarrow')
+        # unique_rays = df['ray_id'].nunique().compute()
+        # voxel_chunk_size = voxel_references.shape[0]
 
-        df = dd.read_parquet(file, engine='pyarrow', blocksize=f"{partition_size}MB")
-        print(f"Reading valid rays file: {file} ({file_size_mb:.1f} MB) with partition size {partition_size} MB.")
+        # est_memory_worker = est_broadcast_bytes(
+        #     num_voxels=voxel_chunk_size,
+        #     num_rays=unique_rays // optimal_workers
+        # )
+        # est_memory_worker_mb = est_memory_worker / (1024 * 1024)
+        # nparts = max(1, optimal_workers)
 
+        # # Adjust voxel chunk size
+        # if est_memory_worker_mb > avail_mem_worker_mb:                
+        #     print(f"Warning: Estimated memory per worker {est_memory_worker_mb:.2f}MB still exceeds available memory {avail_mem_worker_mb:.2f}MB even after adjustments.")
+        #     # Adjust voxels
+        #     while est_memory_worker_mb > avail_mem_worker_mb and voxel_chunk_size > 1:
+        #         voxel_chunk_size = int(voxel_chunk_size * 0.9)
+        #         est_memory_worker_mb = est_broadcast_bytes(
+        #             num_voxels=voxel_chunk_size,
+        #             num_rays=est_num_rays
+        #         ) / (1024 * 1024)
+        #     print(f"Adjusted voxel chunk size to {voxel_chunk_size} to fit memory constraints.")
+
+        # Read with 10MB target partition size
+        # df = dd.read_parquet(file, engine='pyarrow')
+        # df = df.repartition(partition_size="10MB")
+        # df = df.repartition(npartitions=optimal_workers * threads_per_worker)
+        # print(f"Reading valid rays file: {file} with shape {df.shape}.")
+
+        ### REMOVE LATER ###
+        # # Force repartition to ~50MB if supported
+        # try:
+        #     df = df.repartition(partition_size=partition_size)
+        #     print(f"Repartitioned DataFrame to ~{partition_size} chunks.")
+        # except TypeError:
+        #     # Fallback: estimate total size and derive npartitions
+        #     total_bytes = df.memory_usage(deep=True).sum().compute()
+        #     target = 50 * 1024 * 1024
+        #     nparts = max(1, int(np.ceil(total_bytes / target)))
+        #     df = df.repartition(npartitions=nparts)
+        #     print(f"Repartitioned DataFrame to {nparts} partitions based on total size.")
+
+        df = dd.read_parquet(file, engine='pyarrow')
         leg_id = int(os.path.splitext(os.path.basename(file))[0].split("_")[1])
-        meta = pd.DataFrame(columns=voxel_ray_intersection_schema.names)
+        # Create meta DataFrame with correct dtypes for Dask
+        meta = pd.DataFrame({field.name: pd.Series(dtype=field.type.to_pandas_dtype()) for field in voxel_ray_intersection_schema})
 
-        result = df.map_partitions(
-            map_ray_partition_to_function,
-            octree=octree,
-            temp_dir=temp_dir,
-            meta=meta
+        intersections_ddf = voxel_ray_intersections_blocked(
+            valid_rays_ddf=df,
+            voxel_refs_df=voxel_references,
+            meta=meta,
+            target_tile_bytes=256 * 1024 * 1024,
+            rays_partition_size_mb=20
         )
-        voxel_ray_intersections[leg_id] = result
-        print(f"Mapped ray partition for leg_id: {leg_id}.")
+        intersections_ddf = intersections_ddf.persist()
 
-    def save_task(df, leg_id):
-        if df.empty:
-            print(f"No data to save for leg_id: {leg_id}.")
-            return False
-        voxel_size = round(float(df['voxel_size'].iloc[0]), 2)
-        output_filename = os.path.join(valid_rays_dir, f"leg_{leg_id}_voxel_{voxel_size}_intersections.parquet")
-        df.to_parquet(output_filename, engine='pyarrow', compression='snappy', schema=voxel_ray_intersection_schema)
-        print(f"Saved intersections for leg_id: {leg_id} to {output_filename}.")
-        return True
+        print(intersections_ddf.head())
+        if len(intersections_ddf) == 0:
+            print(f"No intersections found for leg_id: {leg_id}. Skipping save.")
+            continue
+        for voxel_size, g in intersections_ddf.groupby('voxel_size', group_keys=True):
+            g.to_parquet(
+                os.path.join(valid_rays_dir, f"leg_{leg_id}_voxel_{voxel_size}_intersections.parquet"),
+                engine='pyarrow',
+                compression='snappy',
+                schema=voxel_ray_intersection_schema
+            )
+    #         r = df.map_partitions(
+    #             map_ray_partition_to_function,
+    #             voxel_group=vchunk,
+    #             temp_dir=temp_dir,
+    #             meta=meta
+    #         )
+    #         chunk_results.append(r)
+    #     result = dd.concat(chunk_results, axis=0, interleave_partitions=True)
+    #     voxel_ray_intersections[leg_id] = result
+    #     print(f"Mapped ray partition for leg_id: {leg_id}.")
 
-    futures = []
-    for leg_id, results in voxel_ray_intersections.items():
-        future = client.compute(results)
-        futures.append((leg_id, future))
+    # def save_task(df, leg_id):
+    #     if df.empty:
+    #         print(f"No data to save for leg_id: {leg_id}.")
+    #         return False
+    #     voxel_size = round(float(df['voxel_size'].iloc[0]), 2)
+    #     output_filename = os.path.join(valid_rays_dir, f"leg_{leg_id}_voxel_{voxel_size}_intersections.parquet")
+    #     df.to_parquet(output_filename, engine='pyarrow', compression='snappy', schema=voxel_ray_intersection_schema)
+    #     print(f"Saved intersections for leg_id: {leg_id} to {output_filename}.")
+    #     return True
 
-    start_time = time.time()
-    for leg_id, future in futures:
-        with ProgressBar():
-            results = future.result()
-        for voxel_size, group_df in results.groupby('voxel_size', group_keys=True):
-            save_task(group_df, leg_id)
-            del group_df
-        del results
+    # futures = []
+    # for leg_id, results in voxel_ray_intersections.items():
+    #     future = client.compute(results)
+    #     futures.append((leg_id, future))
+
+    # start_time = time.time()
+    # for leg_id, future in futures:
+    #     with ProgressBar():
+    #         results = future.result()
+    #     for voxel_size, group_df in results.groupby('voxel_size', group_keys=True):
+    #         save_task(group_df, leg_id)
+    #         del group_df
+    #     del results
     end_time = time.time()
     print(f"Voxel ray intersection processing complete in {end_time - start_time:.2f} seconds.")
     time.sleep(1)
     _close_dask_client(client)
 
-def build_octree(voxel_references, max_depth=10, max_voxels_per_node=50):
+
+# ---- a tile kernel: vectorized NumPy on small blocks only ----
+def traverse_voxels_tile(voxel_block: pd.DataFrame,
+                         ray_block: pd.DataFrame,
+                         epsilon: float = 1e-6) -> pd.DataFrame:
     """
-    Build an octree spatial index for voxels.
-    
-    Args:
-        voxel_references: DataFrame with columns ['voxel_id', 'voxel_cx', 'voxel_cy', 'voxel_cz', 'voxel_size']
-        max_depth: Maximum depth of the octree
-        max_voxels_per_node: Maximum number of voxels per leaf node before splitting
-    
-    Returns:
-        Root node of the octree
+    Compute voxel-ray intersections for one tile (voxel_block × ray_block).
+    Returns a Pandas DataFrame matching voxel_ray_intersection_schema.
+    This is essentially your traverse_voxels but scoped to the tile.
     """
-    # Calculate bounding box for all voxels
-    centres = voxel_references[['voxel_cx', 'voxel_cy', 'voxel_cz']].values
-    sizes = voxel_references['voxel_size'].values
-    
-    mins = centres - sizes[:, np.newaxis] / 2
-    maxs = centres + sizes[:, np.newaxis] / 2
-    
-    bbox_min = mins.min(axis=0)
-    bbox_max = maxs.max(axis=0)
-    
-    # Create root node
-    root = OctreeNode(bbox_min, bbox_max, depth=0, max_depth=max_depth, max_voxels=max_voxels_per_node)
-    
-    # Insert all voxels
-    for idx, row in voxel_references.iterrows():
-        voxel_data = {
-            'voxel_id': row['voxel_id'],
-            'centre': np.array([row['voxel_cx'], row['voxel_cy'], row['voxel_cz']]),
-            'size': row['voxel_size']
-        }
-        root.insert(voxel_data)
-    
-    return root
+    if ray_block.empty or voxel_block.empty:
+        return pd.DataFrame(columns=voxel_ray_intersection_schema.names)
 
-class OctreeNode:
+    # Rays
+    leg_ids    = ray_block['leg_id'].to_numpy()
+    ray_ids    = ray_block['ray_id'].to_numpy()
+    origins    = ray_block[['origin_x','origin_y','origin_z']].to_numpy()
+    directions = ray_block[['direction_x','direction_y','direction_z']].to_numpy()
+    points     = ray_block[['point_x','point_y','point_z']].to_numpy()
+    normals    = ray_block[['normal_x','normal_y','normal_z']].to_numpy()
+    point_wts  = ray_block['point_weight'].to_numpy()
+    echo_int   = ray_block['echo_intensity'].to_numpy()
+    is_leaf    = ray_block['is_leaf'].to_numpy()
+    ret_no     = ray_block['return_number'].to_numpy()
+    n_returns  = ray_block['number_of_returns'].to_numpy()
+
+    # Voxels
+    voxel_ids    = voxel_block['voxel_id'].to_numpy()
+    voxel_sizes  = voxel_block['voxel_size'].to_numpy()
+    voxel_centres= voxel_block[['voxel_cx','voxel_cy','voxel_cz']].to_numpy()
+
+    # ---- coarse cull by inscribed sphere radius (your approach) ----
+    vb_centres = voxel_centres[:, None, :]     # (V, 1, 3)
+    vb_sizes   = voxel_sizes[:, None]          # (V, 1)
+    rb_origins = origins[None, :, :]           # (1, R, 3)
+    rb_dirs    = directions[None, :, :]        # (1, R, 3)
+
+    voxel_radii = vb_sizes * np.sqrt(3) * 0.5 + 0.05
+    oc = rb_origins - vb_centres
+    b  = 2.0 * np.sum(oc * rb_dirs, axis=2)
+    c  = np.sum(oc * oc, axis=2) - voxel_radii**2
+    discriminant = b**2 - 4*c
+    hit = discriminant >= -epsilon             # (V, R) boolean
+
+    if not np.any(hit):
+        print("No hits found in coarse cull.")
+        return pd.DataFrame(columns=voxel_ray_intersection_schema.names)
+
+    # ---- precise slab intersection only for hit pairs ----
+    voxel_idx, ray_idx = np.nonzero(hit)       # 1D indices of candidate pairs
+
+    vmins = (voxel_centres - (voxel_sizes[:, None]/2 - epsilon))[voxel_idx]
+    vmaxs = (voxel_centres + (voxel_sizes[:, None]/2 + epsilon))[voxel_idx]
+    o_sel = origins[ray_idx]
+    d_sel = directions[ray_idx]
+
+    # avoid 0 directions
+    small_eps = 1e-9
+    d_sel = np.where(np.abs(d_sel) <= small_eps,
+                     np.where(d_sel == 0, small_eps, np.sign(d_sel)*small_eps),
+                     d_sel)
+    invd = 1.0 / d_sel
+    t1 = (vmins - o_sel) * invd
+    t2 = (vmaxs - o_sel) * invd
+    t_enter = np.max(np.minimum(t1, t2), axis=1)
+    t_exit  = np.min(np.maximum(t1, t2), axis=1)
+    valid   = (t_enter <= t_exit + epsilon) & (t_exit >= -epsilon)
+
+    if not np.any(valid):
+        print("No valid voxel-ray intersections after precise slab test.")
+        return pd.DataFrame(columns=voxel_ray_intersection_schema.names)
+
+    print(f"Found {np.sum(valid)} valid voxel-ray intersections.")
+    # filter to valid pairs
+    voxel_idx = voxel_idx[valid]
+    ray_idx   = ray_idx[valid]
+
+    # prepare filtered arrays
+    f_voxel_ids     = voxel_ids[voxel_idx]
+    f_voxel_sizes   = voxel_sizes[voxel_idx]
+    f_voxel_centres = voxel_centres[voxel_idx]
+    f_leg_ids       = leg_ids[ray_idx]
+    f_ray_ids       = ray_ids[ray_idx]
+    f_is_leaf       = is_leaf[ray_idx]
+    f_points        = points[ray_idx]
+    f_normals       = normals[ray_idx]
+    f_point_wts     = point_wts[ray_idx]
+    f_origins       = origins[ray_idx]
+    f_dirs          = directions[ray_idx]
+    f_echo          = echo_int[ray_idx]
+    f_ret_no        = ret_no[ray_idx]
+    f_n_returns     = n_returns[ray_idx]
+
+    # entry/exit coordinates
+    vmins_f = f_voxel_centres - (f_voxel_sizes[:, None]/2 - epsilon)
+    vmaxs_f = f_voxel_centres + (f_voxel_sizes[:, None]/2 + epsilon)
+    # direction epsilon handling (reuse logic)
+    f_dirs = np.where(np.abs(f_dirs) <= epsilon,
+                      np.where(f_dirs == 0, epsilon, np.sign(f_dirs)*epsilon),
+                      f_dirs)
+    invd_f = 1.0 / f_dirs
+    tmin   = (vmins_f - f_origins) * invd_f
+    tmax   = (vmaxs_f - f_origins) * invd_f
+    t_enter= np.max(np.minimum(tmin, tmax), axis=1)
+    t_exit = np.min(np.maximum(tmin, tmax), axis=1)
+    entry  = f_origins + t_enter[:, None] * f_dirs
+    exit_  = f_origins + t_exit[:, None]  * f_dirs
+
+    # classify hit type (your logic)
+    unbound   = np.isnan(f_points).any(axis=1)
+    in_voxel  = np.all((f_points >= (vmins_f - epsilon)) &
+                       (f_points <= (vmaxs_f + epsilon)), axis=1)
+    d_entry_sq= np.sum((f_origins - entry)**2, axis=1)
+    d_exit_sq = np.sum((f_origins - exit_)**2, axis=1)
+    d_point_sq= np.sum((f_points  - f_origins)**2, axis=1)
+    before    = (d_entry_sq > d_point_sq) & ~in_voxel & ~unbound
+    after     = (d_exit_sq  < d_point_sq) & ~in_voxel & ~unbound
+
+    hit_type = np.full(f_points.shape[0], -1, dtype=np.int32)
+    hit_type[unbound] = 0
+    hit_type[before]  = 1
+    hit_type[in_voxel]= 2
+    hit_type[after]   = 3
+
+    dist_to_centre = np.linalg.norm(f_origins - f_voxel_centres, axis=1)
+    viewing_angles = find_viewing_angles(directions=f_dirs)  # your helper
+
+    out = {
+        'voxel_size': f_voxel_sizes.astype(np.float32),
+        'voxel_id':   f_voxel_ids.astype(np.uint64),
+        'voxel_cx':   f_voxel_centres[:,0].astype(np.float64),
+        'voxel_cy':   f_voxel_centres[:,1].astype(np.float64),
+        'voxel_cz':   f_voxel_centres[:,2].astype(np.float64),
+        'leg_id':     f_leg_ids.astype(np.uint64),
+        'ray_id':     f_ray_ids.astype(np.uint64),
+        't_entry_x':  entry[:,0].astype(np.float64),
+        't_entry_y':  entry[:,1].astype(np.float64),
+        't_entry_z':  entry[:,2].astype(np.float64),
+        't_exit_x':   exit_[:,0].astype(np.float64),
+        't_exit_y':   exit_[:,1].astype(np.float64),
+        't_exit_z':   exit_[:,2].astype(np.float64),
+        'distance_to_centre': dist_to_centre.astype(np.float64),
+        'point_x':    f_points[:,0].astype(np.float64),
+        'point_y':    f_points[:,1].astype(np.float64),
+        'point_z':    f_points[:,2].astype(np.float64),
+        'echo_intensity': f_echo.astype(np.float64),
+        'return_number':   f_ret_no.astype(np.int32),
+        'number_of_returns': f_n_returns.astype(np.int32),
+        'normal_x':   f_normals[:,0].astype(np.float64),
+        'normal_y':   f_normals[:,1].astype(np.float64),
+        'normal_z':   f_normals[:,2].astype(np.float64),
+        'point_weight':    f_point_wts.astype(np.float64),
+        'viewing_angle':   viewing_angles.astype(np.float64),
+        'hit_type':        hit_type.astype(np.int32),
+        'is_leaf':         f_is_leaf.astype(bool),
+    }
+    return pd.DataFrame(out)
+
+def voxel_ray_intersections_blocked(valid_rays_ddf: dd.DataFrame,
+                                    voxel_refs_df: pd.DataFrame,
+                                    meta: pd.DataFrame,
+                                    target_tile_bytes: int = 256 * 1024 * 1024,
+                                    rays_partition_size_mb: int = 25,
+                                    epsilon: float = 1e-6) -> dd.DataFrame:
     """
-    Octree node for spatial indexing of voxels.
+    Create a dask.dataframe of voxel-ray intersections by tiling the (voxels × rays)
+    space. The tile kernel is vectorized NumPy but scoped to small blocks.
     """
-    def __init__(self, bbox_min, bbox_max, depth=0, max_depth=10, max_voxels=50):
-        self.bbox_min = bbox_min
-        self.bbox_max = bbox_max
-        self.centre = (bbox_min + bbox_max) / 2
-        self.depth = depth
-        self.max_depth = max_depth
-        self.max_voxels = max_voxels
-        self.voxels = []
-        self.children = None
-        self.is_leaf = True
+    print(f"Starting voxel_ray_intersections_blocked with target_tile_bytes={target_tile_bytes}, rays_partition_size_mb={rays_partition_size_mb}")
     
-    def insert(self, voxel_data):
-        """Insert a voxel into the octree."""
-        if not self.is_leaf:
-            # Find which child to insert into
-            child_idx = self._get_child_index(voxel_data['centre'])
-            self.children[child_idx].insert(voxel_data)
-        else:
-            self.voxels.append(voxel_data)
-            # Split if necessary
-            if len(self.voxels) > self.max_voxels and self.depth < self.max_depth:
-                self._split()
+    # 1) Repartition rays (compute-friendly size)
+    print(f"Repartitioning rays to {rays_partition_size_mb}MB partitions...")
+    ddf = valid_rays_ddf.repartition(partition_size=f"{rays_partition_size_mb}MB")
+    print(f"Rays repartitioned into {ddf.npartitions} partitions")
+
+    # 2) Materialize voxel blocks sized to keep per-tile memory under target_tile_bytes.
+    #    Estimate pairwise bytes ~ 64 bytes/pair (empirical; adjust if needed).
+    #    For a ray partition with R rows, choose V such that V * R * 64 <= target.
+    #    We'll compute per partition once we know R in a small sample.
+    print(f"Creating delayed tasks for {ddf.npartitions} ray partitions...")
+    ray_part_delayed = ddf.to_delayed()
+    tasks = []
+
+    for idx, r_delayed in enumerate(ray_part_delayed):
+        print(f"Processing ray partition {idx + 1}/{len(ray_part_delayed)}...")
+        # tie voxel blocking to this partition's size
+        @delayed
+        def _make_tasks_for_partition(ray_block: pd.DataFrame, voxel_refs_df=voxel_refs_df):
+            R = len(ray_block)
+            if R == 0:
+                print(f"  Skipping empty ray partition")
+                return []
+            bytes_per_pair = 64  # heuristic (vectors, masks, temps)
+            V_block = max(1, int(target_tile_bytes // max(1, (R * bytes_per_pair))))
+            # safe minimum block (avoid tiny tiles)
+            # V_block = max(V_block, 2_000)  # tune for your cluster
+            num_voxel_blocks = (len(voxel_refs_df) + V_block - 1) // V_block
+            print(f"  Ray partition has {R} rays, creating {num_voxel_blocks} voxel blocks with V_block={V_block}")
+            v_blocks = [voxel_refs_df.iloc[i:i+V_block] for i in range(0, len(voxel_refs_df), V_block)]
+            # return a list of delayed tile computations for this ray_block
+            return [delayed(traverse_voxels_tile)(v, ray_block, epsilon) for v in v_blocks]
+
+        tile_list = _make_tasks_for_partition(r_delayed)
+        tasks.append(tile_list)
+
+    # 3) Flatten nested lists of delayed tile DataFrames
+    print("Flattening nested lists of delayed tile DataFrames...")
+    delayed_tiles = dask.delayed(sum)(tasks, [])  # concatenate lists lazily
+    print("Computing delayed tiles list...")
+    delayed_tiles = delayed_tiles.compute()       # gather list of Delayed objects
+    print(f"Total delayed tiles created: {len(delayed_tiles)}")
+
+    # 3.5) Reformat each delayed tile to enforce correct dtypes from meta
+    def enforce_schema(df, meta):
+        for col in meta.columns:
+            if col in df.columns:
+                df[col] = df[col].astype(meta[col].dtype)
+        return df
     
-    def _split(self):
-        """Split this node into 8 children."""
-        self.is_leaf = False
-        self.children = []
-        
-        # Create 8 octants
-        mid = self.centre
-        for i in range(8):
-            # Calculate child bounding box
-            child_min = np.array([
-                self.bbox_min[0] if i & 1 == 0 else mid[0],
-                self.bbox_min[1] if i & 2 == 0 else mid[1],
-                self.bbox_min[2] if i & 4 == 0 else mid[2]
-            ])
-            child_max = np.array([
-                mid[0] if i & 1 == 0 else self.bbox_max[0],
-                mid[1] if i & 2 == 0 else self.bbox_max[1],
-                mid[2] if i & 4 == 0 else self.bbox_max[2]
-            ])
-            
-            child = OctreeNode(child_min, child_max, self.depth + 1, self.max_depth, self.max_voxels)
-            self.children.append(child)
-        
-        # Redistribute voxels to children
-        for voxel in self.voxels:
-            child_idx = self._get_child_index(voxel['centre'])
-            self.children[child_idx].insert(voxel)
-        
-        self.voxels = []
+    delayed_tiles = [dask.delayed(enforce_schema)(tile, meta) for tile in delayed_tiles]
+
+    # 4) Wrap tiles into one Dask DataFrame
+    print("Wrapping tiles into Dask DataFrame...")
+    result_ddf = dd.from_delayed(delayed_tiles, meta=meta)
+    print(f"Resulting Dask DataFrame has {result_ddf.npartitions} partitions")
     
-    def _get_child_index(self, point):
-        """Get the index of the child octant containing the point."""
-        idx = 0
-        if point[0] >= self.centre[0]:
-            idx |= 1
-        if point[1] >= self.centre[1]:
-            idx |= 2
-        if point[2] >= self.centre[2]:
-            idx |= 4
-        return idx
-    
-    def query_rays(self, origins, directions, epsilon=1e-6):
-        """
-        Vectorized query: find voxels that each ray (origins, directions) might intersect.
-        Returns:
-            Numpy array: each row contains voxel data for the corresponding ray.
-        """
-        origins = np.atleast_2d(origins)
-        directions = np.atleast_2d(directions)
-        n_rays = origins.shape[0]
+    return result_ddf
 
-        # Check which rays intersect this node's bounding box
-        mask = self._rays_box_intersect(origins, directions, epsilon)
-        if not np.any(mask):
-            return np.empty((n_rays, 0), dtype=object)
 
-        # If leaf, return voxels for intersecting rays
-        if self.is_leaf:
-            voxel_data = np.array(self.voxels, dtype=object)
-            return np.where(mask[:, None], voxel_data, np.empty((0,), dtype=object))
 
-        # Otherwise, recurse into children
-        results = np.empty((n_rays,), dtype=object)
-        for child in self.children:
-            child_results = child.query_rays(origins, directions, epsilon)
-            for i in range(n_rays):
-                if results[i] is None:
-                    results[i] = []
-                results[i].extend(child_results[i])
-        return results
-
-    def _rays_box_intersect(self, origins, directions, epsilon=1e-6):
-        """Vectorized ray-box intersection for multiple rays."""
-        directions = np.where(
-            np.abs(directions) <= epsilon,
-            np.where(directions == 0, epsilon, np.sign(directions) * epsilon),
-            directions
-        )
-        inv_dir = 1.0 / directions
-
-        t_min = (self.bbox_min - origins) * inv_dir
-        t_max = (self.bbox_max - origins) * inv_dir
-
-        t1 = np.minimum(t_min, t_max)
-        t2 = np.maximum(t_min, t_max)
-
-        t_enter = np.max(t1, axis=1)
-        t_exit = np.min(t2, axis=1)
-
-        return (t_enter <= t_exit + epsilon) & (t_exit >= -epsilon)
-
-def traverse_voxels_octree(ray_partition, octree, temp_dir, debug=False, epsilon=1e-6):
-    """
-    Traverse voxels using octree spatial indexing for efficient ray-voxel intersection.
-    """
+def traverse_voxels(voxel_references, ray_partition, debug=False, epsilon=1e-6):
     import logging
     logging.basicConfig(level=logging.INFO)
 
     if ray_partition.empty:
         return pd.DataFrame(columns=voxel_ray_intersection_schema.names)
 
-    # Prepare ray data
+    # Prepare ray and voxel data
     leg_ids = ray_partition['leg_id'].values
     ray_ids = ray_partition['ray_id'].values
     origins = np.asarray(ray_partition[['origin_x', 'origin_y', 'origin_z']].values)
@@ -2869,83 +3000,102 @@ def traverse_voxels_octree(ray_partition, octree, temp_dir, debug=False, epsilon
     return_numbers = np.asarray(ray_partition['return_number'].values)
     number_of_returns = np.asarray(ray_partition['number_of_returns'].values)
 
-    # Use octree to find candidate voxels for each ray (vectorized)
-    candidate_voxels_per_ray = octree.query_rays(origins, directions, epsilon)
-    ray_voxel_pairs = []
-    for i, voxels in enumerate(candidate_voxels_per_ray):
-        for voxel_data in voxels:
-            ray_voxel_pairs.append((i, voxel_data))
-    
-    if not ray_voxel_pairs:
+    voxel_ids = voxel_references['voxel_id'].values
+    voxel_sizes = voxel_references['voxel_size'].values
+    voxel_centres = voxel_references[['voxel_cx', 'voxel_cy', 'voxel_cz']].values
+
+    # Vectorized ray-voxel intersection (no chunking)
+    # Broadcast all voxels and rays at once
+    voxel_centres_b = voxel_centres[:, np.newaxis, :]
+    voxel_sizes_b = voxel_sizes[:, np.newaxis]
+    origins_b = origins[np.newaxis, :, :]
+    directions_b = directions[np.newaxis, :, :]
+
+    # Use half the diagonal of the voxel as the radius, plus epsilon
+    voxel_radii = voxel_sizes_b * np.sqrt(3) * 0.5 + 0.05
+    oc = origins_b - voxel_centres_b
+    b = 2.0 * np.sum(oc * directions_b, axis=2)
+    c = np.sum(oc * oc, axis=2) - voxel_radii**2
+    discriminant = b**2 - 4 * c
+    hit = discriminant >= -epsilon
+
+    mask = np.zeros((voxel_centres.shape[0], origins.shape[0]), dtype=bool)
+    if np.any(hit):
+        voxel_mins = voxel_centres_b - (voxel_sizes_b[..., None] / 2 - epsilon)
+        voxel_maxs = voxel_centres_b + (voxel_sizes_b[..., None] / 2 + epsilon)
+        voxel_idx, ray_idx = np.nonzero(hit)
+        selected_voxel_mins = voxel_mins[voxel_idx, 0]
+        selected_voxel_maxs = voxel_maxs[voxel_idx, 0]
+        selected_origins = origins[ray_idx]
+        selected_directions = directions[ray_idx]
+        small_epsilon = 1e-9
+        small_dir = np.abs(selected_directions) <= small_epsilon
+        selected_directions = np.where(
+            small_dir,
+            np.where(selected_directions == 0, small_epsilon, np.sign(selected_directions) * small_epsilon),
+            selected_directions
+        )
+        inv_directions = 1.0 / selected_directions
+        t1 = (selected_voxel_mins - selected_origins) * inv_directions
+        t2 = (selected_voxel_maxs - selected_origins) * inv_directions
+        t_enter = np.max(np.minimum(t1, t2), axis=1)
+        t_exit = np.min(np.maximum(t1, t2), axis=1)
+        valid = (t_enter <= t_exit + epsilon) & (t_exit >= -epsilon)
+        mask[voxel_idx[valid], ray_idx[valid]] = True
+
+    voxel_ref_idx, ray_ref_idx = np.nonzero(mask[:, :])
+
+    if len(voxel_ref_idx) == 0:
         return pd.DataFrame(columns=voxel_ray_intersection_schema.names)
-    
-    # Extract ray and voxel indices
-    ray_indices = np.array([pair[0] for pair in ray_voxel_pairs])
-    voxel_data_list = [pair[1] for pair in ray_voxel_pairs]
-    
-    # Perform detailed intersection tests
-    filtered_voxel_ids = np.array([v['voxel_id'] for v in voxel_data_list])
-    filtered_voxel_centres = np.array([v['centre'] for v in voxel_data_list])
-    filtered_voxel_sizes = np.array([v['size'] for v in voxel_data_list])
-    
-    filtered_origins = origins[ray_indices]
-    filtered_directions = directions[ray_indices]
-    filtered_leg_ids = leg_ids[ray_indices]
-    filtered_ray_ids = ray_ids[ray_indices]
-    filtered_is_leaf = is_leaf[ray_indices]
-    filtered_points = points[ray_indices]
-    filtered_normals = normals[ray_indices]
-    filtered_point_weights = point_weights[ray_indices]
-    filtered_echo_intensities = echo_intensities[ray_indices]
-    filtered_return_numbers = return_numbers[ray_indices]
-    filtered_number_of_returns = number_of_returns[ray_indices]
-    
-    # Calculate viewing angles
+
+    filtered_voxel_ids = voxel_ids[voxel_ref_idx].reshape(-1)
+    filtered_voxel_sizes = voxel_sizes[voxel_ref_idx]
+    filtered_voxel_centres = voxel_centres[voxel_ref_idx].reshape(-1, 3)
+    filtered_leg_ids = leg_ids[ray_ref_idx].reshape(-1)
+    filtered_ray_ids = ray_ids[ray_ref_idx].reshape(-1)
+    filtered_is_leaf = is_leaf[ray_ref_idx].reshape(-1)
+    filtered_points = points[ray_ref_idx, :].reshape(-1, 3)
+    filtered_normals = normals[ray_ref_idx, :].reshape(-1, 3)
+    filtered_point_weights = point_weights[ray_ref_idx].reshape(-1)
+    filtered_origins = origins[ray_ref_idx, :].reshape(-1, 3)
+    filtered_directions = directions[ray_ref_idx, :].reshape(-1, 3)
+    filtered_echo_intensities = echo_intensities[ray_ref_idx].reshape(-1)
+    filtered_return_numbers = return_numbers[ray_ref_idx].reshape(-1)
+    filtered_number_of_returns = number_of_returns[ray_ref_idx].reshape(-1)
+
     filtered_viewing_angles = find_viewing_angles(directions=filtered_directions)
-    
-    # Calculate intersection coordinates
+
     filtered_voxel_mins = filtered_voxel_centres - (filtered_voxel_sizes[:, np.newaxis] / 2 - epsilon)
     filtered_voxel_maxs = filtered_voxel_centres + (filtered_voxel_sizes[:, np.newaxis] / 2 + epsilon)
-    
     filtered_directions = np.where(
         np.abs(filtered_directions) <= epsilon,
         np.where(filtered_directions == 0, epsilon, np.sign(filtered_directions) * epsilon),
         filtered_directions
     )
     inv_filtered_directions = 1.0 / filtered_directions
-    
     t_min = (filtered_voxel_mins - filtered_origins) * inv_filtered_directions
     t_max = (filtered_voxel_maxs - filtered_origins) * inv_filtered_directions
     t_enter = np.max(np.minimum(t_min, t_max), axis=1)
     t_exit = np.min(np.maximum(t_min, t_max), axis=1)
-    
     filtered_exit_coords = filtered_origins + t_exit[:, np.newaxis] * filtered_directions
     filtered_entry_coords = filtered_origins + t_enter[:, np.newaxis] * filtered_directions
-    
-    # Classify hit types
+
     unbound = np.isnan(filtered_points).any(axis=1)
-    in_voxel = np.all(
-        (filtered_points >= (filtered_voxel_mins - epsilon)) & 
-        (filtered_points <= (filtered_voxel_maxs + epsilon)), 
-        axis=1
-    )
-    
-    dist_to_entry_sq = np.sum((filtered_origins - filtered_entry_coords) ** 2, axis=1)
-    dist_to_exit_sq = np.sum((filtered_origins - filtered_exit_coords) ** 2, axis=1)
+    in_voxel = np.all((filtered_points >= (filtered_voxel_mins - epsilon)) & (filtered_points <= (filtered_voxel_maxs + epsilon)), axis=1)
+    dist_to_entry_sq = np.sum((filtered_origins - (filtered_entry_coords)) ** 2, axis=1)
+    dist_to_exit_sq = np.sum((filtered_origins - (filtered_exit_coords)) ** 2, axis=1)
     dist_to_point_sq = np.sum((filtered_points - filtered_origins) ** 2, axis=1)
-    
     before_voxel = (dist_to_entry_sq > dist_to_point_sq) & ~in_voxel & ~unbound
     after_voxel = (dist_to_exit_sq < dist_to_point_sq) & ~in_voxel & ~unbound
-    
+
     hit_type = np.full(filtered_points.shape[0], -1, dtype=np.int32)
     hit_type[unbound] = 0
     hit_type[before_voxel] = 1
     hit_type[in_voxel] = 2
     hit_type[after_voxel] = 3
-    
+
     filtered_distances_to_voxel_centre = np.linalg.norm(filtered_origins - filtered_voxel_centres, axis=1)
-    
-    # Build result DataFrame
+
     data_dict = {
         'voxel_size': filtered_voxel_sizes.flatten(),
         'voxel_id': filtered_voxel_ids.flatten(),
@@ -2975,7 +3125,6 @@ def traverse_voxels_octree(ray_partition, octree, temp_dir, debug=False, epsilon
         'hit_type': hit_type.flatten() if hasattr(hit_type, "flatten") else hit_type,
         'is_leaf': filtered_is_leaf.flatten() if hasattr(filtered_is_leaf, "flatten") else filtered_is_leaf
     }
-    
     data_df = pd.DataFrame(data_dict)
     return data_df
 
