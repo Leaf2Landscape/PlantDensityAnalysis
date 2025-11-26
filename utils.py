@@ -2652,7 +2652,6 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
         result = df.map_partitions(
             map_ray_partition_to_function,
             voxel_group=voxel_references,
-            voxel_chunk_size=voxel_chunk_size,
             temp_dir=temp_dir,
             meta=meta
         )
