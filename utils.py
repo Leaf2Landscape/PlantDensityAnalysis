@@ -380,7 +380,8 @@ def _start_dask_client(memory_limit='4GB',
                        memory_terminate=False,
                        temp_dir=None,
                        task_retries=3, 
-                       worker_ttl="300s"):
+                       worker_ttl="300s",
+                       processes=True):
     """
     Start (or restart) a Dask LocalCluster with memory & temp directory controls.
 
@@ -468,7 +469,7 @@ def _start_dask_client(memory_limit='4GB',
         threads_per_worker=threads_per_worker,
         memory_limit=memory_limit,
         local_directory=temp_dir,
-        processes=True
+        processes=processes
     )
     DASK_CLIENT = Client(cluster)
     return DASK_CLIENT
@@ -2558,7 +2559,16 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
     import time
 
     print("[voxel_ray_intersections] Initialising Dask client...")
-    avail_cpu = int(os.environ.get('SLURM_CPUS_PER_TASK', psutil.cpu_count(logical=True)))
+    if os.environ.get('SLURM_CPUS_PER_TASK') is not None:
+        print(f"Detected SLURM_CPUS_PER_TASK={os.environ.get('SLURM_CPUS_PER_TASK')}")
+        avail_cpu = int(os.environ.get('SLURM_CPUS_PER_TASK'))
+        threads_per_worker = 2 # hard code this for your system
+    else:
+        avail_cpu = psutil.cpu_count(logical=False)
+        threads_per_worker = psutil.cpu_count(logical=True) // avail_cpu
+        print(f"No SLURM_CPUS_PER_TASK detected, using system CPU count: {avail_cpu} physical cores with {threads_per_worker} threads per worker.")
+
+    # avail_cpu = int(os.environ.get('SLURM_CPUS_PER_TASK', psutil.cpu_count(logical=True)))
     avail_mem = int(float(os.environ.get('SLURM_MEM_PER_NODE', psutil.virtual_memory().available // (1024 * 1024))) * 0.8) # in MB
     
     # Use Dask LocalCluster for memory management and spill configuration
@@ -2579,7 +2589,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
                 temp_dir = "/tmp"
                 print("Using fallback temporary directory: /tmp")
 
-    threads_per_worker = 4
+    threads_per_worker = 2
     optimal_workers = max(1, avail_cpu // threads_per_worker)
 
     memory_worker = avail_mem / optimal_workers
@@ -2635,7 +2645,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
     for file in valid_rays_files:
         leg_id = int(os.path.splitext(os.path.basename(file))[0].split("_")[1])
         print(f"[voxel_ray_intersections] Loading valid rays file for leg {leg_id}: {file}")
-        df = dd.read_parquet(file, engine='pyarrow', blocksize="10MB")
+        df = dd.read_parquet(file, engine='pyarrow', blocksize="25MB")
         print(f"[voxel_ray_intersections] Leg {leg_id} partitions: {df.npartitions}")
         meta = pd.DataFrame(columns=voxel_ray_intersection_schema.names)
 
@@ -2717,13 +2727,17 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
         print(f"[voxel_ray_intersections] Leg {leg_id} grouped into {len(grouped)} voxel_size groups.")
         for voxel_size, group_df in grouped:
             print(f"[voxel_ray_intersections] Saving group voxel_size={voxel_size} (rows={len(group_df)}) for leg {leg_id}")
-    for leg_id, future in futures:
-        with ProgressBar():
-            results = future.result()
-        for voxel_size, group_df in results.groupby('voxel_size', group_keys=True):
             save_task(group_df, leg_id)
             del group_df
         del results
+        print(f"[voxel_ray_intersections] Completed save for leg {leg_id}")
+    # for leg_id, future in futures:
+    #     with ProgressBar():
+    #         results = future.result()
+    #     for voxel_size, group_df in results.groupby('voxel_size', group_keys=True):
+    #         save_task(group_df, leg_id)
+    #         del group_df
+    #     del results
 
     # start_time = time.time()
     # print("[voxel_ray_intersections] Awaiting computation results...")
@@ -2805,16 +2819,16 @@ def traverse_voxels(voxel_references, ray_partition, memory_limit_bytes, min_chu
 
     print(f"[traverse_voxels] Memory diagnostics:")
     print(f"  - Number of unique rays (U): {U}")
-    print(f"  - Number of voxels: {len(voxel_centres)}")
-    print(f"  - Memory limit (bytes): {memory_limit_bytes}")
-    print(f"  - Broadcast memory per voxel: {broadcast_memory} bytes")
-    print(f"  - Intermediate memory per voxel: {intermediate_memory} bytes")
-    print(f"  - Hit mask memory per voxel: {hit_mask_memory} bytes")
-    print(f"  - Box intersection memory per voxel: {box_intersection_memory} bytes")
-    print(f"  - Mask memory per voxel: {mask_memory} bytes")
-    print(f"  - Total memory per voxel: {memory_per_voxel} bytes ({memory_per_voxel / (1024**2):.2f} MB)")
+    # print(f"  - Number of voxels: {len(voxel_centres)}")
+    # print(f"  - Memory limit (bytes): {memory_limit_bytes}")
+    # print(f"  - Broadcast memory per voxel: {broadcast_memory} bytes")
+    # print(f"  - Intermediate memory per voxel: {intermediate_memory} bytes")
+    # print(f"  - Hit mask memory per voxel: {hit_mask_memory} bytes")
+    # print(f"  - Box intersection memory per voxel: {box_intersection_memory} bytes")
+    # print(f"  - Mask memory per voxel: {mask_memory} bytes")
+    # print(f"  - Total memory per voxel: {memory_per_voxel} bytes ({memory_per_voxel / (1024**2):.2f} MB)")
     print(f"  - Optimal chunk size: {optimal_chunk_size} voxels")
-    print(f"  - Min chunk size: {min_chunk_size}, Max chunk size: {max_chunk_size}")
+    # print(f"  - Min chunk size: {min_chunk_size}, Max chunk size: {max_chunk_size}")
 
     # Iterate through voxel sizes and subsequently chunks
     hit_masks = []
