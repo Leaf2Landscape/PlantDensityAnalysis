@@ -2560,12 +2560,6 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
     print("[voxel_ray_intersections] Initialising Dask client...")
     avail_cpu = int(os.environ.get('SLURM_CPUS_PER_TASK', psutil.cpu_count(logical=True)))
     avail_mem = int(float(os.environ.get('SLURM_MEM_PER_NODE', psutil.virtual_memory().available // (1024 * 1024))) * 0.8) # in MB
-
-    # Use fewer workers with more threads to give each worker more memory
-    # optimal_workers = max(1, avail_cpu // 4)  # 4 threads per worker
-    # threads_per_worker = min(4, avail_cpu // optimal_workers)
-    threads_per_worker = 1
-    optimal_workers = avail_cpu // threads_per_worker
     
     # Use Dask LocalCluster for memory management and spill configuration
     if temp_dir is None:
@@ -2585,7 +2579,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
                 temp_dir = "/tmp"
                 print("Using fallback temporary directory: /tmp")
 
-    threads_per_worker = avail_cpu
+    threads_per_worker = 4
     optimal_workers = max(1, avail_cpu // threads_per_worker)
 
     memory_worker = avail_mem / optimal_workers
@@ -2753,7 +2747,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
     _close_dask_client(client)
     print("[voxel_ray_intersections] Dask client closed.")
 
-def traverse_voxels(voxel_references, ray_partition, memory_limit_bytes, min_chunk_size=1, max_chunk_size=100, debug=False, epsilon=1e-6):
+def traverse_voxels(voxel_references, ray_partition, memory_limit_bytes, min_chunk_size=1, max_chunk_size=1000, debug=False, epsilon=1e-6):
     import logging
     logging.basicConfig(level=logging.INFO)
 
