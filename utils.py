@@ -2634,7 +2634,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
 
     def map_ray_partition_to_function(ray_partition, voxel_group, temp_dir):
         # print(f"[map_ray_partition_to_function] Partition rows={len(ray_partition)} | voxels={len(voxel_group)}")
-        return traverse_voxels(ray_partition=ray_partition, voxel_references=voxel_group, voxel_chunk_size=40, debug=debug)
+        return traverse_voxels(ray_partition=ray_partition, voxel_references=voxel_group, memory_limit_bytes=((avail_mem * 1024 ** 2) // (optimal_workers * threads_per_worker) * 0.8), debug=debug)
 
     voxel_ray_intersections = {}
 
@@ -2753,7 +2753,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
     _close_dask_client(client)
     print("[voxel_ray_intersections] Dask client closed.")
 
-def traverse_voxels(voxel_references, ray_partition, voxel_chunk_size=50, debug=False, epsilon=1e-6):
+def traverse_voxels(voxel_references, ray_partition, memory_limit_bytes, min_chunk_size=1, max_chunk_size=100, debug=False, epsilon=1e-6):
     import logging
     logging.basicConfig(level=logging.INFO)
 
@@ -2776,6 +2776,7 @@ def traverse_voxels(voxel_references, ray_partition, voxel_chunk_size=50, debug=
     voxel_ids = voxel_references['voxel_id'].values
     voxel_sizes = voxel_references['voxel_size'].values
     voxel_centres = voxel_references[['voxel_cx', 'voxel_cy', 'voxel_cz']].values
+    unique_sizes, size_group_ids = np.unique(voxel_sizes, return_inverse=True)
 
     # Find unique rays and create mapping back to original indices
     unique_ray_ids, inverse_indices = np.unique(ray_ids, return_inverse=True)
@@ -2786,94 +2787,129 @@ def traverse_voxels(voxel_references, ray_partition, voxel_chunk_size=50, debug=
     # Extract unique ray data
     unique_origins = origins[unique_ray_mask]
     unique_directions = directions[unique_ray_mask]
-    
+    U = unique_origins.shape[0]
     del unique_ray_ids, unique_ray_mask, unique_ray_indices
     gc.collect()
 
-    # Iterate through chunks
+    # Calculate voxel_chunk_size
+    broadcast_memory = 3 * U * 3 * 8    # Broadcast arrays: 3 arrays of (V_chunk, U, 3) × 8 bytes (float64)
+    intermediate_memory = 4 * U * 8     # Intermediate float arrays: oc, b, c, discriminant (conservative estimate)
+    hit_mask_memory = U * 1             # Hit mask: (V_chunk, U) × 1 byte (bool)
+    box_intersection_memory = (2 * 3 * 8) + (2 * U * 0.5 * 3 * 8)   # Box intersection (when hits exist, worst case all hit):
+    mask_memory = 2 * U * 1      # Unique mask and final mask: (V_chunk, U) × 1 byte (bool)
+    
+    # Total memory per voxel in chunk
+    memory_per_voxel = (
+        broadcast_memory + 
+        intermediate_memory + 
+        hit_mask_memory + 
+        box_intersection_memory + 
+        mask_memory
+    )
+    optimal_chunk_size = int(memory_limit_bytes / memory_per_voxel)
+    optimal_chunk_size = max(min_chunk_size, min(optimal_chunk_size, max_chunk_size))
+
+    print(f"[traverse_voxels] Memory diagnostics:")
+    print(f"  - Number of unique rays (U): {U}")
+    print(f"  - Number of voxels: {len(voxel_centres)}")
+    print(f"  - Memory limit (bytes): {memory_limit_bytes}")
+    print(f"  - Broadcast memory per voxel: {broadcast_memory} bytes")
+    print(f"  - Intermediate memory per voxel: {intermediate_memory} bytes")
+    print(f"  - Hit mask memory per voxel: {hit_mask_memory} bytes")
+    print(f"  - Box intersection memory per voxel: {box_intersection_memory} bytes")
+    print(f"  - Mask memory per voxel: {mask_memory} bytes")
+    print(f"  - Total memory per voxel: {memory_per_voxel} bytes ({memory_per_voxel / (1024**2):.2f} MB)")
+    print(f"  - Optimal chunk size: {optimal_chunk_size} voxels")
+    print(f"  - Min chunk size: {min_chunk_size}, Max chunk size: {max_chunk_size}")
+
+    # Iterate through voxel sizes and subsequently chunks
     hit_masks = []
-    for start in range(0, len(voxel_centres), voxel_chunk_size):
-        vc_chunk = voxel_centres[start:start+voxel_chunk_size]
-        vs_chunk = voxel_sizes[start:start+voxel_chunk_size]
+    for s_idx, s in enumerate(unique_sizes):
+        # Indices of voxels with size s
+        group_mask = (size_group_ids == s_idx)
+        group_centres = voxel_centres[group_mask]
+        voxel_radius_sq = (s * np.sqrt(3) * 0.5 + 0.05) ** 2  # Precompute squared radius for sphere intersection
 
-        # Vectorized ray-voxel intersection (only unique rays)
-        voxel_centres_b = vc_chunk[:, np.newaxis, :]
-        voxel_sizes_b = vs_chunk[:, np.newaxis]
-        origins_b = unique_origins[np.newaxis, :, :]
-        directions_b = unique_directions[np.newaxis, :, :]
+        for start in range(0, len(group_centres), optimal_chunk_size):
+            vc_chunk = group_centres[start:start+optimal_chunk_size]
 
-        # Use half the diagonal of the voxel as the radius, plus epsilon
-        voxel_radii = voxel_sizes_b * np.sqrt(3) * 0.5 + 0.05
-        oc = origins_b - voxel_centres_b
-        b = 2.0 * np.sum(oc * directions_b, axis=2)
-        c = np.sum(oc * oc, axis=2) - voxel_radii**2
-        discriminant = b**2 - 4 * c
-        hit = discriminant >= -epsilon
-        
-        del oc, b, c, discriminant, voxel_radii
-        gc.collect()
+            # Vectorized ray-voxel intersection (only unique rays)
+            voxel_centres_b = vc_chunk[:, np.newaxis, :]
+            origins_b = unique_origins[np.newaxis, :, :]
+            directions_b = unique_directions[np.newaxis, :, :]
 
-        unique_mask = np.zeros((len(vc_chunk), len(inverse_indices)), dtype=bool)
-        if np.any(hit):
-            voxel_mins = voxel_centres_b - (voxel_sizes_b[..., None] / 2 - epsilon)
-            voxel_maxs = voxel_centres_b + (voxel_sizes_b[..., None] / 2 + epsilon)
-            voxel_idx, unique_ray_idx = np.nonzero(hit)
-            selected_voxel_mins = voxel_mins[voxel_idx, 0]
-            selected_voxel_maxs = voxel_maxs[voxel_idx, 0]
-            selected_origins = unique_origins[unique_ray_idx]
-            selected_directions = unique_directions[unique_ray_idx]
+            # Use half the diagonal of the voxel as the radius, plus epsilon
+            oc = origins_b - voxel_centres_b
+            b = 2.0 * np.sum(oc * directions_b, axis=2)
+            c = np.sum(oc * oc, axis=2) - voxel_radius_sq
+            discriminant = b**2 - 4 * c
+            hit = discriminant >= -epsilon
             
-            del voxel_mins, voxel_maxs
-            gc.collect()
-            
-            small_epsilon = 1e-9
-            small_dir = np.abs(selected_directions) <= small_epsilon
-            selected_directions = np.where(
-                small_dir,
-                np.where(selected_directions == 0, small_epsilon, np.sign(selected_directions) * small_epsilon),
-                selected_directions
-            )
-            inv_directions = 1.0 / selected_directions
-            
-            del small_dir
-            gc.collect()
-            
-            t1 = (selected_voxel_mins - selected_origins) * inv_directions
-            t2 = (selected_voxel_maxs - selected_origins) * inv_directions
-            
-            del selected_voxel_mins, selected_voxel_maxs, selected_origins, inv_directions
-            gc.collect()
-            
-            t_enter = np.max(np.minimum(t1, t2), axis=1)
-            t_exit = np.min(np.maximum(t1, t2), axis=1)
-            
-            del t1, t2
-            gc.collect()
-            
-            valid = (t_enter <= t_exit + epsilon) & (t_exit >= -epsilon)
-            unique_mask[voxel_idx[valid], unique_ray_idx[valid]] = True
-            
-            del t_enter, t_exit, valid, voxel_idx, unique_ray_idx
+            del oc, b, c, discriminant
             gc.collect()
 
-        del voxel_centres_b, voxel_sizes_b, origins_b, directions_b, hit
-        gc.collect()
-        
-        # Map the unique mask back to all rays using inverse_indices
-        mask = unique_mask[:, inverse_indices]
-        hit_masks.append(mask)
-        
-        del unique_mask, mask, vc_chunk, vs_chunk
-        gc.collect()
+            unique_mask = np.zeros((len(vc_chunk), U), dtype=bool)
+            if np.any(hit):
+                size_half = s / 2.0
+                voxel_mins = voxel_centres_b - (size_half - epsilon)
+                voxel_maxs = voxel_centres_b + (size_half + epsilon)
+                voxel_idx, unique_ray_idx = np.nonzero(hit)
+                selected_voxel_mins = voxel_mins[voxel_idx, 0]
+                selected_voxel_maxs = voxel_maxs[voxel_idx, 0]
+                selected_origins = unique_origins[unique_ray_idx]
+                selected_directions = unique_directions[unique_ray_idx]
+                
+                del voxel_mins, voxel_maxs
+                gc.collect()
+                
+                small_epsilon = 1e-9
+                small_dir = np.abs(selected_directions) <= small_epsilon
+                selected_directions = np.where(
+                    small_dir,
+                    np.where(selected_directions == 0, small_epsilon, np.sign(selected_directions) * small_epsilon),
+                    selected_directions
+                )
+                inv_directions = 1.0 / selected_directions
+                
+                del small_dir
+                gc.collect()
+                
+                t1 = (selected_voxel_mins - selected_origins) * inv_directions
+                t2 = (selected_voxel_maxs - selected_origins) * inv_directions
+                
+                del selected_voxel_mins, selected_voxel_maxs, selected_origins, inv_directions
+                gc.collect()
+                
+                t_enter = np.max(np.minimum(t1, t2), axis=1)
+                t_exit = np.min(np.maximum(t1, t2), axis=1)
+                
+                del t1, t2
+                gc.collect()
+                
+                valid = (t_enter <= t_exit + epsilon) & (t_exit >= -epsilon)
+                unique_mask[voxel_idx[valid], unique_ray_idx[valid]] = True
+                
+                del t_enter, t_exit, valid, voxel_idx, unique_ray_idx
+                gc.collect()
+            
+            # Map the unique mask back to all rays using inverse_indices
+            mask = unique_mask[:, inverse_indices]
+            hit_masks.append((group_mask, start, len(vc_chunk), mask)) # Store group mask and chunk info for later filtering
+            
+            del unique_mask, mask, voxel_centres_b, origins_b, directions_b, hit, vc_chunk
+            gc.collect()
     
     # Concatenate all hit masks
-    mask = np.concatenate(hit_masks, axis=0)
-    del hit_masks
-    gc.collect()
+    global_mask = np.zeros((len(voxel_centres), len(inverse_indices)), dtype=bool)
+
+    for group_mask, start, length, mask in hit_masks:
+        group_positions = np.flatnonzero(group_mask)
+        chunk_positions = group_positions[start:start+length]
+        global_mask[chunk_positions, :] |= mask
     
     # Get voxel and ray indices where mask is True
-    voxel_ref_idx, ray_ref_idx = np.nonzero(mask)
-    del mask
+    voxel_ref_idx, ray_ref_idx = np.nonzero(global_mask)
+    del global_mask, hit_masks
     gc.collect()
     
     if len(voxel_ref_idx) == 0:
