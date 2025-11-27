@@ -2563,13 +2563,15 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
         print(f"Detected SLURM_CPUS_PER_TASK={os.environ.get('SLURM_CPUS_PER_TASK')}")
         avail_cpu = int(os.environ.get('SLURM_CPUS_PER_TASK'))
         threads_per_worker = 2 # hard code this for your system
+        mem_threshold = 1.0
     else:
         avail_cpu = psutil.cpu_count(logical=False)
         threads_per_worker = psutil.cpu_count(logical=True) // avail_cpu
+        mem_threshold = 0.8
         print(f"No SLURM_CPUS_PER_TASK detected, using system CPU count: {avail_cpu} physical cores with {threads_per_worker} threads per worker.")
 
     # avail_cpu = int(os.environ.get('SLURM_CPUS_PER_TASK', psutil.cpu_count(logical=True)))
-    avail_mem = int(float(os.environ.get('SLURM_MEM_PER_NODE', psutil.virtual_memory().available // (1024 * 1024))) * 0.8) # in MB
+    avail_mem = int(float(os.environ.get('SLURM_MEM_PER_NODE', psutil.virtual_memory().available // (1024 * 1024))) * mem_threshold) # in MB
     
     # Use Dask LocalCluster for memory management and spill configuration
     if temp_dir is None:
@@ -2589,8 +2591,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
                 temp_dir = "/tmp"
                 print("Using fallback temporary directory: /tmp")
 
-    threads_per_worker = 2
-    optimal_workers = max(1, avail_cpu // threads_per_worker)
+    optimal_workers = max(1, avail_cpu)
 
     memory_worker = avail_mem / optimal_workers
     avail_mem_string_for_dask = f"{int(memory_worker)}MB"
@@ -2638,7 +2639,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
 
     def map_ray_partition_to_function(ray_partition, voxel_group, temp_dir):
         # print(f"[map_ray_partition_to_function] Partition rows={len(ray_partition)} | voxels={len(voxel_group)}")
-        return traverse_voxels(ray_partition=ray_partition, voxel_references=voxel_group, memory_limit_bytes=((avail_mem * 1024 ** 2) // (optimal_workers * threads_per_worker) * 0.8), debug=debug)
+        return traverse_voxels(ray_partition=ray_partition, voxel_references=voxel_group, memory_limit_bytes=(memory_worker * 1024**2 / threads_per_worker), debug=debug)
 
     voxel_ray_intersections = {}
 
