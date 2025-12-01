@@ -2788,16 +2788,16 @@ def traverse_voxels(voxel_references, ray_partition, memory_limit_bytes, min_chu
     unique_sizes, size_group_ids = np.unique(voxel_sizes, return_inverse=True)
 
     # Find unique rays and create mapping back to original indices
-    unique_ray_ids, inverse_indices = np.unique(ray_ids, return_inverse=True)
-    unique_ray_mask = np.zeros(len(ray_ids), dtype=bool)
-    unique_ray_indices = np.unique(ray_ids, return_index=True)[1]
-    unique_ray_mask[unique_ray_indices] = True
+    _, unique_ray_idx, inverse_indices = np.unique(ray_ids, return_index=True, return_inverse=True)
+    # unique_ray_mask = np.zeros(len(ray_ids), dtype=bool)
+    # unique_ray_indices = np.unique(ray_ids, return_index=True)[1]
+    # unique_ray_mask[unique_ray_indices] = True
     
     # Extract unique ray data
-    unique_origins = origins[unique_ray_mask]
-    unique_directions = directions[unique_ray_mask]
+    unique_origins = origins[unique_ray_idx]
+    unique_directions = directions[unique_ray_idx]
     U = unique_origins.shape[0]
-    del unique_ray_ids, unique_ray_mask, unique_ray_indices
+    # del unique_ray_idx, unique_ray_mask, unique_ray_indices
     gc.collect()
 
     # Calculate voxel_chunk_size
