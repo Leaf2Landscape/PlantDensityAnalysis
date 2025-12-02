@@ -2895,10 +2895,10 @@ def traverse_voxels(voxel_references, ray_partition, memory_limit_bytes, min_chu
                 del t_enter, t_exit, valid, potential_voxel_idx, potential_unique_ray_idx
                 gc.collect()
             
-            del voxel_centres_b, origins_b, directions_b, vc_chunk
+            del voxel_centres_b, origins_b, directions_b
             gc.collect()
         
-        hit_masks.append((group_mask, start, optimal_chunk_size, hit_pairs))
+            hit_masks.append((group_mask, start, len(vc_chunk), hit_pairs))
     
     # Concatenate all hit masks
     # map back to original ray indices
