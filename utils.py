@@ -2639,7 +2639,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
 
     def map_ray_partition_to_function(ray_partition, voxel_group, temp_dir):
         # print(f"[map_ray_partition_to_function] Partition rows={len(ray_partition)} | voxels={len(voxel_group)}")
-        return traverse_voxels(ray_partition=ray_partition, voxel_references=voxel_group, memory_limit_bytes=(memory_worker * 1024**2 / threads_per_worker), debug=debug)
+        return traverse_voxels(ray_partition=ray_partition, voxel_references=voxel_group, memory_limit_bytes=((memory_worker * 1024**2) / threads_per_worker), debug=debug)
 
     voxel_ray_intersections = {}
 
@@ -2806,6 +2806,7 @@ def traverse_voxels(voxel_references, ray_partition, memory_limit_bytes, min_chu
     hit_mask_memory = U * 1             # Hit mask: (V_chunk, U) × 1 byte (bool)
     box_intersection_memory = (2 * 3 * 8) + (2 * U * 0.5 * 3 * 8)   # Box intersection (when hits exist, worst case all hit):
     mask_memory = 2 * U * 1      # Unique mask and final mask: (V_chunk, U) × 1 byte (bool)
+    buffer = 1.2  # Safety buffer
     
     # Total memory per voxel in chunk
     memory_per_voxel = (
@@ -2815,7 +2816,7 @@ def traverse_voxels(voxel_references, ray_partition, memory_limit_bytes, min_chu
         box_intersection_memory + 
         mask_memory
     )
-    optimal_chunk_size = int(memory_limit_bytes / memory_per_voxel)
+    optimal_chunk_size = int(memory_limit_bytes / (memory_per_voxel * buffer))
     optimal_chunk_size = max(min_chunk_size, min(optimal_chunk_size, max_chunk_size))
 
     print(f"[traverse_voxels] Memory diagnostics:")
