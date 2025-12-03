@@ -4531,11 +4531,13 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
     
     # Combine all dataframes into one
     voxel_intersections_df = dd.concat(dfs, axis=0, ignore_index=True)
-    voxel_intersections_df = voxel_intersections_df.set_index('voxel_id')
-    # Map partitions to voxel metrics calculation
-    voxel_metrics_df = voxel_intersections_df.map_partitions(
-        lambda df: df.groupby('voxel_id').apply(calculate_voxel_metrics_per_voxel), 
-        meta=meta
+    # Ensure 'voxel_id' remains a column and group by it directly to compute per-voxel metrics
+    # (don't set 'voxel_id' as the DataFrame index, since subsequent grouping expects it as a column)
+    # Map to per-voxel calculation via dask groupby.apply with the provided meta
+    voxel_metrics_df = voxel_intersections_df.groupby('voxel_id').apply(
+        calculate_voxel_metrics_per_voxel,
+        meta=meta,
+        include_groups=False
     )
 
     # Return the calculated metrics
