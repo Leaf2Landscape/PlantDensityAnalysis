@@ -597,7 +597,7 @@ def simulate_combined_mesh_with_points(scene, leaf_gid, wood_gid,
     efpl_f = compute_efpl_array(z_arr[valid_rays_mask],  lambda_1)
 
     stats_lw = dict(
-        N=n_hits_lw,       # Changed from N to prevent including hits on voxel surface
+        N=N,
         n_hits=n_hits_lw,
         I=n_hits_lw / N if N else 0.0,
         delta_bar=delta[valid_rays_mask].mean() if N else 0.0,
@@ -1073,7 +1073,7 @@ def process_voxel(
                     # hits
                     "num_leaf_hits": int(leaf_data.get("n_hits", np.nan)),
                     "num_lw_hits":   int(lw_data.get("n_hits", np.nan)),
-                    "num_hits":      int(lw_data.get("N", np.nan)),   # kept for legacy parity
+                    "num_hits":      int(lw_data.get("n_hits", np.nan)),   # REMOVE IN REFACTOR
 
                     # interception / pgap
                     "I_leaf": float(leaf_data.get("I", np.nan)),
