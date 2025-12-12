@@ -12,7 +12,7 @@ import numpy as np
 from sklearn.neighbors import NearestNeighbors
 import gc
 import dask
-from dask.distributed import progress, get_client
+from dask.distributed import progress, get_client, get_worker
 import os
 import tempfile
 import uuid
@@ -3794,7 +3794,8 @@ def _determine_dask_resources(cpus: int | None, mem: int | None, optimal_threads
     else:
         avail_mem = int(float(os.environ.get('SLURM_MEM_PER_NODE', psutil.virtual_memory().available // (1024 * 1024))) * mem_threshold)  # in MB
 
-    
+    # Test for not oversubscribing
+    threads = 1
     n_workers = (avail_cpus * threads) // optimal_threads
     threads_per_worker = optimal_threads
 
@@ -4610,9 +4611,13 @@ def _process_partition_pairs(
 
 
 
-def _map_partition_pairs(ray_part: pd.DataFrame, voxel_data: Dict[str, np.ndarray], eps: float = 1e-6) -> pd.DataFrame:
+def _map_partition_pairs(ray_part: pd.DataFrame, eps: float = 1e-6) -> pd.DataFrame:
     if ray_part is None or len(ray_part) == 0:
         return pd.DataFrame(columns=['leg_id', 'ray_id', 'voxel_id', 'voxel_size'])
+    
+    c = get_client()
+    vox_future = c.get_dataset('voxel_data')
+    voxel_data = c.gather(vox_future)
 
     # Extract only what kernel needs
     origins    = ray_part[['origin_x','origin_y','origin_z']].to_numpy(dtype=np.float64)
@@ -4686,7 +4691,13 @@ def voxel_ray_intersections_dask_new(valid_rays_dir: str,
     voxel_refs = _compile_voxel_references(references_dir)
     voxel_data = _build_sparse_grid_arrays(voxel_refs, epsilon=epsilon)
     
-    scattered_vox = client.scatter(voxel_data, broadcast=True)
+    
+    
+    # If voxel_data is big, publish a Future handle rather than the raw object
+    vox_future = client.submit(lambda x: x, voxel_data)  # or client.scatter(voxel_data)
+    client.replicate([vox_future])                       # (optional) copy to all workers
+    client.publish_dataset(voxel_data=vox_future)        # named handle on the scheduler
+
 
     valid_files = glob.glob(os.path.join(valid_rays_dir, '*_valid_rays.parquet'))
     if debug:
@@ -4715,7 +4726,7 @@ def voxel_ray_intersections_dask_new(valid_rays_dir: str,
         'voxel_size': str(voxel_data['sizes'].dtype)
     }
     pairs_ddf = all_ddf.map_partitions(
-        _map_partition_pairs, voxel_data, meta=meta_pairs
+        _map_partition_pairs, meta=meta_pairs
     )
 
     # 2) Prepare rays DDF (select only needed columns)
