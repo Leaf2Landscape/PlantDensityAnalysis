@@ -3803,14 +3803,6 @@ def _determine_dask_resources(cpus: int | None, mem: int | None, optimal_threads
 
     return avail_mem_string_for_dask, n_workers, threads_per_worker
 
-def _save_group(valid_rays_dir: str, leg_id: int, df: pd.DataFrame) -> bool:
-    if df is None or len(df) == 0:
-        return False
-    voxel_size = round(float(df['voxel_size'].iloc[0]), 2)
-    output_filename = os.path.join(valid_rays_dir, f"leg_{leg_id}_voxel_{voxel_size}_intersections.parquet")
-    df.to_parquet(output_filename, engine='pyarrow', compression='snappy', schema=voxel_ray_intersection_schema)
-    return True
-
 
 def _build_sparse_grid_arrays(voxel_refs: pd.DataFrame, epsilon: float = 1e-6):
     voxel_ids = voxel_refs['voxel_id'].to_numpy()
@@ -4044,6 +4036,68 @@ def _slab_per_candidates(o, d, vmins, vmaxs, cand_idx, eps):
     return hit_idx, entry, exitp
 
 
+@njit(cache=True, fastmath=True)
+def _slab_count_only(o, d, vmins, vmaxs, cand_idx, eps):
+    """Count slab intersections without allocating output arrays."""
+    ds0, ds1, ds2 = _safe_dir(d, eps)
+    inv0 = 1.0/ds0; inv1 = 1.0/ds1; inv2 = 1.0/ds2
+    M = cand_idx.shape[0]
+    count = 0
+    for i in range(M):
+        vi = cand_idx[i]
+        t1x = (vmins[vi,0]-o[0])*inv0; t2x = (vmaxs[vi,0]-o[0])*inv0
+        t1y = (vmins[vi,1]-o[1])*inv1; t2y = (vmaxs[vi,1]-o[1])*inv1
+        t1z = (vmins[vi,2]-o[2])*inv2; t2z = (vmaxs[vi,2]-o[2])*inv2
+        tminx = t1x if t1x < t2x else t2x; tmaxx = t1x if t1x > t2x else t2x
+        tminy = t1y if t1y < t2y else t2y; tmaxy = t1y if t1y > t2y else t2y
+        tminz = t1z if t1z < t2z else t2z; tmaxz = t1z if t1z > t2z else t2z
+        t_enter = tminx
+        if tminy > t_enter: t_enter = tminy
+        if tminz > t_enter: t_enter = tminz
+        t_exit = tmaxx
+        if tmaxy < t_exit: t_exit = tmaxy
+        if tmaxz < t_exit: t_exit = tmaxz
+        ok = (t_enter <= t_exit + eps) and (t_exit >= -eps)
+        if ok:
+            count += 1
+    return count
+
+
+@njit(cache=True, fastmath=True)
+def _slab_fill_candidates(o, d, vmins, vmaxs, cand_idx, eps,
+                          hit_idx_buf, entry_buf, exit_buf):
+    """Fill preallocated buffers and return the number of hits."""
+    ds0, ds1, ds2 = _safe_dir(d, eps)
+    inv0 = 1.0/ds0; inv1 = 1.0/ds1; inv2 = 1.0/ds2
+    M = cand_idx.shape[0]
+    k = 0
+    for i in range(M):
+        vi = cand_idx[i]
+        t1x = (vmins[vi,0]-o[0])*inv0; t2x = (vmaxs[vi,0]-o[0])*inv0
+        t1y = (vmins[vi,1]-o[1])*inv1; t2y = (vmaxs[vi,1]-o[1])*inv1
+        t1z = (vmins[vi,2]-o[2])*inv2; t2z = (vmaxs[vi,2]-o[2])*inv2
+        tminx = t1x if t1x < t2x else t2x; tmaxx = t1x if t1x > t2x else t2x
+        tminy = t1y if t1y < t2y else t2y; tmaxy = t1y if t1y > t2y else t2y
+        tminz = t1z if t1z < t2z else t2z; tmaxz = t1z if t1z > t2z else t2z
+        t_enter = tminx
+        if tminy > t_enter: t_enter = tminy
+        if tminz > t_enter: t_enter = tminz
+        t_exit = tmaxx
+        if tmaxy < t_exit: t_exit = tmaxy
+        if tmaxz < t_exit: t_exit = tmaxz
+        ok = (t_enter <= t_exit + eps) and (t_exit >= -eps)
+        if ok:
+            hit_idx_buf[k]  = vi
+            entry_buf[k,0]  = o[0] + t_enter*d[0]
+            entry_buf[k,1]  = o[1] + t_enter*d[1]
+            entry_buf[k,2]  = o[2] + t_enter*d[2]
+            exit_buf[k,0]   = o[0] + t_exit *d[0]
+            exit_buf[k,1]   = o[1] + t_exit *d[1]
+            exit_buf[k,2]   = o[2] + t_exit *d[2]
+            k += 1
+    return k
+
+
 @njit(cache=True, fastmath=False)
 def _process_partition_numba(
     origins, directions, points, normals,
@@ -4205,6 +4259,195 @@ def _process_partition_numba(
     return data, k
 
 
+@njit(cache=True, fastmath=False)
+def _process_partition_numba_new(
+    origins, directions, points, normals,
+    echo_intensity, return_number, number_of_returns, point_weight, is_leaf,
+    leg_ids, ray_ids,
+    v_ids, v_sizes, v_centres, vmins, vmaxs,
+    origin_grid, cell_size, bbox_min, bbox_max,
+    keys_ix, keys_iy, keys_iz, offsets, voxel_ids_flat,
+    eps
+):
+    n_rays = origins.shape[0]
+
+    # precompute voxel radius^2 for sphere cull
+    radius_sq = ((v_sizes * math.sqrt(3) * 0.5) + 0.05) ** 2  # unchanged
+
+    # ---------- PASS 1: count hits (no per-ray slabs, one reusable mask) ----------
+    total_hits = 0
+    max_cand2 = 0
+
+    # one boolean mask for the whole partition (reused)
+    mask = np.zeros(v_sizes.shape[0], np.bool_)
+
+    for r in range(n_rays):
+        _dda_mark_candidates(
+            origins[r], directions[r], origin_grid, cell_size,
+            bbox_min, bbox_max, keys_ix, keys_iy, keys_iz,
+            offsets, voxel_ids_flat, mask, eps
+        )  
+
+        cand_idx = np.nonzero(mask)[0]
+        if cand_idx.size == 0:
+            # clear nothing; continue
+            continue
+
+        keep = _sphere_cull(origins[r], directions[r], v_centres, radius_sq, cand_idx, eps)
+        cand2 = cand_idx[keep]
+
+        # reset only the touched bits (avoid re-allocating mask)
+        for i in range(cand_idx.size):
+            mask[cand_idx[i]] = False
+
+        if cand2.size == 0:
+            continue
+
+        total_hits += _slab_count_only(origins[r], directions[r], vmins, vmaxs, cand2, eps)
+        if cand2.size > max_cand2:
+            max_cand2 = cand2.size
+
+    # ---------- Allocate output columns once (same dtypes, same order) ----------
+    voxel_size_col        = np.empty(total_hits, np.float64)
+    voxel_id_col          = np.empty(total_hits, np.int64)
+    voxel_cx_col          = np.empty(total_hits, np.float64)
+    voxel_cy_col          = np.empty(total_hits, np.float64)
+    voxel_cz_col          = np.empty(total_hits, np.float64)
+    leg_id_col            = np.empty(total_hits, np.int64)
+    ray_id_col            = np.empty(total_hits, np.int64)
+    t_entry_x_col         = np.empty(total_hits, np.float64)
+    t_entry_y_col         = np.empty(total_hits, np.float64)
+    t_entry_z_col         = np.empty(total_hits, np.float64)
+    t_exit_x_col          = np.empty(total_hits, np.float64)
+    t_exit_y_col          = np.empty(total_hits, np.float64)
+    t_exit_z_col          = np.empty(total_hits, np.float64)
+    distance_to_centre    = np.empty(total_hits, np.float64)
+    point_x_col           = np.empty(total_hits, np.float64)
+    point_y_col           = np.empty(total_hits, np.float64)
+    point_z_col           = np.empty(total_hits, np.float64)
+    echo_intensity_col    = np.empty(total_hits, np.float64)
+    return_number_col     = np.empty(total_hits, np.int32)
+    number_of_returns_col = np.empty(total_hits, np.int32)
+    normal_x_col          = np.empty(total_hits, np.float64)
+    normal_y_col          = np.empty(total_hits, np.float64)
+    normal_z_col          = np.empty(total_hits, np.float64)
+    point_weight_col      = np.empty(total_hits, np.float64)
+    viewing_angle_col     = np.empty(total_hits, np.float64)
+    hit_type_col          = np.empty(total_hits, np.int32)
+    is_leaf_col           = np.empty(total_hits, np.bool_)
+
+    # reusable scratch buffers sized to worst-case candidate list
+    hit_idx_tmp = np.empty(max(1, max_cand2), np.int64)
+    entry_tmp   = np.empty((max(1, max_cand2), 3), np.float64)
+    exit_tmp    = np.empty((max(1, max_cand2), 3), np.float64)
+
+    k = 0
+
+    # ---------- PASS 2: fill outputs using scratch buffers ----------
+    for r in range(n_rays):
+        _dda_mark_candidates(
+            origins[r], directions[r], origin_grid, cell_size,
+            bbox_min, bbox_max, keys_ix, keys_iy, keys_iz,
+            offsets, voxel_ids_flat, mask, eps
+        )  
+        
+        cand_idx = np.nonzero(mask)[0]
+        if cand_idx.size == 0:
+            continue
+
+        keep = _sphere_cull(origins[r], directions[r], v_centres, radius_sq, cand_idx, eps)
+        cand2 = cand_idx[keep]
+
+        # clear only touched bits
+        for i in range(cand_idx.size):
+            mask[cand_idx[i]] = False
+
+        if cand2.size == 0:
+            continue
+
+        hits_k = _slab_fill_candidates(
+            origins[r], directions[r], vmins, vmaxs, cand2, eps,
+            hit_idx_tmp, entry_tmp, exit_tmp
+        )
+
+        # viewing angle: compute once
+        dn = math.sqrt(directions[r,0]**2 + directions[r,1]**2 + directions[r,2]**2)
+        va = 0.0
+        if dn > 0.0:
+            cth = directions[r,2] / dn
+            if cth < -1.0: cth = -1.0
+            if cth >  1.0: cth =  1.0
+            ang = math.degrees(math.acos(cth))
+            va = ang if ang <= 90.0 else 180.0 - ang
+
+        p = points[r]
+        for h in range(hits_k):
+            vi = hit_idx_tmp[h]
+
+            # classification (unchanged logic)
+            vmin = vmins[vi]; vmax = vmaxs[vi]
+            in_voxel = (p[0] >= vmin[0]-eps and p[0] <= vmax[0]+eps and
+                        p[1] >= vmin[1]-eps and p[1] <= vmax[1]+eps and
+                        p[2] >= vmin[2]-eps and p[2] <= vmax[2]+eps)
+            unbound = (np.isnan(p[0]) or np.isnan(p[1]) or np.isnan(p[2]))
+            de = (origins[r,0]-entry_tmp[h,0])**2 + (origins[r,1]-entry_tmp[h,1])**2 + (origins[r,2]-entry_tmp[h,2])**2
+            dx = (origins[r,0]-exit_tmp[h,0])**2  + (origins[r,1]-exit_tmp[h,1])**2  + (origins[r,2]-exit_tmp[h,2])**2
+            dp = (origins[r,0]-p[0])**2 + (origins[r,1]-p[1])**2 + (origins[r,2]-p[2])**2
+            before = (de > dp) and (not in_voxel) and (not unbound)
+            after  = (dx < dp) and (not in_voxel) and (not unbound)
+            hit_type = -1
+            if unbound:   hit_type = 0
+            elif before:  hit_type = 1
+            elif in_voxel:hit_type = 2
+            elif after:   hit_type = 3
+
+            # fill columns (same dtypes/order as your schema)
+            voxel_size_col[k]     = v_sizes[vi]
+            voxel_id_col[k]       = v_ids[vi]
+            voxel_cx_col[k]       = v_centres[vi,0]
+            voxel_cy_col[k]       = v_centres[vi,1]
+            voxel_cz_col[k]       = v_centres[vi,2]
+            leg_id_col[k]         = leg_ids[r]
+            ray_id_col[k]         = ray_ids[r]
+            t_entry_x_col[k]      = entry_tmp[h,0]
+            t_entry_y_col[k]      = entry_tmp[h,1]
+            t_entry_z_col[k]      = entry_tmp[h,2]
+            t_exit_x_col[k]       = exit_tmp[h,0]
+            t_exit_y_col[k]       = exit_tmp[h,1]
+            t_exit_z_col[k]       = exit_tmp[h,2]
+            distance_to_centre[k] = math.sqrt((origins[r,0]-v_centres[vi,0])**2 +
+                                              (origins[r,1]-v_centres[vi,1])**2 +
+                                              (origins[r,2]-v_centres[vi,2])**2)
+            point_x_col[k]        = p[0]
+            point_y_col[k]        = p[1]
+            point_z_col[k]        = p[2]
+            echo_intensity_col[k] = echo_intensity[r]
+            return_number_col[k]  = int(return_number[r])      if not np.isnan(return_number[r])      else 0
+            number_of_returns_col[k] = int(number_of_returns[r]) if not np.isnan(number_of_returns[r]) else 0
+            normal_x_col[k]       = normals[r,0]
+            normal_y_col[k]       = normals[r,1]
+            normal_z_col[k]       = normals[r,2]
+            point_weight_col[k]   = point_weight[r]
+            viewing_angle_col[k]  = va
+            hit_type_col[k]       = hit_type
+            is_leaf_col[k]        = bool(is_leaf[r])
+            k += 1
+
+    # final tuple (same shape/order you expect)
+    data = (
+        voxel_size_col[:k], voxel_id_col[:k], voxel_cx_col[:k], voxel_cy_col[:k], voxel_cz_col[:k],
+        leg_id_col[:k], ray_id_col[:k],
+        t_entry_x_col[:k], t_entry_y_col[:k], t_entry_z_col[:k],
+        t_exit_x_col[:k],  t_exit_y_col[:k],  t_exit_z_col[:k],
+        distance_to_centre[:k],
+        point_x_col[:k], point_y_col[:k], point_z_col[:k],
+        echo_intensity_col[:k], return_number_col[:k], number_of_returns_col[:k],
+        normal_x_col[:k], normal_y_col[:k], normal_z_col[:k],
+        point_weight_col[:k], viewing_angle_col[:k], hit_type_col[:k], is_leaf_col[:k]
+    )
+    return data, k
+
+
 def _map_partition_numba(ray_part: pd.DataFrame, voxel_data: Dict[str, np.ndarray], eps: float) -> pd.DataFrame:
     if ray_part is None or len(ray_part) == 0:
         return pd.DataFrame(columns=voxel_ray_intersection_schema.names)
@@ -4286,6 +4529,131 @@ def _map_partition_numba(ray_part: pd.DataFrame, voxel_data: Dict[str, np.ndarra
     return df
 
 
+@njit(cache=True, fastmath=False)
+def _process_partition_pairs(
+    origins, directions,
+    leg_ids, ray_ids,
+    v_ids, v_sizes, v_centres, vmins, vmaxs,
+    origin_grid, cell_size, bbox_min, bbox_max,
+    keys_ix, keys_iy, keys_iz, offsets, voxel_ids_flat,
+    eps
+):
+    n_rays = origins.shape[0]
+    radius_sq = ((v_sizes * math.sqrt(3) * 0.5) + 0.05) ** 2
+
+    # Reusable mask
+    mask = np.zeros(v_sizes.shape[0], np.bool_)
+
+    # ---- PASS 1: count hits ----
+    total_hits = 0
+    for r in range(n_rays):
+        _dda_mark_candidates(origins[r], directions[r], origin_grid, cell_size,
+                             bbox_min, bbox_max, keys_ix, keys_iy, keys_iz,
+                             offsets, voxel_ids_flat, mask, eps)
+        cand_idx = np.nonzero(mask)[0]
+        if cand_idx.size == 0: continue
+        keep = _sphere_cull(origins[r], directions[r], v_centres, radius_sq, cand_idx, eps)
+        cand2 = cand_idx[keep]
+        for i in range(cand_idx.size):
+            mask[cand_idx[i]] = False
+        if cand2.size == 0: continue
+
+        # slab test (count only)
+        total_hits += _slab_count_only(origins[r], directions[r], vmins, vmaxs, cand2, eps)
+
+    # ---- allocate compact outputs ----
+    out_leg   = np.empty(total_hits, np.int64)
+    out_ray   = np.empty(total_hits, np.int64)
+    out_vox   = np.empty(total_hits, np.int64)
+    out_vsize = np.empty(total_hits, np.float64)
+
+    # ---- PASS 2: fill compact outputs ----
+    k = 0
+    # small scratch buffers
+    hit_idx_tmp = np.empty(1024, np.int64)  # grows if needed
+    entry_tmp   = np.empty((1024, 3), np.float64)
+    exit_tmp    = np.empty((1024, 3), np.float64)
+
+    for r in range(n_rays):
+        _dda_mark_candidates(origins[r], directions[r], origin_grid, cell_size,
+                             bbox_min, bbox_max, keys_ix, keys_iy, keys_iz,
+                             offsets, voxel_ids_flat, mask, eps)
+        cand_idx = np.nonzero(mask)[0]
+        if cand_idx.size == 0: continue
+        keep = _sphere_cull(origins[r], directions[r], v_centres, radius_sq, cand_idx, eps)
+        cand2 = cand_idx[keep]
+        for i in range(cand_idx.size):
+            mask[cand_idx[i]] = False
+        if cand2.size == 0: continue
+
+        # ensure scratch capacity
+        if cand2.size > hit_idx_tmp.shape[0]:
+            hit_idx_tmp = np.empty(cand2.size, np.int64)
+            entry_tmp   = np.empty((cand2.size, 3), np.float64)
+            exit_tmp    = np.empty((cand2.size, 3), np.float64)
+
+        hits_k = _slab_fill_candidates(
+            origins[r], directions[r], vmins, vmaxs, cand2, eps,
+            hit_idx_tmp, entry_tmp, exit_tmp
+        )
+
+        # write only IDs/sizes
+        for h in range(hits_k):
+            vi = hit_idx_tmp[h]
+            out_leg[k]   = leg_ids[r]
+            out_ray[k]   = ray_ids[r]
+            out_vox[k]   = v_ids[vi]
+            out_vsize[k] = v_sizes[vi]
+            k += 1
+
+    return (out_leg[:k], out_ray[:k], out_vox[:k], out_vsize[:k]), k
+
+
+
+def _map_partition_pairs(ray_part: pd.DataFrame, voxel_data: Dict[str, np.ndarray], eps: float = 1e-6) -> pd.DataFrame:
+    if ray_part is None or len(ray_part) == 0:
+        return pd.DataFrame(columns=['leg_id', 'ray_id', 'voxel_id', 'voxel_size'])
+
+    # Extract only what kernel needs
+    origins    = ray_part[['origin_x','origin_y','origin_z']].to_numpy(dtype=np.float64)
+    directions = ray_part[['direction_x','direction_y','direction_z']].to_numpy(dtype=np.float64)
+    leg_ids    = ray_part['leg_id'].to_numpy(dtype=np.int64)
+    ray_ids    = ray_part['ray_id'].to_numpy(dtype=np.int64)
+
+    v_ids     = voxel_data['ids'].astype(np.int64)
+    v_sizes   = voxel_data['sizes'].astype(np.float64)
+    v_centres = voxel_data['centres'].astype(np.float64)
+    vmins     = voxel_data['vmins'].astype(np.float64)
+    vmaxs     = voxel_data['vmaxs'].astype(np.float64)
+    origin_grid = voxel_data['origin'].astype(np.float64)
+    cell_size   = float(voxel_data['cell_size'])
+    bbox_min    = voxel_data['bbox_min'].astype(np.float64)
+    bbox_max    = voxel_data['bbox_max'].astype(np.float64)
+    keys_ix     = voxel_data['keys_ix'].astype(np.int32)
+    keys_iy     = voxel_data['keys_iy'].astype(np.int32)
+    keys_iz     = voxel_data['keys_iz'].astype(np.int32)
+    offsets     = voxel_data['offsets'].astype(np.int64)
+    voxel_ids_flat = voxel_data['voxel_ids_flat'].astype(np.int64)
+
+    data, k = _process_partition_pairs(
+        origins, directions, leg_ids, ray_ids,
+        v_ids, v_sizes, v_centres, vmins, vmaxs,
+        origin_grid, cell_size, bbox_min, bbox_max,
+        keys_ix, keys_iy, keys_iz, offsets, voxel_ids_flat,
+        np.float64(eps)
+    )
+
+    if k == 0:
+        return pd.DataFrame(columns=['leg_id', 'ray_id', 'voxel_id', 'voxel_size'])
+
+    return pd.DataFrame({
+        'leg_id':     data[0],
+        'ray_id':     data[1],
+        'voxel_id':   data[2],
+        'voxel_size': data[3],
+    })
+
+
 def voxel_ray_intersections_dask_new(valid_rays_dir: str,
                                  references_dir: str,
                                  voxel_chunk_size: int = 10000,
@@ -4295,7 +4663,7 @@ def voxel_ray_intersections_dask_new(valid_rays_dir: str,
                                  debug: bool = True,
                                  epsilon: float = 1e-6) -> None:
     memory_limit_str, n_workers, threads_per_worker = _determine_dask_resources(
-        cpus=cpus, mem=mem, optimal_threads=8
+        cpus=cpus, mem=mem, optimal_threads=2
     )
     client = _start_dask_client(
         n_workers=n_workers,
@@ -4313,26 +4681,16 @@ def voxel_ray_intersections_dask_new(valid_rays_dir: str,
 
     dask.config.set({"dataframe.shuffle.method": "tasks"})
 
+    start_time = time.time()
+
     voxel_refs = _compile_voxel_references(references_dir)
-    # print(f"voxel_refs: {voxel_refs.head()}")
+    voxel_data = _build_sparse_grid_arrays(voxel_refs, epsilon=epsilon)
     
-    # Chunk voxels into separate datasets for large sites
-    for i in range(0, len(voxel_refs), voxel_chunk_size):
-        # use a DataFrame slice so _build_sparse_grid_arrays receives the expected DataFrame
-        chunk_refs = voxel_refs.iloc[i:i+voxel_chunk_size].reset_index(drop=True)
-        chunk_voxel_data = _build_sparse_grid_arrays(chunk_refs, epsilon=epsilon)
-        dataset_name = f"voxel_data_chunk_{i//voxel_chunk_size}"
-        client.publish_dataset(**{dataset_name: chunk_voxel_data})
-        if debug:
-            print(f"Published dataset '{dataset_name}' with "
-                  f"{chunk_voxel_data['keys_ix'].shape[0]} occupied cells; "
-                  f"cell_size={chunk_voxel_data['cell_size']:.6f}")
+    scattered_vox = client.scatter(voxel_data, broadcast=True)
 
     valid_files = glob.glob(os.path.join(valid_rays_dir, '*_valid_rays.parquet'))
     if debug:
         print(f"Found {len(valid_files)} valid rays files.")
-
-    meta = pd.DataFrame(columns=voxel_ray_intersection_schema.names)
 
     def leg_from_filename(path: str) -> int:
         base = os.path.basename(path)
@@ -4342,61 +4700,206 @@ def voxel_ray_intersections_dask_new(valid_rays_dir: str,
         except Exception:
             return next((int(p) for p in parts if p.isdigit()), 0)
 
-    start_time = time.time()
-
-    # Build a single DDF with leg_id attached
     ddfs = []
     for file in valid_files:
         leg_id = leg_from_filename(file)
         ddf = dd.read_parquet(file, engine='pyarrow', split_row_groups=True)
         ddfs.append(ddf.assign(leg_id=leg_id))
+    
     all_ddf = dd.concat(ddfs, interleave_partitions=True)
 
-    # find published voxel chunk datasets
-    dataset_names = [name for name in client.list_datasets() if name.startswith("voxel_data_chunk_")]
-    if len(dataset_names) == 0:
-        # fallback to single dataset name if present
-        if "voxel_data" in client.list_datasets():
-            dataset_names = ["voxel_data"]
-
-    mapped_parts = []
-
-    def _map_with_vox(ray_part: pd.DataFrame, vox) -> pd.DataFrame:
-        vdata = vox.result() if hasattr(vox, "result") else vox
-        return _map_partition_numba(ray_part, vdata, eps=epsilon)
-
-    for ds_name in dataset_names:
-        vox = client.get_dataset(ds_name)
-        mapped_parts.append(all_ddf.map_partitions(_map_with_vox, vox, meta=meta))
-
-    # concat mapped results across voxel chunks so each partition is scheduled per voxel chunk
-    mapped = dd.concat(mapped_parts, interleave_partitions=True)
-
-    persisted = mapped.persist()
-    wait(persisted)
-
-    # Write one dataset partitioned by leg_id and voxel_size_rounded
-    persisted.to_parquet(
-        os.path.join(valid_rays_dir, "intersections"),
-        engine='pyarrow',
-        compression='snappy',
-        write_index=False,
-        partition_on=['leg_id', 'voxel_size'],
-        schema=voxel_ray_intersection_schema,
-        # overwrite=True,
+    meta_pairs = {
+        'leg_id': str(all_ddf['leg_id'].dtype),
+        'ray_id': str(all_ddf['ray_id'].dtype),
+        'voxel_id': str(voxel_data['ids'].dtype),
+        'voxel_size': str(voxel_data['sizes'].dtype)
+    }
+    pairs_ddf = all_ddf.map_partitions(
+        _map_partition_pairs, voxel_data, meta=meta_pairs
     )
 
-    del persisted
+    # 2) Prepare rays DDF (select only needed columns)
+    rays_ddf = all_ddf[['leg_id','ray_id',
+                        'origin_x','origin_y','origin_z',
+                        'direction_x','direction_y','direction_z',
+                        'point_x','point_y','point_z',
+                        'normal_x','normal_y','normal_z',
+                        'echo_intensity','return_number','number_of_returns',
+                        'point_weight','is_leaf']]
+
+    # 3) Prepare voxel refs DDF
+    voxels_df = _compile_voxel_references(references_dir)  # pandas DF
+    voxels_df = voxels_df[['voxel_id','voxel_cx','voxel_cy','voxel_cz','voxel_size']]
+    voxels_ddf = dd.from_pandas(voxels_df, npartitions=max(1, len(voxels_df)//10000))
+
+    # 4) Join pairs → rays → voxels
+    pairs_rays = pairs_ddf.merge(rays_ddf, on=['leg_id','ray_id'], how='left')
+    joined     = pairs_rays.merge(voxels_ddf, on=['voxel_id','voxel_size'], how='left')
+
+    del pairs_ddf
+    del rays_ddf
+    del voxels_ddf
+    del pairs_rays
     client.run(lambda: __import__("gc").collect())
 
+    # 5) Vectorized slab entry/exit using Dask DataFrame operations
+    eps = 1e-6
+    
+    # Compute vmins/vmaxs from centres and voxel_size
+    half = joined['voxel_size'] / 2.0
+    joined['vmin_x'] = joined['voxel_cx'] - half
+    joined['vmin_y'] = joined['voxel_cy'] - half
+    joined['vmin_z'] = joined['voxel_cz'] - half
+    joined['vmax_x'] = joined['voxel_cx'] + half
+    joined['vmax_y'] = joined['voxel_cy'] + half
+    joined['vmax_z'] = joined['voxel_cz'] + half
+    
+    # Safe inverse of direction components (avoid division by zero)
+    joined['invx'] = 1.0 / joined['direction_x'].where(joined['direction_x'].abs() > eps, eps)
+    joined['invy'] = 1.0 / joined['direction_y'].where(joined['direction_y'].abs() > eps, eps)
+    joined['invz'] = 1.0 / joined['direction_z'].where(joined['direction_z'].abs() > eps, eps)
+    
+    # Slab intersection calculations (t1, t2 per axis)
+    joined['t1x'] = (joined['vmin_x'] - joined['origin_x']) * joined['invx']
+    joined['t2x'] = (joined['vmax_x'] - joined['origin_x']) * joined['invx']
+    joined['t1y'] = (joined['vmin_y'] - joined['origin_y']) * joined['invy']
+    joined['t2y'] = (joined['vmax_y'] - joined['origin_y']) * joined['invy']
+    joined['t1z'] = (joined['vmin_z'] - joined['origin_z']) * joined['invz']
+    joined['t2z'] = (joined['vmax_z'] - joined['origin_z']) * joined['invz']
+    
+    # Min/max per axis
+    joined['tminx'] = joined[['t1x', 't2x']].min(axis=1)
+    joined['tmaxx'] = joined[['t1x', 't2x']].max(axis=1)
+    joined['tminy'] = joined[['t1y', 't2y']].min(axis=1)
+    joined['tmaxy'] = joined[['t1y', 't2y']].max(axis=1)
+    joined['tminz'] = joined[['t1z', 't2z']].min(axis=1)
+    joined['tmaxz'] = joined[['t1z', 't2z']].max(axis=1)
+    
+    # Entry/exit t parameters
+    joined['t_enter'] = joined[['tminx', 'tminy', 'tminz']].max(axis=1)
+    joined['t_exit'] = joined[['tmaxx', 'tmaxy', 'tmaxz']].min(axis=1)
+    
+    # 6) Entry/exit coordinates
+    entry_x = joined['origin_x'] + joined['t_enter'] * joined['direction_x']
+    entry_y = joined['origin_y'] + joined['t_enter'] * joined['direction_y']
+    entry_z = joined['origin_z'] + joined['t_enter'] * joined['direction_z']
+    exit_x = joined['origin_x'] + joined['t_exit'] * joined['direction_x']
+    exit_y = joined['origin_y'] + joined['t_exit'] * joined['direction_y']
+    exit_z = joined['origin_z'] + joined['t_exit'] * joined['direction_z']
+    
+    # 7) Viewing angle (zenith normalized to ≤ 90°)
+    dn = (joined['direction_x']**2 + joined['direction_y']**2 + joined['direction_z']**2).map_partitions(np.sqrt)
+    cth = (joined['direction_z'] / dn.map_partitions(lambda x: x.clip(lower=eps))).map_partitions(lambda x: x.clip(-1.0, 1.0))
+    ang = cth.map_partitions(np.arccos) * (180.0 / np.pi)
+    viewing_angle = ang.map_partitions(lambda x: x.where(x <= 90.0, 180.0 - x))
+    
+    # 8) Distance to centre
+    dist_c = ((joined['origin_x'] - joined['voxel_cx'])**2 + 
+              (joined['origin_y'] - joined['voxel_cy'])**2 + 
+              (joined['origin_z'] - joined['voxel_cz'])**2).map_partitions(np.sqrt)
+    
+    # 9) Classification
+    in_voxel = ((joined['point_x'] >= (joined['vmin_x'] - eps)) & 
+                (joined['point_x'] <= (joined['vmax_x'] + eps)) &
+                (joined['point_y'] >= (joined['vmin_y'] - eps)) & 
+                (joined['point_y'] <= (joined['vmax_y'] + eps)) &
+                (joined['point_z'] >= (joined['vmin_z'] - eps)) & 
+                (joined['point_z'] <= (joined['vmax_z'] + eps)))
+    unbound = (joined['point_x'].isna() | joined['point_y'].isna() | joined['point_z'].isna())
+    
+    de = ((joined['origin_x'] - entry_x)**2 + 
+          (joined['origin_y'] - entry_y)**2 + 
+          (joined['origin_z'] - entry_z)**2)
+    dx_ = ((joined['origin_x'] - exit_x)**2 + 
+           (joined['origin_y'] - exit_y)**2 + 
+           (joined['origin_z'] - exit_z)**2)
+    dp = ((joined['origin_x'] - joined['point_x'])**2 + 
+          (joined['origin_y'] - joined['point_y'])**2 + 
+          (joined['origin_z'] - joined['point_z'])**2)
+    
+    before = (de > dp) & (~in_voxel) & (~unbound)
+    after = (dx_ < dp) & (~in_voxel) & (~unbound)
+    
+    # Build hit_type using where() for conditional assignment
+    hit_type = joined['origin_x'].map_partitions(lambda x: pd.Series(-1, index=x.index, dtype=np.int32))
+    hit_type = hit_type.where(~unbound, 0)
+    hit_type = hit_type.where(~before, 1)
+    hit_type = hit_type.where(~in_voxel, 2)
+    hit_type = hit_type.where(~after, 3)
+
+    # 9) Assemble final DDF columns
+    result = joined.assign(
+        voxel_cx=joined['voxel_cx'], voxel_cy=joined['voxel_cy'], voxel_cz=joined['voxel_cz'],
+        t_entry_x=entry_x, t_entry_y=entry_y, t_entry_z=entry_z,
+        t_exit_x=exit_x,   t_exit_y=exit_y,   t_exit_z=exit_z,
+        distance_to_centre=dist_c,
+        viewing_angle=viewing_angle,
+        hit_type=hit_type
+    )
+
+    # 10) Write (stream; avoid persist)
+    result.to_parquet(
+        os.path.join(valid_rays_dir, "voxel_ray_intersections"),
+        engine='pyarrow', compression='snappy',
+        write_index=False,
+        partition_on=['leg_id','voxel_size'],
+        schema=voxel_ray_intersection_schema,
+        overwrite=True,
+        write_metadata_file=True
+    )
+
+    ### OLD ###
+    # # Build a single DDF with leg_id attached
+    # ddfs = []
+    # for file in valid_files:
+    #     leg_id = leg_from_filename(file)
+    #     ddf = dd.read_parquet(file, engine='pyarrow', split_row_groups=True)
+    #     ddfs.append(ddf.assign(leg_id=leg_id))
+    # all_ddf = dd.concat(ddfs, interleave_partitions=True)
+
+    # # find published voxel chunk datasets
+    # dataset_names = [name for name in client.list_datasets() if name.startswith("voxel_data_chunk_")]
+    # if len(dataset_names) == 0:
+    #     # fallback to single dataset name if present
+    #     if "voxel_data" in client.list_datasets():
+    #         dataset_names = ["voxel_data"]
+
+    # mapped_parts = []
+
+    # def _map_with_vox(ray_part: pd.DataFrame, vox) -> pd.DataFrame:
+    #     vdata = vox.result() if hasattr(vox, "result") else vox
+    #     return _map_partition_numba(ray_part, vdata, eps=epsilon)
+
+    # for ds_name in dataset_names:
+    #     vox = client.get_dataset(ds_name)
+    #     mapped_parts.append(all_ddf.map_partitions(_map_with_vox, vox, meta=meta))
+
+    # # concat mapped results across voxel chunks so each partition is scheduled per voxel chunk
+    # mapped = dd.concat(mapped_parts, interleave_partitions=True)
+
+    # persisted = mapped.persist()
+    # wait(persisted)
+
+    # # Write one dataset partitioned by leg_id and voxel_size_rounded
+    # persisted.to_parquet(
+    #     os.path.join(valid_rays_dir, "intersections"),
+    #     engine='pyarrow',
+    #     compression='snappy',
+    #     write_index=False,
+    #     partition_on=['leg_id', 'voxel_size'],
+    #     schema=voxel_ray_intersection_schema,
+    #     # overwrite=True,
+    # )
+
+    # del persisted
+    # client.run(lambda: __import__("gc").collect())
+
     end_time = time.time()
-    if debug:
-        print(f"[voxel_ray_intersections_dask] Completed in {end_time - start_time:.2f} s")
+    print(f"[voxel_ray_intersections_dask] Completed in {end_time - start_time:.2f} s")
 
     time.sleep(0.5)
     _close_dask_client(client)
-    if debug:
-        print("[voxel_ray_intersections_dask] Dask client closed.")
+    print("[voxel_ray_intersections_dask] Dask client closed.")
 
 
 def voxel_ray_intersections_dask(valid_rays_dir: str,
