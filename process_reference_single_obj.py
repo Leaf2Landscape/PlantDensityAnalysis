@@ -1073,7 +1073,11 @@ def process_voxel(
                     # hits
                     "num_leaf_hits": int(leaf_data.get("n_hits", np.nan)),
                     "num_lw_hits":   int(lw_data.get("n_hits", np.nan)),
+<<<<<<< HEAD
                     "num_hits":      int(lw_data.get("n_hits", np.nan)),   # kept for legacy parity
+=======
+                    "num_hits":      int(lw_data.get("n_hits", np.nan)),   # REMOVE IN REFACTOR
+>>>>>>> main
 
                     # interception / pgap
                     "I_leaf": float(leaf_data.get("I", np.nan)),
