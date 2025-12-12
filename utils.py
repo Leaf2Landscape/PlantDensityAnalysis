@@ -4679,7 +4679,7 @@ def voxel_ray_intersections_dask_new(valid_rays_dir: str,
         print(f"[voxel_ray_intersections_dask] Dask client: "
               f"workers={n_workers}, threads/worker={threads_per_worker}, mem/worker={memory_limit_str}")
 
-    dask.config.set({"dataframe.shuffle.method": "tasks"})
+    dask.config.set({"dataframe.shuffle.method": "p2p"})
 
     start_time = time.time()
 
@@ -4728,13 +4728,22 @@ def voxel_ray_intersections_dask_new(valid_rays_dir: str,
                         'point_weight','is_leaf']]
 
     # 3) Prepare voxel refs DDF
-    voxels_df = _compile_voxel_references(references_dir)  # pandas DF
-    voxels_df = voxels_df[['voxel_id','voxel_cx','voxel_cy','voxel_cz','voxel_size']]
-    voxels_ddf = dd.from_pandas(voxels_df, npartitions=max(1, len(voxels_df)//10000))
+    voxel_df = voxel_refs[['voxel_id','voxel_cx','voxel_cy','voxel_cz','voxel_size']]
+    voxels_ddf = dd.from_pandas(voxel_df, npartitions=256)
 
     # 4) Join pairs → rays → voxels
-    pairs_rays = pairs_ddf.merge(rays_ddf, on=['leg_id','ray_id'], how='left')
-    joined     = pairs_rays.merge(voxels_ddf, on=['voxel_id','voxel_size'], how='left')
+    pairs_rays = pairs_ddf.merge(
+        rays_ddf,
+        on=['leg_id','ray_id'],
+        how='left',
+        shuffle_method='p2p'
+    )
+    joined = pairs_rays.merge(
+        voxels_ddf, 
+        on=['voxel_id','voxel_size'], 
+        how='left',
+        shuffle_method='p2p'
+    )
 
     del pairs_ddf
     del rays_ddf
