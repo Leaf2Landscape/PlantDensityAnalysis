@@ -54,8 +54,18 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args": [
-                "/home/capheus/projects/RAJA_TEST/1001_etri_erecto_diamond.obj",
-                "--voxel_sizes", "2.0", "1.0", "0.5", "0.2", "--debug"
+                "/home/capheus/projects/1066_etri_RF3_6_inc200_diamond_plano/1066_etri_RF3_6_inc200_diamond_plano.obj",
+                "--voxel_sizes", "2.0"
+            ]
+        },
+        {
+            "name": "single_tree_HPC",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": [
+                "/scratch/project/veg3d/uqjrivor/ref_test/1066_etri_RF3_6_inc200_diamond_plano.obj",
             ]
         },
         {
