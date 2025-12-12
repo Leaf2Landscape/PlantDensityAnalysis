@@ -4288,6 +4288,7 @@ def _map_partition_numba(ray_part: pd.DataFrame, voxel_data: Dict[str, np.ndarra
 
 def voxel_ray_intersections_dask_new(valid_rays_dir: str,
                                  references_dir: str,
+                                 voxel_chunk_size: int = 10000,
                                  temp_dir: str | None = None,
                                  cpus: int | None = None,
                                  mem: int | None = None,
@@ -4313,13 +4314,19 @@ def voxel_ray_intersections_dask_new(valid_rays_dir: str,
     dask.config.set({"dataframe.shuffle.method": "tasks"})
 
     voxel_refs = _compile_voxel_references(references_dir)
-    voxel_data = _build_sparse_grid_arrays(voxel_refs, epsilon=epsilon)
-    if debug:
-        print(f"Sparse grid: {voxel_data['keys_ix'].shape[0]} occupied cells; "
-              f"cell_size={voxel_data['cell_size']:.6f}")
-
-    # Publish dataset for voxels
-    client.publish_dataset(voxel_data=voxel_data)
+    # print(f"voxel_refs: {voxel_refs.head()}")
+    
+    # Chunk voxels into separate datasets for large sites
+    for i in range(0, len(voxel_refs), voxel_chunk_size):
+        # use a DataFrame slice so _build_sparse_grid_arrays receives the expected DataFrame
+        chunk_refs = voxel_refs.iloc[i:i+voxel_chunk_size].reset_index(drop=True)
+        chunk_voxel_data = _build_sparse_grid_arrays(chunk_refs, epsilon=epsilon)
+        dataset_name = f"voxel_data_chunk_{i//voxel_chunk_size}"
+        client.publish_dataset(**{dataset_name: chunk_voxel_data})
+        if debug:
+            print(f"Published dataset '{dataset_name}' with "
+                  f"{chunk_voxel_data['keys_ix'].shape[0]} occupied cells; "
+                  f"cell_size={chunk_voxel_data['cell_size']:.6f}")
 
     valid_files = glob.glob(os.path.join(valid_rays_dir, '*_valid_rays.parquet'))
     if debug:
@@ -4345,11 +4352,25 @@ def voxel_ray_intersections_dask_new(valid_rays_dir: str,
         ddfs.append(ddf.assign(leg_id=leg_id))
     all_ddf = dd.concat(ddfs, interleave_partitions=True)
 
-    def _map(ray_part: pd.DataFrame) -> pd.DataFrame:
-        vox = get_client().get_dataset('voxel_data')
-        return _map_partition_numba(ray_part, vox, eps=epsilon)
+    # find published voxel chunk datasets
+    dataset_names = [name for name in client.list_datasets() if name.startswith("voxel_data_chunk_")]
+    if len(dataset_names) == 0:
+        # fallback to single dataset name if present
+        if "voxel_data" in client.list_datasets():
+            dataset_names = ["voxel_data"]
 
-    mapped = all_ddf.map_partitions(_map, meta=meta)
+    mapped_parts = []
+
+    def _map_with_vox(ray_part: pd.DataFrame, vox) -> pd.DataFrame:
+        vdata = vox.result() if hasattr(vox, "result") else vox
+        return _map_partition_numba(ray_part, vdata, eps=epsilon)
+
+    for ds_name in dataset_names:
+        vox = client.get_dataset(ds_name)
+        mapped_parts.append(all_ddf.map_partitions(_map_with_vox, vox, meta=meta))
+
+    # concat mapped results across voxel chunks so each partition is scheduled per voxel chunk
+    mapped = dd.concat(mapped_parts, interleave_partitions=True)
 
     persisted = mapped.persist()
     wait(persisted)
