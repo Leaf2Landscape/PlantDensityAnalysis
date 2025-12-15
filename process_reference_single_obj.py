@@ -8,6 +8,8 @@ import numpy as np
 import traceback
 import open3d as o3d
 import open3d.core as o3c
+o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
+
 import datetime as dt
 from typing import Optional
 import sys
@@ -23,6 +25,8 @@ import subprocess
 import pyvista as pv
 from typing import List, Tuple, Union, Optional
 from pathlib import Path
+    
+from numba import njit, prange
 
 temp_dir = os.getenv('TMPDIR', 'tmp')
 # temp_dir = "/scratch/project/veg3d/uqjrivor/Raja_Tumba_Test/tmp"
@@ -246,8 +250,6 @@ def tqdm_joblib(tqdm_object):
         joblib.parallel.BatchCompletionCallBack = old_callback
         tqdm_object.close()
 
-
-
 @memory.cache
 def load_mesh_trimesh(file_path: str) -> Optional[trimesh.Trimesh]:
     """
@@ -263,6 +265,82 @@ def load_mesh_trimesh(file_path: str) -> Optional[trimesh.Trimesh]:
     except Exception as e:
         print(f"Error loading mesh from {file_path}: {e}")
         return None
+    
+# Global leaf and wood mesh cache
+_LEAF_MESH = None
+_WOOD_MESH = None
+_LEAF_TREE = None
+_WOOD_TREE = None
+
+_LEAF_TRI_MIN = None
+_LEAF_TRI_MAX = None   
+_WOOD_TRI_MIN = None
+_WOOD_TRI_MAX = None
+
+
+def _ensure_clip_worker_meshes(leaf_mesh_path: str, wood_mesh_path: str, build_tree: bool=True):
+    """Ensure that the global leaf and wood meshes are loaded in the worker process.
+    """
+    global _LEAF_MESH, _WOOD_MESH
+    global _LEAF_TREE, _WOOD_TREE
+    global _LEAF_TRI_MIN, _LEAF_TRI_MAX
+    global _WOOD_TRI_MIN, _WOOD_TRI_MAX
+
+    if _LEAF_MESH is None:
+        _LEAF_MESH = load_mesh_trimesh(leaf_mesh_path)
+
+        if _LEAF_MESH is not None and not _LEAF_MESH.is_empty:
+            tris = _LEAF_MESH.triangles  # (N, 3, 3)
+            _LEAF_TRI_MIN = tris.min(axis=1)
+            _LEAF_TRI_MAX = tris.max(axis=1)
+            if build_tree:
+                _LEAF_TREE = _LEAF_MESH.triangles_tree  # built once per worker
+
+    if _WOOD_MESH is None:
+        _WOOD_MESH = load_mesh_trimesh(wood_mesh_path)
+        
+        if _WOOD_MESH is not None and not _WOOD_MESH.is_empty:
+            tris = _WOOD_MESH.triangles
+            _WOOD_TRI_MIN = tris.min(axis=1)
+            _WOOD_TRI_MAX = tris.max(axis=1)
+            if build_tree:
+                _WOOD_TREE = _WOOD_MESH.triangles_tree
+
+
+def _clip_one_mesh_with_aabb(mesh, tri_min, tri_max, voxel_center, voxel_size):
+    """Fast candidate selection via triangle AABB overlap; then clip via PyVista."""
+    if mesh is None or mesh.is_empty:
+        return (np.empty((0, 3), np.float64), np.empty((0, 3), np.int64))
+
+    half = voxel_size / 2.0
+    min_bound = np.asarray(voxel_center) - half
+    max_bound = np.asarray(voxel_center) + half
+    bounds6 = (min_bound[0], max_bound[0], min_bound[1], max_bound[1], min_bound[2], max_bound[2])
+
+    overlap = (tri_max >= min_bound).all(axis=1) & (tri_min <= max_bound).all(axis=1)
+    idx = np.flatnonzero(overlap)
+    if idx.size == 0:
+        return (np.empty((0, 3), np.float64), np.empty((0, 3), np.int64))
+
+    submesh = mesh.submesh([idx], append=True)
+    p_sub = pv.wrap(submesh)
+
+    # Prefer bounds param to avoid constructing a cube dataset
+    try:
+        clipped = p_sub.clip_box(bounds=bounds6, invert=False)
+    except TypeError:
+        cube = pv.Cube(center=voxel_center, x_length=voxel_size, y_length=voxel_size, z_length=voxel_size)
+        clipped = p_sub.clip_box(cube, invert=False)
+
+    if isinstance(clipped, pv.UnstructuredGrid):
+        clipped = clipped.extract_geometry()
+    if not clipped.is_all_triangles:
+        clipped = clipped.triangulate()
+
+    vertices = np.asarray(clipped.points)
+    faces = np.asarray(clipped.faces.reshape((-1, 4))[:, 1:])
+    return (vertices, faces)
+
     
 def _faces_to_poly(vertices, faces):
     """Convert trimesh faces to a format compatible with PyVista.
@@ -386,7 +464,7 @@ def get_clipped_meshes(
 
 def build_voxel_scene(o3d_leaf, o3d_wood):
     """Return (scene, leaf_id, wood_id)  either id may be None."""
-    scene = o3d.t.geometry.RaycastingScene()
+    scene = o3d.t.geometry.RaycastingScene(nthreads=psutil.cpu_count(logical=True))
     leaf_id = wood_id = None
     if (o3d_leaf is not None) and (len(o3d_leaf.triangles) > 0) and LEAF_OFF is False:
         leaf_id = scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(o3d_leaf))
@@ -467,14 +545,14 @@ def compute_efpl_array(d_arr, lambda_1):
 
 
 ### Ray tracing functions ###
-def _grid(voxel_size, spacing):
+def _grid(voxel_size, ray_spacing):
     """
     Generate a grid covering a square of size `face_len` centered at the origin.
     For full coverage when rotating the voxel, use face_len = voxel_size * sqrt(2).
     This ensures the grid covers the diagonal of the voxel after rotation.
     """
     face_len = voxel_size * np.sqrt(2)
-    s = np.arange(-face_len / 2, face_len / 2 + spacing, spacing)
+    s = np.arange(-face_len / 2, face_len / 2 + ray_spacing, ray_spacing)
     return np.meshgrid(s, s, indexing='xy')
 
 def generate_face_rays_bottom(vc, vs, grid):
@@ -636,6 +714,156 @@ def simulate_combined_mesh_with_points(scene, leaf_gid, wood_gid,
         var_efpl_free=efpl_f.var(ddof=1) if N > 1 else 0.0,
     )
     return stats_lw, stats_leaf, hit_details
+
+
+def simulate_voxel_grouped(scene, leaf_gid, wood_gid,
+                           voxel_center, voxel_size,
+                           rays_FAR6,  # shape (Faces,Angles,Rays,6), float32
+                           lambda_1):
+    """
+    Vectorized per-(face, angle) aggregation that matches your stats dictionaries.
+    Returns:
+      stats_lw[F][A], stats_leaf[F][A], each a dict like your original.
+    """
+    F, A, R, _ = rays_FAR6.shape
+    vc = np.asarray(voxel_center, dtype=np.float32)
+    bmin = vc - 0.5 * voxel_size
+    bmax = vc + 0.5 * voxel_size
+
+    O = rays_FAR6[..., 0:3]  # (F,A,R,3)
+    D = rays_FAR6[..., 3:6]  # (F,A,R,3)
+
+    # Compute t_near, t_far for ray-box intersection
+    t_near, t_far = ray_box_intersection_vectorized(
+        O.reshape(-1, 3), D.reshape(-1, 3), bmin, bmax
+    )
+    t_near = t_near.reshape(F, A, R)
+    t_far  = t_far.reshape(F, A, R)
+    valid_rays_mask = (t_near <= t_far) & (t_far >= 0.0)  # (F,A,R)
+
+    # Single cast_rays call
+    hits = scene.cast_rays(o3c.Tensor(rays_FAR6, dtype=o3c.float32))
+    # Each field returns with leading dims (F,A,R)
+    gids   = hits["geometry_ids"].numpy()      # (F,A,R), uint32 or int64
+    dists  = hits["t_hit"].numpy()             # (F,A,R), float32; inf for miss
+
+    # Valid hits inside the voxel slab
+    valid_hits_mask = np.isfinite(dists) & (dists >= t_near) & (dists <= t_far) & (dists >= 0) & valid_rays_mask
+
+    # Separate leaf vs wood by geometry_id
+    # Open3D returns INVALID_ID (typically 0xFFFFFFFF) on miss.
+    # We only consider valid_hits_mask anyway.
+    dist_leaf = np.full_like(dists, np.inf, dtype=np.float32)
+    dist_wood = np.full_like(dists, np.inf, dtype=np.float32)
+    if leaf_gid is not None:
+        m_leaf = (gids == leaf_gid) & valid_hits_mask
+        dist_leaf[m_leaf] = dists[m_leaf]
+    if wood_gid is not None:
+        m_wood = (gids == wood_gid) & valid_hits_mask
+        dist_wood[m_wood] = dists[m_wood]
+
+    # Combined (leaf+wood): first hit distance among the two
+    comb_dist = np.minimum(dist_leaf, dist_wood)  # (F,A,R)
+    hit_any   = np.isfinite(comb_dist)            # (F,A,R)
+    hit_leaf  = np.isfinite(dist_leaf)            # (F,A,R)
+
+    # Path lengths inside voxel
+    delta = np.zeros_like(dists, dtype=np.float32)
+    delta[valid_rays_mask] = (t_far[valid_rays_mask] - t_near[valid_rays_mask])
+
+    # z_arr for combined: distance from t_near to first intersection (leaf or wood)
+    z_lw = delta.copy()
+    z_lw[hit_any] = comb_dist[hit_any] - t_near[hit_any]
+
+    # z_arr for leaf-only: distance from t_near to leaf intersection
+    z_leaf = delta.copy()
+    z_leaf[hit_leaf] = dists[hit_leaf] - t_near[hit_leaf]
+
+    # Effective path length transforms (you already have compute_efpl_array)
+    # Compute only on valid rays to avoid NaNs
+    efpl_delta = np.zeros_like(delta, dtype=np.float32)
+    efpl_free_lw = np.zeros_like(z_lw, dtype=np.float32)
+    efpl_free_leaf = np.zeros_like(z_leaf, dtype=np.float32)
+
+    vf = valid_rays_mask
+    efpl_delta[vf]       = compute_efpl_array(delta[vf],   lambda_1).astype(np.float32)
+    efpl_free_lw[vf]     = compute_efpl_array(z_lw[vf],    lambda_1).astype(np.float32)
+    efpl_free_leaf[vf]   = compute_efpl_array(z_leaf[vf],  lambda_1).astype(np.float32)
+
+    # Aggregation helpers along axis=2 (per group)
+    N = valid_rays_mask.sum(axis=2).astype(np.int32)                 # (F,A)
+    n_hits_lw   = hit_any.sum(axis=2).astype(np.int32)               # (F,A)
+    n_hits_leaf = hit_leaf.sum(axis=2).astype(np.int32)              # (F,A)
+
+    sum_delta   = delta.sum(axis=2)                                  # (F,A)
+    delta_bar   = np.divide(sum_delta, N, out=np.zeros_like(sum_delta), where=(N > 0))
+
+    sum_z_lw    = z_lw.sum(axis=2)                                   # (F,A)
+    mean_z_lw   = np.divide(sum_z_lw, N, out=np.zeros_like(sum_z_lw), where=(N > 0))
+
+    sum_z_leaf  = z_leaf.sum(axis=2)                                 # (F,A)
+    mean_z_leaf = np.divide(sum_z_leaf, N, out=np.zeros_like(sum_z_leaf), where=(N > 0))
+
+    # efpl means/vars (ddof=1); compute sums and sums of squares
+    def mean_var_ddof1(x, N):
+        mx = x.sum(axis=2)
+        mean = np.divide(mx, N, out=np.zeros_like(mx), where=(N > 0))
+        mx2 = (x**2).sum(axis=2)
+        # var = (sum(x^2) - sum(x)^2 / N) / (N-1)
+        numer = mx2 - (mx * mx) / np.maximum(N, 1)
+        denom = np.maximum(N - 1, 1)
+        var = numer / denom
+        var[(N <= 1)] = 0.0
+        return mean, var
+
+    mean_delta_e, var_delta_e = mean_var_ddof1(efpl_delta, N)
+    mean_efpl_free_lw, var_efpl_free_lw = mean_var_ddof1(efpl_free_lw, N)
+    mean_efpl_free_leaf, var_efpl_free_leaf = mean_var_ddof1(efpl_free_leaf, N)
+
+    # Sum of efpl_free over hits-only
+    sum_hits_z_e_lw   = (efpl_free_lw * hit_any).sum(axis=2)
+    sum_hits_z_e_leaf = (efpl_free_leaf * hit_leaf).sum(axis=2)
+
+    # Build per-(face, angle) dicts that match your original structure
+    stats_lw  = [[None for _ in range(A)] for _ in range(F)]
+    stats_leaf= [[None for _ in range(A)] for _ in range(F)]
+
+    for f in range(F):
+        for a in range(A):
+            stats_lw[f][a] = dict(
+                N=int(N[f, a]),
+                n_hits=int(n_hits_lw[f, a]),
+                I=(float(n_hits_lw[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
+                delta_bar=float(delta_bar[f, a]),
+                sum_delta=float(sum_delta[f, a]),
+                sum_z=float(sum_z_lw[f, a]),
+                mean_z=float(mean_z_lw[f, a]),
+                mean_delta_e=float(mean_delta_e[f, a]),
+                var_delta_e=float(var_delta_e[f, a]),
+                sum_z_e=float(efpl_free_lw[f, a].sum(axis=0)),   # or sum over R keep consistent
+                sum_hits_z_e=float(sum_hits_z_e_lw[f, a]),
+                mean_efpl_free=float(mean_efpl_free_lw[f, a]),
+                var_efpl_free=float(var_efpl_free_lw[f, a]),
+            )
+            stats_leaf[f][a] = dict(
+                N=int(N[f, a]),
+                n_hits=int(n_hits_leaf[f, a]),
+                I=(float(n_hits_leaf[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
+                delta_bar=float(delta_bar[f, a]),
+                sum_delta=float(sum_delta[f, a]),
+                sum_z=float(sum_z_leaf[f, a]),
+                mean_z=float(mean_z_leaf[f, a]),
+                mean_delta_e=float(mean_delta_e[f, a]),
+                var_delta_e=float(var_delta_e[f, a]),
+                sum_z_e=float(efpl_free_leaf[f, a].sum(axis=0)),
+                sum_hits_z_e=float(sum_hits_z_e_leaf[f, a]),
+                mean_efpl_free=float(mean_efpl_free_leaf[f, a]),
+                var_efpl_free=float(var_efpl_free_leaf[f, a])       
+            )
+
+    return stats_lw, stats_leaf
+
+
 
 def compute_G_function_binwise(viewing_angles, leaf_bin_centers, LIAD_values):
     """
@@ -888,17 +1116,90 @@ def filter_voxel_centers(voxel_centers, leaf_bounds, wood_bounds, voxel_size):
     combined_mask = leaf_mask | wood_mask
 
     return voxel_centers[combined_mask]
+
+
+# Precompute rotation matrices once (outside voxel loop)
+def rotation_mx_x(deg):
+    a = np.deg2rad(deg); c, s = np.cos(a), np.sin(a)
+    return np.array([[1,0,0],[0,c,-s],[0,s,c]], dtype=np.float32)
+
+def rotation_mx_y(deg):
+    a = np.deg2rad(deg); c, s = np.cos(a), np.sin(a)
+    return np.array([[c,0,s],[0,1,0],[-s,0,c]], dtype=np.float32)
+
+# Precompute canonical face grids once (origins & directions relative to (0,0,0))
+# Then translate to voxel_center each time; no trig inside inner loops
+_GRIDS = {}
+def _build_canonical_grids(voxel_sizes, ray_spacing):
+    for vs in voxel_sizes:
+        grid = _grid(voxel_size=vs, ray_spacing=ray_spacing)
+        _GRIDS[vs] = {
+            "bottom": generate_face_rays_bottom(vc=np.array([0,0,0]), vs=vs, grid=grid),
+            "top":    generate_face_rays_top(vc=np.array([0,0,0]), vs=vs, grid=grid),
+            "xplus":  generate_side_rays_xplus(vc=np.array([0,0,0]), vs=vs, grid=grid),
+            "xminus": generate_side_rays_xminus(vc=np.array([0,0,0]), vs=vs, grid=grid),
+            "yplus":  generate_side_rays_yplus(vc=np.array([0,0,0]), vs=vs, grid=grid),
+            "yminus": generate_side_rays_yminus(vc=np.array([0,0,0]), vs=vs, grid=grid),
+        }
+
+# faces that rotate around y vs x (matches your current logic)
+rot_axis = {"xplus":"y","xminus":"y","bottom":"x","top":"x","yplus":"x","yminus":"x"}
+
+def build_ray_tensor_for_voxel(voxel_center, voxel_size, angles):
+    rays_list = []
+    labels = []  # (face_idx, angle_idx) per ray
+    face_order = ["bottom","top","xplus","xminus","yplus","yminus"]
+    angles_sorted = sorted(angles)
+
+    F = len(face_order)
+    A = len(angles_sorted)
+    R = _GRIDS[voxel_size][face_order[0]][0].shape[0]  # number of rays per face
+
+    rays = np.empty((F, A, R, 6), dtype=np.float32)  # preallocate
+    vc = voxel_center.astype(np.float32)
+
+    # Precompute rotation matrices once per angle
+    rot_x = {deg: rotation_mx_x(deg) for deg in angles_sorted}
+    rot_y = {deg: rotation_mx_y(deg) for deg in angles_sorted}
+
+    for f_idx, face in enumerate(face_order):
+        O_base, D_base = _GRIDS[voxel_size][face]         # relative to origin
+        O_trans = O_base + vc                           # translate to voxel_center (diagonal offset built into original grid)
+        for a_idx, deg in enumerate(angles_sorted):
+            Rmx = rot_y[deg] if rot_axis[face] == "y" else rot_x[deg]
+            # rotate directions about center; origins rotate around center too if you need orientation shift
+            D_rot = (D_base @ Rmx.T).astype(np.float32)
+            # (optional) rotate O around center: (O - center) @ Rmx.T + center
+            O_rot = ((O_trans - vc) @ Rmx.T + vc).astype(np.float32)
+
+            # Write rotated rays into preallocated array
+            rays[f_idx, a_idx, :, 0:3] = O_rot
+            rays[f_idx, a_idx, :, 3:6] = D_rot
+
+    return rays, face_order, angles_sorted
+
+@njit(parallel=True, fastmath=True)
+def group_counts(label_ids, t_hit, n_faces, n_angles):
+    # returns per-group stats; you can extend with sums/means of z, delta_e, etc.
+    counts = np.zeros((n_faces, n_angles), np.int32)
+    hits_n = np.zeros((n_faces, n_angles), np.int32)
+    for i in prange(label_ids.shape[0]):
+        lab = label_ids[i]
+        f_idx = (lab >> 16) & 0xFFFF
+        a_idx = lab & 0xFFFF
+        counts[f_idx, a_idx] += 1
+        if np.isfinite(t_hit[i]) and t_hit[i] > 0.0:
+            hits_n[f_idx, a_idx] += 1
+    return counts, hits_n
     
 def process_voxel(
-        voxel_center, 
-        voxel_size, 
-        o3d_leaf,
-        o3d_wood, 
-        ray_spacing, 
-        grid,
-        angles, 
-        wood_volume_points, 
-        lambda_1
+    voxel_center, 
+    voxel_size, 
+    o3d_leaf,
+    o3d_wood, 
+    angles, 
+    wood_volume_points, 
+    lambda_1
     ):
     """
     Process a single voxel center with the given parameters.
@@ -908,7 +1209,6 @@ def process_voxel(
 
     if o3d_leaf is None:
         print(f"[DEBUG] {voxel_center}: No leaf mesh after clipping. Skipping.")
-        # print(f"Voxel center {voxel_center} has no leaf mesh after clipping. Skipping.")
         return [], []
 
     # Build voxel scene
@@ -918,7 +1218,7 @@ def process_voxel(
         raise RuntimeError(
             f"Error building voxel scene for voxel at {voxel_center}: {e}"
         ) from e
-
+    
     # Reference areas / densities
     try:
         leaf_area = o3d_leaf.get_surface_area()
@@ -934,12 +1234,11 @@ def process_voxel(
         LAD_ref = leaf_area / (voxel_size ** 3)
         PAD_ref = (leaf_area + wood_area) / (voxel_size ** 3)
 
-        wood_vol = compute_wood_volume_in_voxel(wood_volume_points, voxel_center, voxel_size) if wood_volume_file is not None else 0.0
+        wood_vol = compute_wood_volume_in_voxel(wood_volume_points, voxel_center, voxel_size) if wood_volume_points is not None else 0.0
         if wood_vol != 0.0:
             alpha = (voxel_size ** 3 - wood_vol) / (voxel_size ** 3)
         else:
             alpha = None
-        # print(f"Processing voxel at {voxel_center} with LAI_leaf: {LAI_leaf}, LAI_lw: {LAI_lw}, LAD_ref: {LAD_ref}, PAD_ref: {PAD_ref}, alpha: {alpha}")
 
         # LIAD bins for voxel
         bin_leaf, liad_leaf, _ = compute_LIAD_from_mesh(o3d_leaf)
@@ -948,36 +1247,42 @@ def process_voxel(
 
         # Store the LIAD bins repeated on every row
         liad_dict = {f"LIAD_bin_{c:.1f}": float(v)
-                    for c, v in zip(bin_leaf, liad_leaf)}
+                for c, v in zip(bin_leaf, liad_leaf)}
     except Exception as e:
         raise RuntimeError(
             f"Error computing LAI, LIAD, or alpha for voxel at {voxel_center}: {e}"
         ) from e
     
+    # Raytrace from all angles simultaneously
+    rays_FAR6, face_order, angles_sorted = build_ray_tensor_for_voxel(
+    voxel_center=voxel_center, 
+    voxel_size=voxel_size, 
+    angles=angles)
+
+    # rays_FAR6 shape: (F, A, R, 6)
+    F, A, R, _ = rays_FAR6.shape
+    
+    # Cast all rays at once
+    hits = voxel_scene.cast_rays(o3d.core.Tensor(rays_FAR6, nthreads=psutil.cpu_count(logical=True), dtype=o3d.core.Dtype.Float32))
+    
+    t_hit = hits['t_hit'].numpy()  # (F, A, R)
+    geomid = hits['geometry_ids'].numpy()  # (F, A, R)
+    
+    # Use simulate_voxel_grouped for vectorized stats computation
+    stats_lw_grouped, stats_leaf_grouped = simulate_voxel_grouped(
+    voxel_scene, leaf_gid, wood_gid,
+    voxel_center, voxel_size,
+    rays_FAR6, lambda_1)
+    
+    # stats_lw_grouped and stats_leaf_grouped are lists of lists: [F][A] -> dict
     voxel_rows = []
-    faces = [
-        ("bottom", generate_face_rays_bottom),
-        ("top", generate_face_rays_top),
-        ("xplus", generate_side_rays_xplus),
-        ("xminus", generate_side_rays_xminus),
-        ("yplus", generate_side_rays_yplus),
-        ("yminus", generate_side_rays_yminus)
-    ]
+    
     try:
-        for face_lbl, face_fn in faces:
-            # print(f"[DEBUG] {voxel_center}: Processing face {face_lbl}")
-            o_base, d_base = face_fn(voxel_center, voxel_size, grid)
-            for angle in sorted(angles):
-                # print(f"[DEBUG] {voxel_center}: {face_lbl}: Processing angle {angle}")
-                ### Rotate rays ###
-                if face_lbl in ("xplus", "xminus"):
-                    rot_o, rot_d = rotate_rays(o_base, d_base, angle, voxel_center, axis='y')
-                else:
-                    rot_o, rot_d = rotate_rays(o_base, d_base, angle, voxel_center, axis='x')
-
-                ### Ray tracing ###
-                lw_data, leaf_data, _ = simulate_combined_mesh_with_points(voxel_scene, leaf_gid, wood_gid, voxel_center, voxel_size, rot_o, rot_d, lambda_1)
-
+        for f_idx, face_lbl in enumerate(face_order):
+            for a_idx, angle in enumerate(angles_sorted):
+                lw_data = stats_lw_grouped[f_idx][a_idx]
+                leaf_data = stats_leaf_grouped[f_idx][a_idx]
+                
                 if leaf_data["N"] == 0:
                     leaf_data = {k: np.nan for k in leaf_data}
                 if lw_data["N"] == 0:
@@ -985,7 +1290,7 @@ def process_voxel(
 
                 ### G ###
                 G_leaf_est = np.nan
-                if leaf_data ["n_hits"] >= MIN_HITS and bin_leaf.size > 0:
+                if leaf_data["n_hits"] >= MIN_HITS and bin_leaf.size > 0:
                     G_leaf_est = compute_G_function_binwise([angle], bin_leaf, liad_leaf)[0]
 
                 G_lw_est = np.nan
@@ -997,15 +1302,15 @@ def process_voxel(
                 pgap_lw = 1.0 - lw_data["I"]
 
                 ### CI from G ###
-                CI_leaf = (-math.log(pgap_lw) / (G_leaf_est * LAI_leaf)
-                        if (LAI_leaf > 0 and G_leaf_est > 0 and
-                            0 < pgap_lw < 1) else np.nan)
+                CI_leaf = (-math.log(pgap_leaf) / (G_leaf_est * LAI_leaf)
+                    if (LAI_leaf > 0 and G_leaf_est > 0 and
+                        0 < pgap_leaf < 1) else np.nan)
 
-                CI_lw   = (-math.log(pgap_lw) / (G_lw_est * LAI_leaf)
-                        if (LAI_leaf > 0 and G_lw_est > 0 and
-                            0 < pgap_lw < 1) else np.nan)
+                CI_lw   = (-math.log(pgap_lw) / (G_lw_est * LAI_lw)
+                    if (LAI_lw > 0 and G_lw_est > 0 and
+                        0 < pgap_lw < 1) else np.nan)
                 
-                ### LAD/PAD metrics 
+                ### LAD/PAD metrics ###
                 lad_leaf = compute_lad_metrics(
                     leaf_data["n_hits"], leaf_data["N"], G_leaf_est,
                     leaf_data["delta_bar"], leaf_data["mean_z"],
@@ -1023,18 +1328,16 @@ def process_voxel(
                     if lw_data["n_hits"] else 0.0)
                 
                 ### data prep ###
-                dx, dy, dz = rot_d[0]
                 leaf_fraction = (leaf_data["n_hits"] / lw_data["n_hits"]
-                                if lw_data["n_hits"] else np.nan)
+                        if lw_data["n_hits"] else np.nan)
                 
                 row = {
                     "voxel_cx": float(voxel_center[0]), "voxel_cy": float(voxel_center[1]), "voxel_cz": float(voxel_center[2]),
                     "face": face_lbl, "angle_deg": angle,
-                    "dx": float(dx), "dy": float(dy), "dz": float(dz),
 
                     # per-angle G
-                    "G_leaf_computed": float(G_leaf_est) if G_leaf_est is not None else np.nan,
-                    "G_lw_computed":  float(G_lw_est) if G_lw_est is not None else np.nan,
+                    "G_leaf_computed": float(G_leaf_est) if not np.isnan(G_leaf_est) else np.nan,
+                    "G_lw_computed":  float(G_lw_est) if not np.isnan(G_lw_est) else np.nan,
 
                     # reference densities
                     "LAI_Leaf": float(LAI_leaf) if LAI_leaf is not None else np.nan, 
@@ -1042,11 +1345,12 @@ def process_voxel(
                     "LAD_ref":  float(LAD_ref) if LAD_ref is not None else np.nan,  
                     "PAD_ref": float(PAD_ref) if PAD_ref is not None else np.nan,
 
-                    # CI from true G(ÃÂ¸)
-                    "CI_leaf": float(CI_leaf) if CI_leaf is not None else np.nan,
-                    "CI_lw":   float(CI_lw) if CI_lw is not None else np.nan,
+                    # CI from true G(θ)
+                    "CI_leaf": float(CI_leaf) if not np.isnan(CI_leaf) else np.nan,
+                    "CI_lw":   float(CI_lw) if not np.isnan(CI_lw) else np.nan,
                     "alpha":   float(alpha) if alpha is not None else np.nan,
-                    "leaf_fraction": float(leaf_fraction) if leaf_fraction is not None else np.nan,
+                    "leaf_fraction": float(leaf_fraction) if not np.isnan(leaf_fraction) else np.nan,
+                    
                     # LAD metrics
                     "LAD_BL":          float(lad_leaf.get("LAD_BL", np.nan)),
                     "LAD_BL_EPL":      float(lad_leaf.get("LAD_BL_EPL", np.nan)),
@@ -1061,11 +1365,12 @@ def process_voxel(
                     "PAD_MCF":         float(pad_lw.get("PAD_MCF", np.nan)),
                     "PAD_MCF_Corr":    float(pad_lw.get("PAD_MCF_Corrected", np.nan)),
                     "PAD_MLE_pimont_2018": float(pad_lw.get("PAD_MLE_pimont_2018", np.nan)),
+                    
                     # extra LAD estimates that lived in the PAD dict
                     "LAD_MLE_pimont_2019": float(pad_lw.get("LAD_MLE_pimont_2019", np.nan)),
                     "LAD_MLE_soma":        float(pad_lw.get("LAD_MLE_Soma_21",   np.nan)),
+                    
                     # raw stats
-                    # raw ray statistics
                     "Total_number_of_rays": int(lw_data.get("N", np.nan)),
                     "sum_path_length":      float(lw_data.get("sum_delta", np.nan)),
                     "mean_path_length":     float(lw_data.get("delta_bar", np.nan)),
@@ -1073,7 +1378,7 @@ def process_voxel(
                     # hits
                     "num_leaf_hits": int(leaf_data.get("n_hits", np.nan)),
                     "num_lw_hits":   int(lw_data.get("n_hits", np.nan)),
-                    "num_hits":      int(lw_data.get("n_hits", np.nan)),   # REMOVE IN REFACTOR
+                    "num_hits":      int(lw_data.get("n_hits", np.nan)),
 
                     # interception / pgap
                     "I_leaf": float(leaf_data.get("I", np.nan)),
@@ -1085,9 +1390,9 @@ def process_voxel(
                     "sum_free_path_length":           float(lw_data.get("sum_z",             np.nan)),
                     "sum_effective_free_path_length": float(lw_data.get("sum_z_e",           np.nan)),
                     "sum_effective_free_path_length_hit":
-                        float(lw_data.get("sum_hits_z_e", np.nan)),
+                    float(lw_data.get("sum_hits_z_e", np.nan)),
                     "sum_effective_free_path_length_hit_leaf":
-                        float(leaf_data.get("sum_hits_z_e", np.nan)),
+                    float(leaf_data.get("sum_hits_z_e", np.nan)),
 
                     "mean_free_path_length":              float(lw_data.get("mean_z",        np.nan)),
                     "mean_effective_path_length":         float(lw_data.get("mean_delta_e",  np.nan)),
@@ -1101,16 +1406,15 @@ def process_voxel(
 
                 voxel_rows.append(row)
     
-        # print(f"[DEBUG] {voxel_center}: Finished processing all faces and angles")
-    
     except Exception as e:
         raise RuntimeError(
             f"Error processing voxel at {voxel_center} with size {voxel_size}: {e}"
         ) from e
 
             
-    del o3d_leaf, o3d_wood, voxel_scene, rot_o, rot_d, lw_data, leaf_data
+    del o3d_leaf, o3d_wood, voxel_scene, lw_data, leaf_data
     gc.collect()
+
     return voxel_rows, []
 
 
@@ -1168,7 +1472,7 @@ if __name__ == "__main__":
     if os.environ.get("SLURM_CPUS_PER_TASK") is None:
         num_cpus = psutil.cpu_count(logical=True)
     else:
-        num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", psutil.cpu_count(logical=True)))
+        num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", psutil.cpu_count(logical=False)) * 2) # hyperthreading
     num_cpus = max(1, num_cpus)
 
     angles = [0.0000001, 10, 20, 30, 40, 50, 60, 70, 80, 89.9999]  # Example angles in degrees
@@ -1208,6 +1512,9 @@ if __name__ == "__main__":
         num_leaves = df['num_leaves'][0]
         total_leaf_area = df['total_leaf_area'][0]
 
+    # Build canonical grids for all voxel sizes
+    _build_canonical_grids(voxel_sizes, ray_spacing)
+
     for voxel_size in voxel_sizes:
         # Batch voxel centers into number of CPUs
         voxel_centers, voxel_ids = generate_voxel_centers(
@@ -1225,9 +1532,9 @@ if __name__ == "__main__":
 
 
 
-        def process_voxel_wrapper(voxel_center, leaf_mesh, wood_mesh, voxel_size, ray_spacing, grid, angles, wood_volume_points, lambda_1):
+        def process_voxel_wrapper(voxel_center, leaf_mesh, wood_mesh, voxel_size, angles, wood_volume_points, lambda_1):
             try:
-                args = (voxel_center, voxel_size, leaf_mesh, wood_mesh, ray_spacing, grid, angles, wood_volume_points, lambda_1)
+                args = (voxel_center, voxel_size, leaf_mesh, wood_mesh, angles, wood_volume_points, lambda_1)
                 result, placeholder = process_voxel(*args)
                 # print(f" Processed voxel {args[0]} successfully.")
                 return result, placeholder
@@ -1236,27 +1543,26 @@ if __name__ == "__main__":
                 traceback.print_exc()
                 return [], []
             
-        def parallel_clip_meshes(voxel_centers, voxel_size, leaf_mesh_file, wood_mesh_file, workers):
+        def clip_mesh_wrapper(
+                voxel_centers, 
+                voxel_size,
+                leaf_mesh_file,
+                wood_mesh_file,
+            ):
+            
+            _ensure_clip_worker_meshes(leaf_mesh_file, wood_mesh_file)
 
-            leaf_mesh = memory.cache(load_mesh_trimesh)(leaf_mesh_file)
-            wood_mesh = memory.cache(load_mesh_trimesh)(wood_mesh_file)
+            out = []
+            for c in voxel_centers:
+                leaf_v, leaf_f = _clip_one_mesh_with_aabb(_LEAF_MESH, _LEAF_TRI_MIN, _LEAF_TRI_MAX, c, voxel_size)
+                wood_v, wood_f = _clip_one_mesh_with_aabb(_WOOD_MESH, _WOOD_TRI_MIN, _WOOD_TRI_MAX, c, voxel_size)
+                out.append((c, leaf_v, leaf_f, wood_v, wood_f))
 
-            pbar = tqdm(total=len(voxel_centers), desc="Clipping meshes", unit="voxel")
-            with tqdm_joblib(pbar):
-                results = Parallel(n_jobs=workers, backend='loky', prefer="processes")(
-                    delayed(get_clipped_meshes)(leaf_mesh, wood_mesh, voxel_center, voxel_size)
-                    for voxel_center in voxel_centers
-                )
-            pbar.close()
-
-            return results
+            
+            return out
 
         # For each voxel_center batch, process the voxels in parallel
         start = dt.datetime.now()
-
-        ### PARALLEL TEST ###
-        leaf_mesh = memory.cache(load_mesh_trimesh)(leaf_mesh_file)
-        wood_mesh = memory.cache(load_mesh_trimesh)(wood_mesh_file)
 
         # Filter out voxel centers that are outside the bounds of leaf and wood meshes
         leaf_bounds = leaf_mesh.bounds.flatten() if leaf_mesh is not None else (0, 0, 0, 0, 0, 0)
@@ -1268,14 +1574,18 @@ if __name__ == "__main__":
             voxel_size=voxel_size
         )
 
-        pbar = tqdm(total=len(voxel_centers), desc="Clipping meshes", unit="voxel") 
+        batch_size = min(2048, len(voxel_centers) // num_cpus + 1)
+        voxel_center_batches = [voxel_centers[i:i + batch_size] for i in range(0, len(voxel_centers), batch_size)]
+
+        pbar = tqdm(total=len(voxel_center_batches), desc="Clipping meshes", unit=f"({batch_size} voxel batches)") 
         with tqdm_joblib(pbar):
-            results = Parallel(n_jobs=num_cpus, backend='loky', prefer="processes")(
-                    delayed(get_clipped_meshes)(leaf_mesh, wood_mesh, voxel_center, voxel_size)
-                    for voxel_center in voxel_centers
+            results = Parallel(n_jobs=num_cpus, backend='loky', prefer="processes", batch_size=1)(
+                    delayed(clip_mesh_wrapper)(voxel_center_batch, voxel_size, leaf_mesh_file, wood_mesh_file)
+                    for voxel_center_batch in voxel_center_batches
                 )
             pbar.close()
 
+        results = [item for sublist in results for item in sublist]  # Flatten list of lists
         clipped_voxel_centres, clipped_leaf_vertices, clipped_leaf_faces, clipped_wood_vertices, clipped_wood_faces = zip(*results)
         valid_indices = [i for i, (v, lv, lf, wv, wf) in enumerate(results) if lv.shape[0] != 0 or lf.shape[0] != 0 or wv.shape[0] != 0 or wf.shape[0] != 0]
 
@@ -1329,8 +1639,6 @@ if __name__ == "__main__":
         worker = partial(
             process_voxel_wrapper,
             voxel_size=voxel_size,
-            ray_spacing=ray_spacing,
-            grid=grid,
             angles=angles,
             wood_volume_points=wood_volume_points,
             lambda_1=lambda_1
