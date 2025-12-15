@@ -4669,6 +4669,7 @@ def _map_partition_pairs(ray_part: pd.DataFrame, eps: float = 1e-6) -> pd.DataFr
 
 def voxel_ray_intersections_dask_new(valid_rays_dir: str,
                                  references_dir: str,
+                                 output_path: str | None = None,
                                  temp_dir: str | None = None,
                                  cpus: int | None = None,
                                  mem: int | None = None,
@@ -4868,8 +4869,9 @@ def voxel_ray_intersections_dask_new(valid_rays_dir: str,
     )
 
     # 10) Write (stream; avoid persist)
+    output_path = output_path if output_path is not None else os.path.join(valid_rays_dir, "voxel_ray_intersections")
     result.to_parquet(
-        os.path.join(valid_rays_dir, "voxel_ray_intersections"),
+        output_path,
         engine='pyarrow', compression='snappy',
         write_index=False,
         partition_on=['leg_id','voxel_size'],
@@ -5461,7 +5463,18 @@ def lad_bl_suite(num_rays,
     return tuple(map(_bl_gap,
                      (P_first, P_equal, P_int, P_ideal, P_exact)))
 
-def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_multireturn=False, is_leaf_true=True, debug=True, epsilon=1e-9):
+def get_voxel_metrics(
+        intersections_ddf, 
+        lambda_1, 
+        cpus: int | None = None,
+        mem: int | None = None,
+        optimal_threads: int = 2,
+        beam_divergence: float = 0.35, 
+        is_multireturn: bool = False, 
+        is_leaf_true: bool = True, 
+        debug: bool = True, 
+        epsilon: float = 1e-9
+    ):
     """
     This function will take the voxel_ray_intersection files and calculate the metrics for each voxel.
     It will save the results to a parquet file.
@@ -5486,13 +5499,21 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
     from dask.distributed import Client
     from collections import defaultdict
 
-    avail_cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', psutil.cpu_count(logical=True)))
-    threads = 1 if not os.environ.get('SLURM_CPUS_PER_TASK') else 2
-    avail_mem = int(float(os.environ.get('SLURM_MEM_PER_NODE', psutil.virtual_memory().available // (1024 * 1024)))) # in MB
-    avail_mem = avail_mem * 0.9 // 1024 # Use 80% of available memory and convert to GB
-    mem_limit = avail_mem // avail_cpus
-    mem_limit = f"{mem_limit}GB"
-    _start_dask_client(memory_limit=mem_limit, n_workers=avail_cpus)
+    mem_string_for_dask, n_workers, threads_per_worker, _ = _determine_dask_resources(
+        cpus=cpus,
+        mem=mem,
+        optimal_threads=optimal_threads
+    )
+
+    _start_dask_client(
+        n_workers=n_workers,
+        threads_per_worker=threads_per_worker,
+        memory_limit=mem_string_for_dask,
+        memory_target_fraction=0.7,
+        memory_spill_fraction=0.9,
+        memory_pause_fraction=0.95,
+        processes=True
+    )
 
     # Per voxel function
     def calculate_voxel_metrics_per_voxel(voxel_df, min_rays=6, epsilon=1e-9):
@@ -6014,23 +6035,10 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
     schema = voxel_metrics_schema_singlereturn if not is_multireturn else voxel_metrics_schema_multireturn
     meta = _gen_dataframe(schema)
 
-    # Read all parquets into dask dataframe
-    dfs = []
-    for file in intersections_files:
-        if os.path.exists(file):
-            df = dd.read_parquet(file, engine='pyarrow')
-
-            dfs.append(df)
-
-    if len(dfs) == 0:
-        raise ValueError("No valid voxel_ray_intersection files found.")
-    
-    # Combine all dataframes into one
-    voxel_intersections_df = dd.concat(dfs, axis=0, ignore_index=True)
     # Ensure 'voxel_id' remains a column and group by it directly to compute per-voxel metrics
     # (don't set 'voxel_id' as the DataFrame index, since subsequent grouping expects it as a column)
     # Map to per-voxel calculation via dask groupby.apply with the provided meta
-    voxel_metrics_df = voxel_intersections_df.groupby('voxel_id').apply(
+    voxel_metrics_df = intersections_ddf.groupby('voxel_id').apply(
         calculate_voxel_metrics_per_voxel,
         meta=meta,
         include_groups=False
