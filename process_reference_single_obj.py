@@ -472,7 +472,7 @@ def build_voxel_scene(o3d_leaf, o3d_wood):
         mesh_leaf = mesh_leaf.to(dev)
         if mesh_wood is not None:
             mesh_wood = mesh_wood.to(dev)
-        print("[INFO] Using CUDA for raycasting.")
+        # print("[INFO] Using CUDA for raycasting.")
     except Exception as e:
         # Fallback to CPU
         dev = o3d.core.Device("CPU:0")
