@@ -464,7 +464,21 @@ def get_clipped_meshes(
 
 def build_voxel_scene(o3d_leaf, o3d_wood):
     """Return (scene, leaf_id, wood_id)  either id may be None."""
-    scene = o3d.t.geometry.RaycastingScene(nthreads=psutil.cpu_count(logical=True))
+    
+    try:
+        # Try GPU (CUDA:0)
+        dev = o3d.core.Device("CUDA:0")
+        scene = o3d.t.geometry.RaycastingScene(device=dev)
+        mesh_leaf = mesh_leaf.to(dev)
+        if mesh_wood is not None:
+            mesh_wood = mesh_wood.to(dev)
+        print("[INFO] Using CUDA for raycasting.")
+    except Exception as e:
+        # Fallback to CPU
+        dev = o3d.core.Device("CPU:0")
+        scene = o3d.t.geometry.RaycastingScene(device=dev)
+        print("[INFO] CUDA unavailable, falling back to CPU.")
+
     leaf_id = wood_id = None
     if (o3d_leaf is not None) and (len(o3d_leaf.triangles) > 0) and LEAF_OFF is False:
         leaf_id = scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(o3d_leaf))
@@ -1263,7 +1277,7 @@ def process_voxel(
     F, A, R, _ = rays_FAR6.shape
     
     # Cast all rays at once
-    hits = voxel_scene.cast_rays(o3d.core.Tensor(rays_FAR6, nthreads=psutil.cpu_count(logical=True), dtype=o3d.core.Dtype.Float32))
+    hits = voxel_scene.cast_rays(o3d.core.Tensor(rays_FAR6, dtype=o3d.core.Dtype.Float32))
     
     t_hit = hits['t_hit'].numpy()  # (F, A, R)
     geomid = hits['geometry_ids'].numpy()  # (F, A, R)
@@ -1411,10 +1425,7 @@ def process_voxel(
             f"Error processing voxel at {voxel_center} with size {voxel_size}: {e}"
         ) from e
 
-            
-    del o3d_leaf, o3d_wood, voxel_scene, lw_data, leaf_data
-    gc.collect()
-
+    # print(f"[DEBUG] Processed voxel at {voxel_center} with size {voxel_size}, generated {len(voxel_rows)} rows.")
     return voxel_rows, []
 
 
