@@ -1604,6 +1604,15 @@ if __name__ == "__main__":
     cached_wood_mesh = memory.cache(load_mesh_trimesh)(wood_mesh_file)
     set_clip_globals(cached_leaf_mesh, cached_wood_mesh)
 
+    
+    # Warm up the clipping function
+    _ = _clip_one_mesh_with_aabb(_CLIP_GLOBALS['leaf_mesh'],
+                             _CLIP_GLOBALS['leaf_tri_min'],
+                             _CLIP_GLOBALS['leaf_tri_max'],
+                             voxel_center=np.asarray([0,0,0], dtype=float),
+                             voxel_size=voxel_sizes[0])
+
+
     wood_volume_file = os.path.join(os.path.dirname(args.scene_file), os.path.basename(args.scene_file).replace(".obj", f"_inside_voxels_size{args.wood_volume_voxel_size}_thresh{args.wood_volume_threshold}.txt"))
     if not os.path.exists(wood_volume_file):
         print(f"Wood volume file {wood_volume_file} does not exist. Generating wood volume data.")
