@@ -4768,7 +4768,9 @@ def voxel_ray_intersections_dask_new(valid_rays_dir: str,
     del rays_ddf
     del voxels_ddf
     del pairs_rays
+
     client.run(lambda: __import__("gc").collect())
+    time.sleep(0.5) # Ensure memory is freed
 
     # 5) Vectorized slab entry/exit using Dask DataFrame operations
     eps = 1e-6
