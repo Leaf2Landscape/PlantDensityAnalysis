@@ -1470,8 +1470,10 @@ if __name__ == "__main__":
     print("JOBLIB_TEMP_FOLDER:", os.environ.get('JOBLIB_TEMP_FOLDER'))
     print("tempfile.gettempdir():", tempfile.gettempdir())
 
-    import joblib
-    print("joblib:",print("joblib:", joblib.__file__))
+    import joblib, loky
+    print("joblib:", joblib.__version__)
+    print("loky:", loky.__version__)
+    print("loky file", loky.__file__)
 
 
     # Check for CUDA device availability with Open3D
