@@ -1640,13 +1640,18 @@ if __name__ == "__main__":
         batch_size = min(2048, len(voxel_centers) // num_cpus + 1)
         voxel_center_batches = [voxel_centers[i:i + batch_size] for i in range(0, len(voxel_centers), batch_size)]
 
-        pbar = tqdm(total=len(voxel_center_batches), desc="Clipping meshes", unit=f"({batch_size} voxel batches)") 
-        with tqdm_joblib(pbar):
-            results = Parallel(n_jobs=num_cpus, backend='loky', prefer="processes")(
-                    delayed(clip_mesh_wrapper)(voxel_center_batch, voxel_size, leaf_mesh_file, wood_mesh_file)
-                    for voxel_center_batch in voxel_center_batches
-                )
-            pbar.close()
+        # pbar = tqdm(total=len(voxel_center_batches), desc="Clipping meshes", unit=f"({batch_size} voxel batches)") 
+        # with tqdm_joblib(pbar):
+        import time
+        clip_start = time.time()
+        results = Parallel(n_jobs=num_cpus, backend='loky', prefer="processes")(
+                delayed(clip_mesh_wrapper)(voxel_center_batch, voxel_size, leaf_mesh_file, wood_mesh_file)
+                for voxel_center_batch in voxel_center_batches
+            )
+            # pbar.close()
+        clip_end = time.time()
+        print(f"Clipping meshes took {clip_end - clip_start:.2f} seconds")
+        print(f"Per batch: {(clip_end - clip_start)/len(voxel_center_batches):.2f} seconds")
 
         results = [item for sublist in results for item in sublist]  # Flatten list of lists
         clipped_voxel_centres, clipped_leaf_vertices, clipped_leaf_faces, clipped_wood_vertices, clipped_wood_faces = zip(*results)
