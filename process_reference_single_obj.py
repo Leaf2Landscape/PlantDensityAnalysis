@@ -1443,6 +1443,61 @@ def process_voxel(
     # print(f"[DEBUG] Processed voxel at {voxel_center} with size {voxel_size}, generated {len(voxel_rows)} rows.")
     return voxel_rows, []
 
+# NEW Clipping parallel logic
+
+# ---- Global cache for threading-based clipping ----
+_CLIP_GLOBALS = {
+    'leaf_mesh': None,
+    'wood_mesh': None,
+    'leaf_tri_min': None,
+    'leaf_tri_max': None,
+    'wood_tri_min': None,
+    'wood_tri_max': None,
+}
+
+def set_clip_globals(leaf_mesh, wood_mesh):
+    """
+    Populate module-level globals once in the parent process.
+    Threads will read from these; no pickling or joblib.Memory in workers.
+    """
+    g = _CLIP_GLOBALS
+    g['leaf_mesh'] = leaf_mesh
+    g['wood_mesh'] = wood_mesh
+
+    # Precompute triangle AABB mins/maxs once
+    if leaf_mesh is not None and not leaf_mesh.is_empty:
+        tris = leaf_mesh.triangles  # (N, 3, 3)
+        g['leaf_tri_min'] = tris.min(axis=1)
+        g['leaf_tri_max'] = tris.max(axis=1)
+    else:
+        g['leaf_tri_min'] = None
+        g['leaf_tri_max'] = None
+
+    if wood_mesh is not None and not wood_mesh.is_empty:
+        tris = wood_mesh.triangles
+        g['wood_tri_min'] = tris.min(axis=1)
+        g['wood_tri_max'] = tris.max(axis=1)
+    else:
+        g['wood_tri_min'] = None
+        g['wood_tri_max'] = None
+
+def clip_one_thread(voxel_center, voxel_size):
+    """
+    Thread worker: clip both leaf and wood using the shared globals.
+    Returns (center, leaf_vertices, leaf_faces, wood_vertices, wood_faces).
+    """
+    g = _CLIP_GLOBALS
+    leaf_v, leaf_f = _clip_one_mesh_with_aabb(
+        g['leaf_mesh'], g['leaf_tri_min'], g['leaf_tri_max'],
+        voxel_center, voxel_size
+    )
+    wood_v, wood_f = _clip_one_mesh_with_aabb(
+        g['wood_mesh'], g['wood_tri_min'], g['wood_tri_max'],
+        voxel_center, voxel_size
+    )
+    return (voxel_center, leaf_v, leaf_f, wood_v, wood_f)
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process voxel batch.")
@@ -1547,6 +1602,7 @@ if __name__ == "__main__":
     # Cache mesh loading using joblib.Memory
     cached_leaf_mesh = memory.cache(load_mesh_trimesh)(leaf_mesh_file)
     cached_wood_mesh = memory.cache(load_mesh_trimesh)(wood_mesh_file)
+    set_clip_globals(cached_leaf_mesh, cached_wood_mesh)
 
     wood_volume_file = os.path.join(os.path.dirname(args.scene_file), os.path.basename(args.scene_file).replace(".obj", f"_inside_voxels_size{args.wood_volume_voxel_size}_thresh{args.wood_volume_threshold}.txt"))
     if not os.path.exists(wood_volume_file):
@@ -1640,20 +1696,14 @@ if __name__ == "__main__":
         batch_size = min(2048, len(voxel_centers) // num_cpus + 1)
         voxel_center_batches = [voxel_centers[i:i + batch_size] for i in range(0, len(voxel_centers), batch_size)]
 
-        # pbar = tqdm(total=len(voxel_center_batches), desc="Clipping meshes", unit=f"({batch_size} voxel batches)") 
-        # with tqdm_joblib(pbar):
-        import time
-        clip_start = time.time()
-        results = Parallel(n_jobs=num_cpus, backend='loky', prefer="processes")(
-                delayed(clip_mesh_wrapper)(voxel_center_batch, voxel_size, leaf_mesh_file, wood_mesh_file)
-                for voxel_center_batch in voxel_center_batches
-            )
-            # pbar.close()
-        clip_end = time.time()
-        print(f"Clipping meshes took {clip_end - clip_start:.2f} seconds")
-        print(f"Per batch: {(clip_end - clip_start)/len(voxel_center_batches):.2f} seconds")
+        pbar = tqdm(total=len(voxel_center_batches), desc="Clipping meshes", unit=f"({batch_size} voxel batches)") 
+        with tqdm_joblib(pbar):
+            results = Parallel(n_jobs=num_cpus, backend='threading')(
+                    delayed(clip_one_thread)(voxel_center, voxel_size) for voxel_center_batch in voxel_center_batches for voxel_center in voxel_center_batch
+                )
+            pbar.close()
 
-        results = [item for sublist in results for item in sublist]  # Flatten list of lists
+        # results = [item for sublist in results for item in sublist]  # Flatten list of lists
         clipped_voxel_centres, clipped_leaf_vertices, clipped_leaf_faces, clipped_wood_vertices, clipped_wood_faces = zip(*results)
         valid_indices = [i for i, (v, lv, lf, wv, wf) in enumerate(results) if lv.shape[0] != 0 or lf.shape[0] != 0 or wv.shape[0] != 0 or wf.shape[0] != 0]
 
