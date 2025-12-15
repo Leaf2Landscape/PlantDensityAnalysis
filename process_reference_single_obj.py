@@ -1593,6 +1593,7 @@ if __name__ == "__main__":
     else:
         num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", psutil.cpu_count(logical=False)) * 2) # hyperthreading
     num_cpus = max(1, num_cpus)
+    n_workers = min(32, num_cpus)
 
     angles = [0.0000001, 10, 20, 30, 40, 50, 60, 70, 80, 89.9999]  # Example angles in degrees
 
@@ -1705,7 +1706,7 @@ if __name__ == "__main__":
 
         pbar = tqdm(total=len(voxel_centers), desc="Clipping meshes", unit="voxels") 
         with tqdm_joblib(pbar):
-            results = Parallel(n_jobs=num_cpus, backend='threading')(
+            results = Parallel(n_jobs=n_workers, backend='threading')(
                     delayed(clip_one_thread)(voxel_center, voxel_size) for voxel_center in voxel_centers
                 )
             pbar.close()

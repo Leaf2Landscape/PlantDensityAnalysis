@@ -55,7 +55,7 @@
             "console": "integratedTerminal",
             "args": [
                 "/home/capheus/projects/1066_etri_RF3_6_inc200_diamond_plano/1066_etri_RF3_6_inc200_diamond_plano.obj",
-                "--voxel_sizes", "2.0"
+                "--voxel_sizes", "0.2"
             ]
         },
         {
