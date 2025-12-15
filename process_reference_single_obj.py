@@ -1463,6 +1463,17 @@ if __name__ == "__main__":
     os.environ['JOBLIB_TEMP_FOLDER'] = os.environ.get('TMPDIR', '/tmp') + '/joblib'
     os.makedirs(os.environ['JOBLIB_TEMP_FOLDER'], exist_ok=True)
 
+    
+    import os, sys, tempfile
+    print("Python:", sys.executable)
+    print("TMPDIR:", os.environ.get('TMPDIR'))
+    print("JOBLIB_TEMP_FOLDER:", os.environ.get('JOBLIB_TEMP_FOLDER'))
+    print("tempfile.gettempdir():", tempfile.gettempdir())
+
+    import joblib
+    print("joblib:",print("joblib:", joblib.__file__))
+
+
     # Check for CUDA device availability with Open3D
     _CUDA_DEVICE_ID = None
     try:
@@ -1531,7 +1542,6 @@ if __name__ == "__main__":
 
     # Process each voxel center in parallel and collect results
     # Use joblib's Memory to cache mesh loading, and pass cached mesh objects to loky workers
-
     # Cache mesh loading using joblib.Memory
     cached_leaf_mesh = memory.cache(load_mesh_trimesh)(leaf_mesh_file)
     cached_wood_mesh = memory.cache(load_mesh_trimesh)(wood_mesh_file)
