@@ -1693,13 +1693,11 @@ if __name__ == "__main__":
             voxel_size=voxel_size
         )
 
-        batch_size = min(2048, len(voxel_centers) // num_cpus + 1)
-        voxel_center_batches = [voxel_centers[i:i + batch_size] for i in range(0, len(voxel_centers), batch_size)]
 
-        pbar = tqdm(total=len(voxel_center_batches), desc="Clipping meshes", unit=f"({batch_size} voxel batches)") 
+        pbar = tqdm(total=len(voxel_centers), desc="Clipping meshes", unit="voxels") 
         with tqdm_joblib(pbar):
             results = Parallel(n_jobs=num_cpus, backend='threading')(
-                    delayed(clip_one_thread)(voxel_center, voxel_size) for voxel_center_batch in voxel_center_batches for voxel_center in voxel_center_batch
+                    delayed(clip_one_thread)(voxel_center, voxel_size) for voxel_center in voxel_centers
                 )
             pbar.close()
 
