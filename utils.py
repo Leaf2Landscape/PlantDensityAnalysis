@@ -3774,7 +3774,13 @@ def _compile_voxel_references(references_dir: str) -> pd.DataFrame:
 
 
 # Calculate avail_cpus, avail_mem, and return optimal worker/thread config
-def _determine_dask_resources(cpus: int | None, mem: int | None, optimal_threads: int = 8, mem_threshold: float = 0.7) -> tuple[str, int, int]:
+def _determine_dask_resources(
+        cpus: int | None, 
+        mem: int | None, 
+        optimal_threads: int = 8, 
+        mem_threshold: float = 0.7,
+        partition_worker_ratio: float = 0.001
+    ) -> tuple[str, int, int, str]:
     """
     Determine available CPUs and memory for Dask configuration.
     Returns (avail_cpus, avail_mem_string_for_dask, optimal_workers, threads_per_worker).
@@ -3800,7 +3806,10 @@ def _determine_dask_resources(cpus: int | None, mem: int | None, optimal_threads
     memory_worker = avail_mem / n_workers
     avail_mem_string_for_dask = f"{int(memory_worker)}MB"
 
-    return avail_mem_string_for_dask, n_workers, threads_per_worker
+    partition_size_mb = memory_worker * partition_worker_ratio
+    partition_size_str = f"{int(partition_size_mb)}MB"
+
+    return avail_mem_string_for_dask, n_workers, threads_per_worker, partition_size_str
 
 
 def _build_sparse_grid_arrays(voxel_refs: pd.DataFrame, epsilon: float = 1e-6):
@@ -4666,7 +4675,7 @@ def voxel_ray_intersections_dask_new(valid_rays_dir: str,
                                  optimal_threads: int = 4,
                                  debug: bool = True,
                                  epsilon: float = 1e-6) -> None:
-    memory_limit_str, n_workers, threads_per_worker = _determine_dask_resources(
+    memory_limit_str, n_workers, threads_per_worker, partition_size_str = _determine_dask_resources(
         cpus=cpus, mem=mem, optimal_threads=optimal_threads
     )
     client = _start_dask_client(
@@ -4681,7 +4690,7 @@ def voxel_ray_intersections_dask_new(valid_rays_dir: str,
     )
     if debug:
         print(f"[voxel_ray_intersections_dask] Dask client: "
-              f"workers={n_workers}, threads/worker={threads_per_worker}, mem/worker={memory_limit_str}")
+              f"workers={n_workers}, threads/worker={threads_per_worker}, mem/worker={memory_limit_str}, partition_size={partition_size_str}")
 
     dask.config.set({"dataframe.shuffle.method": "p2p"})
 
@@ -4713,8 +4722,7 @@ def voxel_ray_intersections_dask_new(valid_rays_dir: str,
     ddfs = []
     for file in valid_files:
         leg_id = leg_from_filename(file)
-        ddf = dd.read_parquet(file, engine='pyarrow', split_row_groups='adaptive', blocksize='32MB')
-        print(f"Reading {file} with npartitions={ddf.npartitions}")
+        ddf = dd.read_parquet(file, engine='pyarrow', split_row_groups='adaptive', blocksize=partition_size_str)
         ddfs.append(ddf.assign(leg_id=leg_id))
     
     all_ddf = dd.concat(ddfs, interleave_partitions=True)
