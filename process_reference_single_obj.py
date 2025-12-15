@@ -28,6 +28,8 @@ from pathlib import Path
     
 from numba import njit, prange
 
+global _CUDA_DEVICE_ID
+
 temp_dir = os.getenv('TMPDIR', 'tmp')
 # temp_dir = "/scratch/project/veg3d/uqjrivor/Raja_Tumba_Test/tmp"
 if not os.path.exists(temp_dir):
@@ -464,27 +466,40 @@ def get_clipped_meshes(
 
 def build_voxel_scene(o3d_leaf, o3d_wood):
     """Return (scene, leaf_id, wood_id)  either id may be None."""
+
+    _load_leaf = True if o3d_leaf is not None and len(o3d_leaf.triangles) > 0 and LEAF_OFF is False else False
+    _load_wood = True if o3d_wood is not None and len(o3d_wood.triangles) > 0 else False
+    leaf_id = wood_id = None
     
     try:
-        # Try GPU (CUDA:0)
-        dev = o3d.core.Device("CUDA:0")
+        dev = o3d.core.Device(f"SYCL:{_CUDA_DEVICE_ID}" if _CUDA_DEVICE_ID is not None else "SYCL:0")
         scene = o3d.t.geometry.RaycastingScene(device=dev)
-        mesh_leaf = mesh_leaf.to(dev)
-        if mesh_wood is not None:
-            mesh_wood = mesh_wood.to(dev)
+
+        if _load_leaf:
+            leaves = o3d.t.geometry.TriangleMesh.from_legacy(o3d_leaf)
+            leaves = leaves.to(dev)
+            leaf_id = scene.add_triangles(leaves)
+        
+        if _load_wood:
+            wood = o3d.t.geometry.TriangleMesh.from_legacy(o3d_wood)
+            wood = wood.to(dev)
+            wood_id = scene.add_triangles(wood)
+
         # print("[INFO] Using CUDA for raycasting.")
     except Exception as e:
         # Fallback to CPU
         dev = o3d.core.Device("CPU:0")
         scene = o3d.t.geometry.RaycastingScene(device=dev)
-        print("[INFO] CUDA unavailable, falling back to CPU.")
 
-    leaf_id = wood_id = None
-    if (o3d_leaf is not None) and (len(o3d_leaf.triangles) > 0) and LEAF_OFF is False:
-        leaf_id = scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(o3d_leaf))
+        if _load_leaf:
+            leaves = o3d.t.geometry.TriangleMesh.from_legacy(o3d_leaf)
+            leaf_id = scene.add_triangles(leaves)
+        
+        if _load_wood:
+            wood = o3d.t.geometry.TriangleMesh.from_legacy(o3d_wood)
+            wood_id = scene.add_triangles(wood)
 
-    if (o3d_wood is not None) and (len(o3d_wood.triangles) > 0):
-        wood_id = scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(o3d_wood))
+        # print(f"[INFO] CUDA unavailable, falling back to CPU: {e}.")
 
     return scene, leaf_id, wood_id
 
@@ -1443,6 +1458,31 @@ if __name__ == "__main__":
 
     # Clear the joblib.Memory cache to ensure any updates are applied:
     memory.clear(warn=True)
+
+    # Establish joblib tempdir for any launching process
+    os.environ['JOBLIB_TEMP_FOLDER'] = os.environ.get('TMPDIR', '/tmp') + '/joblib'
+    os.makedirs(os.environ['JOBLIB_TEMP_FOLDER'], exist_ok=True)
+
+    # Check for CUDA device availability with Open3D
+    _CUDA_DEVICE_ID = None
+    try:
+        # Try to detect NVIDIA GPU using nvidia-smi
+        try:
+            result = subprocess.run(['nvidia-smi', '-L'], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                gpu_lines = result.stdout.strip().split('\n')
+                print(f"Detected NVIDIA GPUs:")
+                for line in gpu_lines:
+                    print(f"  {line}")
+                _CUDA_DEVICE_ID = 0  # Use first GPU
+            else:
+                print("nvidia-smi not found or no NVIDIA GPU detected. Will try CUDA devices.")
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            print("nvidia-smi command failed. Attempting to initialize CUDA devices directly.")
+        
+    except Exception as e:
+        print(f"Error checking CUDA availability: {e}")
+        print("Code will use CPU for ray tracing.")
 
     # Store a global setting for leaf-off
     LEAF_OFF = args.leaf_off
