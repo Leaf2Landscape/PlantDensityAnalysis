@@ -3794,8 +3794,6 @@ def _determine_dask_resources(cpus: int | None, mem: int | None, optimal_threads
     else:
         avail_mem = int(float(os.environ.get('SLURM_MEM_PER_NODE', psutil.virtual_memory().available // (1024 * 1024))) * mem_threshold)  # in MB
 
-    # Test for not oversubscribing
-    threads = 1
     n_workers = (avail_cpus * threads) // optimal_threads
     threads_per_worker = optimal_threads
 
@@ -3916,7 +3914,7 @@ def _ray_box_entry_exit(o, d, bbox_min, bbox_max, eps):
     return t_enter, t_exit, ds0, ds1, ds2
 
 
-@njit(cache=True, fastmath=True)
+@njit(nogil=True, cache=True, fastmath=True)
 def _dda_mark_candidates(o, d, origin, cell_size, bbox_min, bbox_max,
                          keys_ix, keys_iy, keys_iz, offsets, voxel_ids_flat,
                          mask, eps):
@@ -3969,7 +3967,7 @@ def _dda_mark_candidates(o, d, origin, cell_size, bbox_min, bbox_max,
             cz += stepz; t = tMaxZ; tMaxZ += tDeltaZ
 
 
-@njit(cache=True, fastmath=True)
+@njit(nogil=True, cache=True, fastmath=True)
 def _sphere_cull(o, d, centres, radius_sq, cand_idx, eps):
     M = cand_idx.shape[0]
     keep = np.zeros(M, np.bool_)
@@ -4064,7 +4062,7 @@ def _slab_count_only(o, d, vmins, vmaxs, cand_idx, eps):
     return count
 
 
-@njit(cache=True, fastmath=True)
+@njit(nogil=True, cache=True, fastmath=True)
 def _slab_fill_candidates(o, d, vmins, vmaxs, cand_idx, eps,
                           hit_idx_buf, entry_buf, exit_buf):
     """Fill preallocated buffers and return the number of hits."""
@@ -4530,7 +4528,7 @@ def _map_partition_numba(ray_part: pd.DataFrame, voxel_data: Dict[str, np.ndarra
     return df
 
 
-@njit(cache=True, fastmath=False)
+@njit(nogil=True, cache=True, fastmath=False)
 def _process_partition_pairs(
     origins, directions,
     leg_ids, ray_ids,
@@ -4648,6 +4646,7 @@ def _map_partition_pairs(ray_part: pd.DataFrame, eps: float = 1e-6) -> pd.DataFr
         np.float64(eps)
     )
 
+    # Check if k is empty and return empty DataFrame if so
     if k == 0:
         return pd.DataFrame(columns=['leg_id', 'ray_id', 'voxel_id', 'voxel_size'])
 
@@ -4661,14 +4660,14 @@ def _map_partition_pairs(ray_part: pd.DataFrame, eps: float = 1e-6) -> pd.DataFr
 
 def voxel_ray_intersections_dask_new(valid_rays_dir: str,
                                  references_dir: str,
-                                 voxel_chunk_size: int = 10000,
                                  temp_dir: str | None = None,
                                  cpus: int | None = None,
                                  mem: int | None = None,
+                                 optimal_threads: int = 4,
                                  debug: bool = True,
                                  epsilon: float = 1e-6) -> None:
     memory_limit_str, n_workers, threads_per_worker = _determine_dask_resources(
-        cpus=cpus, mem=mem, optimal_threads=2
+        cpus=cpus, mem=mem, optimal_threads=optimal_threads
     )
     client = _start_dask_client(
         n_workers=n_workers,
@@ -4714,7 +4713,8 @@ def voxel_ray_intersections_dask_new(valid_rays_dir: str,
     ddfs = []
     for file in valid_files:
         leg_id = leg_from_filename(file)
-        ddf = dd.read_parquet(file, engine='pyarrow', split_row_groups=True)
+        ddf = dd.read_parquet(file, engine='pyarrow', split_row_groups='adaptive', blocksize='32MB')
+        print(f"Reading {file} with npartitions={ddf.npartitions}")
         ddfs.append(ddf.assign(leg_id=leg_id))
     
     all_ddf = dd.concat(ddfs, interleave_partitions=True)
