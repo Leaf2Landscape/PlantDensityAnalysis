@@ -1642,7 +1642,7 @@ if __name__ == "__main__":
 
         pbar = tqdm(total=len(voxel_center_batches), desc="Clipping meshes", unit=f"({batch_size} voxel batches)") 
         with tqdm_joblib(pbar):
-            results = Parallel(n_jobs=num_cpus, backend='threading')(
+            results = Parallel(n_jobs=num_cpus, backend='loky', prefer="processes")(
                     delayed(clip_mesh_wrapper)(voxel_center_batch, voxel_size, leaf_mesh_file, wood_mesh_file)
                     for voxel_center_batch in voxel_center_batches
                 )
