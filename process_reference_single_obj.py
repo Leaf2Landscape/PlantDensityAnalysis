@@ -1508,6 +1508,7 @@ if __name__ == "__main__":
     parser.add_argument("--wood_volume_threshold", type=int, default=4, help="Threshold for wood volume calculation (default: 4).")
     parser.add_argument("--cross_section_area", type=float, default=0.003, help="Cross section area for wood volume calculation (default: 0.01).")
     parser.add_argument("--leaf_off", action='store_true', help="If set, leaf mesh will not be included in raytracing.")
+    parser.add_argument("--max_workers", type=int, default=32, help="Maximum number of parallel workers (default: 32).")
     parser.add_argument("--debug", action='store_true', help="If set, debug outputs will be saved.")
     args = parser.parse_args()
 
@@ -1593,7 +1594,7 @@ if __name__ == "__main__":
     else:
         num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", psutil.cpu_count(logical=False)) * 2) # hyperthreading
     num_cpus = max(1, num_cpus)
-    n_workers = min(32, num_cpus)
+    n_workers = min(max_workers, num_cpus)
 
     angles = [0.0000001, 10, 20, 30, 40, 50, 60, 70, 80, 89.9999]  # Example angles in degrees
 
