@@ -1594,7 +1594,7 @@ if __name__ == "__main__":
     else:
         num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", psutil.cpu_count(logical=False)) * 2) # hyperthreading
     num_cpus = max(1, num_cpus)
-    n_workers = min(max_workers, num_cpus)
+    n_workers = min(args.max_workers, num_cpus)
 
     angles = [0.0000001, 10, 20, 30, 40, 50, 60, 70, 80, 89.9999]  # Example angles in degrees
 
