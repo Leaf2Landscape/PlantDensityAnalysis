@@ -745,10 +745,11 @@ def simulate_combined_mesh_with_points(scene, leaf_gid, wood_gid,
     return stats_lw, stats_leaf, hit_details
 
 
-def simulate_voxel_grouped(scene, leaf_gid, wood_gid,
+def simulate_voxel_grouped(scene, leaf_gids, wood_gids,
                            voxel_center, voxel_size,
                            rays_FAR6,  # shape (Faces,Angles,Rays,6), float32
-                           lambda_1):
+                           lambda_1,
+                           scene_name="scene"):
     """
     Vectorized per-(face, angle) aggregation that matches your stats dictionaries.
     Returns:
@@ -772,9 +773,56 @@ def simulate_voxel_grouped(scene, leaf_gid, wood_gid,
 
     # Single cast_rays call
     hits = scene.cast_rays(o3c.Tensor(rays_FAR6, dtype=o3c.float32))
+
     # Each field returns with leading dims (F,A,R)
     gids   = hits["geometry_ids"].numpy()      # (F,A,R), uint32 or int64
     dists  = hits["t_hit"].numpy()             # (F,A,R), float32; inf for miss
+
+    # If debugging, save xyz to ASCII .xyz, with scalar for Face, Angle, and Leaf/Wood hit
+    if DEBUG_MODE:
+        # Filter to valid hits before computing points to avoid NaN from inf * direction
+        hit_mask = valid_rays_mask & np.isfinite(dists)
+        if np.any(hit_mask):
+            f_idx, a_idx, r_idx = np.nonzero(hit_mask)
+
+            O_hits = O[f_idx, a_idx, r_idx]  # (N_hits, 3)
+            D_hits = D[f_idx, a_idx, r_idx]  # (N_hits, 3)
+            dists_hits = dists[f_idx, a_idx, r_idx]  # (N_hits,)
+            pts = O_hits + D_hits * dists_hits[:, np.newaxis]  # (N_hits, 3)
+
+            gids_hits = gids[f_idx, a_idx, r_idx]  # (N_hits,)
+            leaf_hit = (np.isin(gids_hits, leaf_gids))
+            wood_hit = (np.isin(gids_hits, wood_gids))
+
+            classes = np.zeros(pts.shape[0], dtype=np.int8)
+            classes[leaf_hit] = 1
+            classes[wood_hit] = 0
+
+            data = np.column_stack((pts, f_idx, a_idx, classes))  # (N_hits, 6)
+
+            debug_dir = os.path.join(DEBUG_PATH, f"voxel_size={voxel_size}", f"voxel_{voxel_center[0]:.2f}_{voxel_center[1]:.2f}_{voxel_center[2]:.2f}")
+            os.makedirs(debug_dir, exist_ok=True)
+            out_path = os.path.join(debug_dir, f"{scene_name}_hits_{voxel_center[0]:.2f}_{voxel_center[1]:.2f}_{voxel_center[2]:.2f}.xyz")
+
+            # Write separate class mapping file
+            class_map_path = os.path.join(debug_dir, "class_mapping.txt")
+            face_idx_to_label = {i: label for i, label in enumerate(FACE_ORDER)}
+            angle_idx_to_label = {i: label for i, label in enumerate(ANGLE_ORDER)}
+            with open(class_map_path, 'w') as f:
+                f.write(f"# face_idx mapping: {','.join([f'{i}={label}' for i, label in face_idx_to_label.items()])}\n")
+                f.write(f"# angle_idx mapping: {','.join([f'{i}={label}' for i, label in angle_idx_to_label.items()])}\n")
+                f.write(f"# class: 0=wood, 1=leaf\n")
+
+            # Write hits to .xyz file in chunks to avoid large memory usage
+            header_text = f"x y z face_idx angle_idx class\n"
+            df = pd.DataFrame(data, columns=["x", "y", "z", "face_idx", "angle_idx", "class"])
+
+            chunk_size = 200000  # 200 thousand rows per chunk
+            with open(out_path, 'w', buffering=4*1024*1024) as f:
+                f.write(header_text)
+                for start in range(0, df.shape[0], chunk_size):
+                    end = start + chunk_size
+                    df.iloc[start:end].to_csv(f, sep=' ', header=False, index=False, float_format='%.2f')
 
     # Valid hits inside the voxel slab
     valid_hits_mask = np.isfinite(dists) & (dists >= t_near) & (dists <= t_far) & (dists >= 0) & valid_rays_mask
@@ -784,56 +832,66 @@ def simulate_voxel_grouped(scene, leaf_gid, wood_gid,
     # We only consider valid_hits_mask anyway.
     dist_leaf = np.full_like(dists, np.inf, dtype=np.float32)
     dist_wood = np.full_like(dists, np.inf, dtype=np.float32)
-    if leaf_gid is not None:
-        m_leaf = (gids == leaf_gid) & valid_hits_mask
+    if leaf_gids is not None:
+        m_leaf = np.isin(gids, leaf_gids) & valid_hits_mask
         dist_leaf[m_leaf] = dists[m_leaf]
-    if wood_gid is not None:
-        m_wood = (gids == wood_gid) & valid_hits_mask
+    if wood_gids is not None:
+        m_wood = np.isin(gids, wood_gids) & valid_hits_mask
         dist_wood[m_wood] = dists[m_wood]
 
     # Combined (leaf+wood): first hit distance among the two
     comb_dist = np.minimum(dist_leaf, dist_wood)  # (F,A,R)
     hit_any   = np.isfinite(comb_dist)            # (F,A,R)
     hit_leaf  = np.isfinite(dist_leaf)            # (F,A,R)
+    hit_wood  = np.isfinite(dist_wood)            # (F,A,R)
 
     # Path lengths inside voxel
-    delta = np.zeros_like(dists, dtype=np.float32)
-    delta[valid_rays_mask] = (t_far[valid_rays_mask] - t_near[valid_rays_mask])
+    path_lengths = np.zeros_like(dists, dtype=np.float32)
+    path_lengths[valid_rays_mask] = (t_far[valid_rays_mask] - t_near[valid_rays_mask])
 
-    # z_arr for combined: distance from t_near to first intersection (leaf or wood)
-    z_lw = delta.copy()
-    z_lw[hit_any] = comb_dist[hit_any] - t_near[hit_any]
+    # free_path_length for combined: distance from t_near to first intersection (leaf or wood)
+    free_path_length_comb = path_lengths.copy()
+    free_path_length_comb[hit_any] = comb_dist[hit_any] - t_near[hit_any]
 
-    # z_arr for leaf-only: distance from t_near to leaf intersection
-    z_leaf = delta.copy()
-    z_leaf[hit_leaf] = dists[hit_leaf] - t_near[hit_leaf]
+    # free_path_length for leaf-only: distance from t_near to leaf intersection
+    free_path_length_leaf = path_lengths.copy()
+    free_path_length_leaf[hit_leaf] = dists[hit_leaf] - t_near[hit_leaf]
 
-    # Effective path length transforms (you already have compute_efpl_array)
+    # free_path_length for wood-only: distance from t_near to wood intersection
+    free_path_length_wood = path_lengths.copy()
+    free_path_length_wood[hit_wood] = dists[hit_wood] - t_near[hit_wood]
+
+    # Effective free path length transforms (you already have compute_efpl_array)
     # Compute only on valid rays to avoid NaNs
-    efpl_delta = np.zeros_like(delta, dtype=np.float32)
-    efpl_free_lw = np.zeros_like(z_lw, dtype=np.float32)
-    efpl_free_leaf = np.zeros_like(z_leaf, dtype=np.float32)
+    eff_free_path_length_path = np.zeros_like(path_lengths, dtype=np.float32)
+    eff_free_path_length_comb = np.zeros_like(free_path_length_comb, dtype=np.float32)
+    eff_free_path_length_leaf = np.zeros_like(free_path_length_leaf, dtype=np.float32)
+    eff_free_path_length_wood = np.zeros_like(free_path_length_wood, dtype=np.float32)
 
     vf = valid_rays_mask
-    efpl_delta[vf]       = compute_efpl_array(delta[vf],   lambda_1).astype(np.float32)
-    efpl_free_lw[vf]     = compute_efpl_array(z_lw[vf],    lambda_1).astype(np.float32)
-    efpl_free_leaf[vf]   = compute_efpl_array(z_leaf[vf],  lambda_1).astype(np.float32)
+    eff_free_path_length_path[vf]   = compute_efpl_array(path_lengths[vf], lambda_1).astype(np.float32)
+    eff_free_path_length_comb[vf]   = compute_efpl_array(free_path_length_comb[vf], lambda_1).astype(np.float32)
+    eff_free_path_length_leaf[vf]   = compute_efpl_array(free_path_length_leaf[vf], lambda_1).astype(np.float32)
+    eff_free_path_length_wood[vf]   = compute_efpl_array(free_path_length_wood[vf], lambda_1).astype(np.float32)
 
     # Aggregation helpers along axis=2 (per group)
     N = valid_rays_mask.sum(axis=2).astype(np.int32)                 # (F,A)
     n_hits_lw   = hit_any.sum(axis=2).astype(np.int32)               # (F,A)
     n_hits_leaf = hit_leaf.sum(axis=2).astype(np.int32)              # (F,A)
+    n_hits_wood = hit_wood.sum(axis=2).astype(np.int32)              # (F,A)
 
-    sum_delta   = delta.sum(axis=2)                                  # (F,A)
-    delta_bar   = np.divide(sum_delta, N, out=np.zeros_like(sum_delta), where=(N > 0))
+    sum_path_lengths   = path_lengths.sum(axis=2)                                  # (F,A)
 
-    sum_z_lw    = z_lw.sum(axis=2)                                   # (F,A)
-    mean_z_lw   = np.divide(sum_z_lw, N, out=np.zeros_like(sum_z_lw), where=(N > 0))
+    sum_free_path_length_comb    = free_path_length_comb.sum(axis=2)                                   # (F,A)
+    mean_free_path_length_comb   = np.divide(sum_free_path_length_comb, N, out=np.zeros_like(sum_free_path_length_comb), where=(N > 0))
 
-    sum_z_leaf  = z_leaf.sum(axis=2)                                 # (F,A)
-    mean_z_leaf = np.divide(sum_z_leaf, N, out=np.zeros_like(sum_z_leaf), where=(N > 0))
+    sum_free_path_length_leaf  = free_path_length_leaf.sum(axis=2)                                 # (F,A)
+    mean_free_path_length_leaf = np.divide(sum_free_path_length_leaf, N, out=np.zeros_like(sum_free_path_length_leaf), where=(N > 0))
 
-    # efpl means/vars (ddof=1); compute sums and sums of squares
+    sum_free_path_length_wood  = free_path_length_wood.sum(axis=2)                                 # (F,A)
+    mean_free_path_length_wood = np.divide(sum_free_path_length_wood, N, out=np.zeros_like(sum_free_path_length_wood), where=(N > 0))
+
+    # eff_free_path_length means/vars (ddof=1); compute sums and sums of squares
     def mean_var_ddof1(x, N):
         mx = x.sum(axis=2)
         mean = np.divide(mx, N, out=np.zeros_like(mx), where=(N > 0))
@@ -845,53 +903,69 @@ def simulate_voxel_grouped(scene, leaf_gid, wood_gid,
         var[(N <= 1)] = 0.0
         return mean, var
 
-    mean_delta_e, var_delta_e = mean_var_ddof1(efpl_delta, N)
-    mean_efpl_free_lw, var_efpl_free_lw = mean_var_ddof1(efpl_free_lw, N)
-    mean_efpl_free_leaf, var_efpl_free_leaf = mean_var_ddof1(efpl_free_leaf, N)
+    mean_eff_free_path_length_comb, var_eff_free_path_length_comb = mean_var_ddof1(eff_free_path_length_comb, N)
+    mean_eff_free_path_length_leaf, var_eff_free_path_length_leaf = mean_var_ddof1(eff_free_path_length_leaf, N)
+    mean_eff_free_path_length_wood, var_eff_free_path_length_wood = mean_var_ddof1(eff_free_path_length_wood, N)
 
-    # Sum of efpl_free over hits-only
-    sum_hits_z_e_lw   = (efpl_free_lw * hit_any).sum(axis=2)
-    sum_hits_z_e_leaf = (efpl_free_leaf * hit_leaf).sum(axis=2)
+    # Sum of eff_free_path_length over hits-only
+    sum_hits_eff_free_path_length_comb   = (eff_free_path_length_comb * hit_any).sum(axis=2)
+    sum_hits_eff_free_path_length_leaf = (eff_free_path_length_leaf * hit_leaf).sum(axis=2)
+    sum_hits_eff_free_path_length_wood = (eff_free_path_length_wood * hit_wood).sum(axis=2)
 
     # Build per-(face, angle) dicts that match your original structure
-    stats_lw  = [[None for _ in range(A)] for _ in range(F)]
+    stats_comb  = [[None for _ in range(A)] for _ in range(F)]
     stats_leaf= [[None for _ in range(A)] for _ in range(F)]
+    stats_wood= [[None for _ in range(A)] for _ in range(F)]
 
     for f in range(F):
         for a in range(A):
-            stats_lw[f][a] = dict(
+            stats_comb[f][a] = dict(
                 N=int(N[f, a]),
                 n_hits=int(n_hits_lw[f, a]),
                 I=(float(n_hits_lw[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
-                delta_bar=float(delta_bar[f, a]),
-                sum_delta=float(sum_delta[f, a]),
-                sum_z=float(sum_z_lw[f, a]),
-                mean_z=float(mean_z_lw[f, a]),
-                mean_delta_e=float(mean_delta_e[f, a]),
-                var_delta_e=float(var_delta_e[f, a]),
-                sum_z_e=float(efpl_free_lw[f, a].sum(axis=0)),   # or sum over R keep consistent
-                sum_hits_z_e=float(sum_hits_z_e_lw[f, a]),
-                mean_efpl_free=float(mean_efpl_free_lw[f, a]),
-                var_efpl_free=float(var_efpl_free_lw[f, a]),
+                mean_path_length=float(mean_free_path_length_comb[f, a]),
+                sum_path_length=float(sum_path_lengths[f, a]),
+                sum_free_path_length=float(sum_free_path_length_comb[f, a]),
+                mean_free_path_length=float(mean_free_path_length_comb[f, a]),
+                mean_eff_free_path_length=float(mean_eff_free_path_length_comb[f, a]),
+                var_eff_free_path_length=float(var_eff_free_path_length_comb[f, a]),
+                sum_eff_free_path_length=float((eff_free_path_length_comb).sum(axis=2)[f, a]),
+                sum_hits_eff_free_path_length=float(sum_hits_eff_free_path_length_comb[f, a]),
+                mean_eff_free_path_length_free=float(mean_eff_free_path_length_comb[f, a]),
+                var_eff_free_path_length_free=float(var_eff_free_path_length_comb[f, a]),
             )
             stats_leaf[f][a] = dict(
                 N=int(N[f, a]),
                 n_hits=int(n_hits_leaf[f, a]),
                 I=(float(n_hits_leaf[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
-                delta_bar=float(delta_bar[f, a]),
-                sum_delta=float(sum_delta[f, a]),
-                sum_z=float(sum_z_leaf[f, a]),
-                mean_z=float(mean_z_leaf[f, a]),
-                mean_delta_e=float(mean_delta_e[f, a]),
-                var_delta_e=float(var_delta_e[f, a]),
-                sum_z_e=float(efpl_free_leaf[f, a].sum(axis=0)),
-                sum_hits_z_e=float(sum_hits_z_e_leaf[f, a]),
-                mean_efpl_free=float(mean_efpl_free_leaf[f, a]),
-                var_efpl_free=float(var_efpl_free_leaf[f, a])       
+                mean_path_length=float(mean_eff_free_path_length_leaf[f, a]),
+                sum_path_length=float(sum_path_lengths[f, a]),
+                sum_free_path_length=float(sum_free_path_length_leaf[f, a]),
+                mean_free_path_length=float(mean_free_path_length_leaf[f, a]),
+                mean_eff_free_path_length=float(mean_eff_free_path_length_leaf[f, a]),
+                var_eff_free_path_length=float(var_eff_free_path_length_leaf[f, a]),
+                sum_eff_free_path_length=float((eff_free_path_length_leaf).sum(axis=2)[f, a]),
+                sum_hits_eff_free_path_length=float(sum_hits_eff_free_path_length_leaf[f, a]),
+                mean_eff_free_path_length_free=float(mean_eff_free_path_length_leaf[f, a]),
+                var_eff_free_path_length_free=float(var_eff_free_path_length_leaf[f, a])       
+            )
+            stats_wood[f][a] = dict(
+                N=int(N[f, a]),
+                n_hits=int(n_hits_wood[f, a]),
+                I=(float(n_hits_wood[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
+                mean_path_length=float(mean_free_path_length_wood[f, a]),
+                sum_path_length=float(sum_path_lengths[f, a]),
+                sum_free_path_length=float(sum_free_path_length_wood[f, a]),
+                mean_free_path_length=float(mean_free_path_length_wood[f, a]),
+                mean_eff_free_path_length=float(mean_eff_free_path_length_wood[f, a]),
+                var_eff_free_path_length=float(var_eff_free_path_length_wood[f, a]),
+                sum_eff_free_path_length=float((eff_free_path_length_wood).sum(axis=2)[f, a]),
+                sum_hits_eff_free_path_length=float(sum_hits_eff_free_path_length_wood[f, a]),
+                mean_eff_free_path_length_free=float(mean_eff_free_path_length_wood[f, a]),
+                var_eff_free_path_length_free=float(var_eff_free_path_length_wood[f, a])
             )
 
-    return stats_lw, stats_leaf
-
+    return stats_comb, stats_leaf, stats_wood
 
 
 def compute_G_function_binwise(viewing_angles, leaf_bin_centers, LIAD_values):
@@ -1171,13 +1245,18 @@ def _build_canonical_grids(voxel_sizes, ray_spacing):
             "yminus": generate_side_rays_yminus(vc=np.array([0,0,0]), vs=vs, grid=grid),
         }
 
+global FACE_ORDER
+FACE_ORDER = ["bottom","top","xplus","xminus","yplus","yminus"]
+
+global ANGLE_ORDER
+
 # faces that rotate around y vs x (matches your current logic)
 rot_axis = {"xplus":"y","xminus":"y","bottom":"x","top":"x","yplus":"x","yminus":"x"}
 
 def build_ray_tensor_for_voxel(voxel_center, voxel_size, angles):
     rays_list = []
     labels = []  # (face_idx, angle_idx) per ray
-    face_order = ["bottom","top","xplus","xminus","yplus","yminus"]
+    face_order = FACE_ORDER
     angles_sorted = sorted(angles)
 
     F = len(face_order)
@@ -1226,6 +1305,7 @@ def process_voxel(
     voxel_size, 
     o3d_leaf,
     o3d_wood, 
+    scenes,
     angles, 
     wood_volume_points, 
     lambda_1
@@ -1236,9 +1316,74 @@ def process_voxel(
     """
     MIN_HITS = 10
 
-    if o3d_leaf is None:
-        print(f"[DEBUG] {voxel_center}: No leaf mesh after clipping. Skipping.")
+    if o3d_leaf is None and "leaf" in scenes:
+        print(f"[DEBUG] {voxel_center}: No leaf mesh after clipping for leaf-only scene. Skipping.")
         return [], []
+    
+    if o3d_wood is None and "wood" in scenes:
+        print(f"[DEBUG] {voxel_center}: No wood mesh after clipping for wood-only scene. Skipping.")
+        return [], []
+    
+    # Extract surface areas from meshes
+    try:
+        leaf_area = o3d_leaf.get_surface_area() if o3d_leaf else 0.0
+        wood_area = o3d_wood.get_surface_area() if o3d_wood else 0.0
+        comb_area = leaf_area + wood_area
+    except Exception as e:
+        raise RuntimeError(
+            f"Error computing surface area for voxel at {voxel_center}: {e}"
+        ) from e
+    
+    # Calculate LAI, WAI, and PAI
+    try:
+        LAI = leaf_area / (voxel_size ** 2)
+        WAI = wood_area / (voxel_size ** 2)
+        PAI = comb_area / (voxel_size ** 2)
+    except Exception as e:
+        raise RuntimeError(
+            f"Error computing LAI, WAI, or PAI for voxel at {voxel_center}: {e}"
+        ) from e
+    
+    # Calculate LAD, WAD, and PAD
+    try:
+        LAD = leaf_area / (voxel_size ** 3)
+        WAD = wood_area / (voxel_size ** 3)
+        PAD = comb_area / (voxel_size ** 3)
+    except Exception as e:
+        raise RuntimeError(
+            f"Error computing LAD, WAD, or PAD for voxel at {voxel_center}: {e}"
+        ) from e
+    
+    # Calculate wood volume (alpha) in voxel if points provided
+    try:
+        wood_vol = compute_wood_volume_in_voxel(wood_volume_points, voxel_center, voxel_size) if wood_volume_points is not None else 0.0
+        if wood_vol != 0.0:
+            alpha = (voxel_size ** 3 - wood_vol) / (voxel_size ** 3)
+        else:
+            alpha = None
+    except Exception as e:
+        raise RuntimeError(
+            f"Error computing wood volume or alpha for voxel at {voxel_center}: {e}"
+        ) from e
+    
+    # Compute LIAD bins for voxel
+    try:
+        bin_leaf, liad, _ = compute_LIAD_from_mesh(o3d_leaf) if o3d_leaf else (np.array([]), np.array([]), None)
+        bin_wood, wiad, _ = compute_LIAD_from_mesh(o3d_wood) if o3d_wood else (np.array([]), np.array([]), None)
+        bin_comb, piad, _ = compute_LIAD_from_mesh(o3d_leaf + o3d_wood) if (o3d_leaf and o3d_wood) else (np.array([]), np.array([]), None)
+
+        # Store LIAD/WIAD/PIAD bins and values
+        liad_dict = {f"LIAD_bin_{c:.1f}": float(v)
+                for c, v in zip(bin_leaf, liad)}
+        wiad_dict = {f"WIAD_bin_{c:.1f}": float(v)
+                for c, v in zip(bin_wood, wiad)}
+        piad_dict = {f"PIAD_bin_{c:.1f}": float(v)
+                for c, v in zip(bin_comb, piad)}
+        
+    except Exception as e:
+        raise RuntimeError(
+            f"Error computing LIAD for voxel at {voxel_center}: {e}"
+        ) from e
 
     # Build voxel scene
     try:
@@ -1248,192 +1393,202 @@ def process_voxel(
             f"Error building voxel scene for voxel at {voxel_center}: {e}"
         ) from e
     
-    # Reference areas / densities
-    try:
-        leaf_area = o3d_leaf.get_surface_area()
-        wood_area = o3d_wood.get_surface_area() if o3d_wood else 0.0
-    except Exception as e:
-        raise RuntimeError(
-            f"Error computing surface area for voxel at {voxel_center}: {e}"
-        ) from e
-
-    try:
-        LAI_leaf = leaf_area / (voxel_size ** 2)
-        LAI_lw = (leaf_area + wood_area) / (voxel_size ** 2)
-        LAD_ref = leaf_area / (voxel_size ** 3)
-        PAD_ref = (leaf_area + wood_area) / (voxel_size ** 3)
-
-        wood_vol = compute_wood_volume_in_voxel(wood_volume_points, voxel_center, voxel_size) if wood_volume_points is not None else 0.0
-        if wood_vol != 0.0:
-            alpha = (voxel_size ** 3 - wood_vol) / (voxel_size ** 3)
-        else:
-            alpha = None
-
-        # LIAD bins for voxel
-        bin_leaf, liad_leaf, _ = compute_LIAD_from_mesh(o3d_leaf)
-        comb_mesh = o3d_leaf if o3d_wood is None else o3d_leaf + o3d_wood
-        bin_lw, liad_lw, _ = compute_LIAD_from_mesh(comb_mesh)
-
-        # Store the LIAD bins repeated on every row
-        liad_dict = {f"LIAD_bin_{c:.1f}": float(v)
-                for c, v in zip(bin_leaf, liad_leaf)}
-    except Exception as e:
-        raise RuntimeError(
-            f"Error computing LAI, LIAD, or alpha for voxel at {voxel_center}: {e}"
-        ) from e
-    
-    # Raytrace from all angles simultaneously
+    # Build ray tensor for all rays in voxel
     rays_FAR6, face_order, angles_sorted = build_ray_tensor_for_voxel(
     voxel_center=voxel_center, 
     voxel_size=voxel_size, 
     angles=angles)
+    
+    ### For each scene in scenes, create a scene and raycast for outputs
+    all_results = []
 
-    # rays_FAR6 shape: (F, A, R, 6)
-    F, A, R, _ = rays_FAR6.shape
-    
-    # Cast all rays at once
-    hits = voxel_scene.cast_rays(o3d.core.Tensor(rays_FAR6, dtype=o3d.core.Dtype.Float32))
-    
-    t_hit = hits['t_hit'].numpy()  # (F, A, R)
-    geomid = hits['geometry_ids'].numpy()  # (F, A, R)
-    
-    # Use simulate_voxel_grouped for vectorized stats computation
-    stats_lw_grouped, stats_leaf_grouped = simulate_voxel_grouped(
-    voxel_scene, leaf_gid, wood_gid,
-    voxel_center, voxel_size,
-    rays_FAR6, lambda_1)
-    
-    # stats_lw_grouped and stats_leaf_grouped are lists of lists: [F][A] -> dict
-    voxel_rows = []
-    
     try:
-        for f_idx, face_lbl in enumerate(face_order):
-            for a_idx, angle in enumerate(angles_sorted):
-                lw_data = stats_lw_grouped[f_idx][a_idx]
-                leaf_data = stats_leaf_grouped[f_idx][a_idx]
+        for scene in scenes:
+            if scene == "leaf":
+                if o3d_leaf is None:
+                    print(f"[DEBUG] {voxel_center}: No leaf mesh after clipping for leaf-only scene. Skipping.")
+                    all_results.append({})
+                    continue
+
+                voxel_scene, leaf_gid, wood_gid = build_voxel_scene(o3d_leaf, None)
                 
-                if leaf_data["N"] == 0:
-                    leaf_data = {k: np.nan for k in leaf_data}
-                if lw_data["N"] == 0:
-                    lw_data = {k: np.nan for k in lw_data}
-
-                ### G ###
-                G_leaf_est = np.nan
-                if leaf_data["n_hits"] >= MIN_HITS and bin_leaf.size > 0:
-                    G_leaf_est = compute_G_function_binwise([angle], bin_leaf, liad_leaf)[0]
-
-                G_lw_est = np.nan
-                if lw_data["n_hits"] >= MIN_HITS and bin_lw.size > 0:
-                    G_lw_est = compute_G_function_binwise([angle], bin_lw, liad_lw)[0]
-
-                ### pgap ###
-                pgap_leaf = 1.0 - leaf_data["I"]
-                pgap_lw = 1.0 - lw_data["I"]
-
-                ### CI from G ###
-                CI_leaf = (-math.log(pgap_leaf) / (G_leaf_est * LAI_leaf)
-                    if (LAI_leaf > 0 and G_leaf_est > 0 and
-                        0 < pgap_leaf < 1) else np.nan)
-
-                CI_lw   = (-math.log(pgap_lw) / (G_lw_est * LAI_lw)
-                    if (LAI_lw > 0 and G_lw_est > 0 and
-                        0 < pgap_lw < 1) else np.nan)
                 
-                ### LAD/PAD metrics ###
-                lad_leaf = compute_lad_metrics(
-                    leaf_data["n_hits"], leaf_data["N"], G_leaf_est,
-                    leaf_data["delta_bar"], leaf_data["mean_z"],
-                    leaf_data["mean_delta_e"], leaf_data["var_delta_e"],
-                    lambda_1)
-
-                pad_lw = compute_pad_metrics(
-                    lw_data["n_hits"], leaf_data["n_hits"],
-                    lw_data["N"], G_lw_est, lw_data["delta_bar"],
-                    lw_data["sum_z"], lw_data["sum_z_e"],
-                    leaf_data["sum_hits_z_e"], lw_data["sum_hits_z_e"],
-                    alpha, lw_data["mean_delta_e"], lw_data["var_delta_e"],
-                    lambda_1,
-                    leaf_data["n_hits"]/lw_data["n_hits"]
-                    if lw_data["n_hits"] else 0.0)
                 
-                ### data prep ###
-                leaf_fraction = (leaf_data["n_hits"] / lw_data["n_hits"]
-                        if lw_data["n_hits"] else np.nan)
+
+            elif scene == "wood":
+                if o3d_wood is None:
+                    print(f"[DEBUG] {voxel_center}: No wood mesh after clipping for wood-only scene. Skipping.")
+                    all_results.append({})
+                    continue
+
+                voxel_scene, leaf_gid, wood_gid = build_voxel_scene(None, o3d_wood)
                 
-                row = {
-                    "voxel_cx": float(voxel_center[0]), "voxel_cy": float(voxel_center[1]), "voxel_cz": float(voxel_center[2]),
-                    "face": face_lbl, "angle_deg": angle,
 
-                    # per-angle G
-                    "G_leaf_computed": float(G_leaf_est) if not np.isnan(G_leaf_est) else np.nan,
-                    "G_lw_computed":  float(G_lw_est) if not np.isnan(G_lw_est) else np.nan,
+            elif scene == "combined":
+                if o3d_leaf is None and o3d_wood is None:
+                    print(f"[DEBUG] {voxel_center}: No meshes after clipping for combined scene. Skipping.")
+                    all_results.append({})
+                    continue
 
-                    # reference densities
-                    "LAI_Leaf": float(LAI_leaf) if LAI_leaf is not None else np.nan, 
-                    "LAI_lw": float(LAI_lw) if LAI_lw is not None else np.nan,
-                    "LAD_ref":  float(LAD_ref) if LAD_ref is not None else np.nan,  
-                    "PAD_ref": float(PAD_ref) if PAD_ref is not None else np.nan,
+                voxel_scene, leaf_gid, wood_gid = build_voxel_scene(o3d_leaf, o3d_wood)
 
-                    # CI from true G(θ)
-                    "CI_leaf": float(CI_leaf) if not np.isnan(CI_leaf) else np.nan,
-                    "CI_lw":   float(CI_lw) if not np.isnan(CI_lw) else np.nan,
-                    "alpha":   float(alpha) if alpha is not None else np.nan,
-                    "leaf_fraction": float(leaf_fraction) if not np.isnan(leaf_fraction) else np.nan,
-                    
-                    # LAD metrics
-                    "LAD_BL":          float(lad_leaf.get("LAD_BL", np.nan)),
-                    "LAD_BL_EPL":      float(lad_leaf.get("LAD_BL_EPL", np.nan)),
-                    "LAD_BL_UEPL":     float(lad_leaf.get("LAD_BL_UEPL", np.nan)),
-                    "LAD_MCF":         float(lad_leaf.get("LAD_MCF", np.nan)),
-                    "LAD_MCF_Corr":    float(lad_leaf.get("LAD_MCF_Corrected", np.nan)),
+            else:
+                raise ValueError(f"Unknown scene type: {scene}")
+    
+            # Use simulate_voxel_grouped for vectorized stats computation
+            stats_comb_grouped, stats_leaf_grouped, stats_wood_grouped = simulate_voxel_grouped(
+            voxel_scene, leaf_gid, wood_gid,
+            voxel_center, voxel_size,
+            rays_FAR6, lambda_1, scene_name=scene)
 
-                    # PAD metrics
-                    "PAD_BL":          float(pad_lw.get("PAD_BL", np.nan)),
-                    "PAD_BL_EPL":      float(pad_lw.get("PAD_BL_EPL", np.nan)),
-                    "PAD_BL_UEPL":     float(pad_lw.get("PAD_BL_UEPL", np.nan)),
-                    "PAD_MCF":         float(pad_lw.get("PAD_MCF", np.nan)),
-                    "PAD_MCF_Corr":    float(pad_lw.get("PAD_MCF_Corrected", np.nan)),
-                    "PAD_MLE_pimont_2018": float(pad_lw.get("PAD_MLE_pimont_2018", np.nan)),
-                    
-                    # extra LAD estimates that lived in the PAD dict
-                    "LAD_MLE_pimont_2019": float(pad_lw.get("LAD_MLE_pimont_2019", np.nan)),
-                    "LAD_MLE_soma":        float(pad_lw.get("LAD_MLE_Soma_21",   np.nan)),
-                    
-                    # raw stats
-                    "Total_number_of_rays": int(lw_data.get("N", np.nan)),
-                    "sum_path_length":      float(lw_data.get("sum_delta", np.nan)),
-                    "mean_path_length":     float(lw_data.get("delta_bar", np.nan)),
+            try:
+                for f_idx, face_lbl in enumerate(face_order):
+                    for a_idx, angle in enumerate(angles_sorted):
+                        comb_data = stats_comb_grouped[f_idx][a_idx]
+                        leaf_data = stats_leaf_grouped[f_idx][a_idx]
+                        wood_data = stats_wood_grouped[f_idx][a_idx]
 
-                    # hits
-                    "num_leaf_hits": int(leaf_data.get("n_hits", np.nan)),
-                    "num_lw_hits":   int(lw_data.get("n_hits", np.nan)),
-                    "num_hits":      int(lw_data.get("n_hits", np.nan)),
+                        if comb_data["N"] == 0:
+                            comb_data = {k: np.nan for k in comb_data}
+                        if leaf_data["N"] == 0:
+                            leaf_data = {k: np.nan for k in leaf_data}
+                        if wood_data["N"] == 0:
+                            wood_data = {k: np.nan for k in wood_data}
 
-                    # interception / pgap
-                    "I_leaf": float(leaf_data.get("I", np.nan)),
-                    "I_lw":   float(lw_data.get("I", np.nan)),
-                    "pgap_leaf": 1.0 - float(leaf_data.get("I", np.nan)),
-                    "pgap_lw":   1.0 - float(lw_data.get("I", np.nan)),
+                        ### G ###
+                        G_leaf_est = np.nan
+                        if leaf_data["n_hits"] >= MIN_HITS and bin_leaf.size > 0:
+                            G_leaf_est = compute_G_function_binwise([angle], bin_leaf, liad)[0]
 
-                    # freepath sums & means
-                    "sum_free_path_length":           float(lw_data.get("sum_z",             np.nan)),
-                    "sum_effective_free_path_length": float(lw_data.get("sum_z_e",           np.nan)),
-                    "sum_effective_free_path_length_hit":
-                    float(lw_data.get("sum_hits_z_e", np.nan)),
-                    "sum_effective_free_path_length_hit_leaf":
-                    float(leaf_data.get("sum_hits_z_e", np.nan)),
+                        G_wood_est = np.nan
+                        if wood_data["n_hits"] >= MIN_HITS and bin_wood.size > 0:
+                            G_wood_est = compute_G_function_binwise([angle], bin_wood, wiad)[0]
 
-                    "mean_free_path_length":              float(lw_data.get("mean_z",        np.nan)),
-                    "mean_effective_path_length":         float(lw_data.get("mean_delta_e",  np.nan)),
-                    "var_effective_path_length":          float(lw_data.get("var_delta_e",   np.nan)),
-                    "mean_effective_free_path_length":    float(lw_data.get("mean_efpl_free",np.nan)),
-                    "var_effective_free_path_length":     float(lw_data.get("var_efpl_free", np.nan)),
-                }
+                        G_comb_est = np.nan
+                        if comb_data["n_hits"] >= MIN_HITS and bin_comb.size > 0:
+                            G_comb_est = compute_G_function_binwise([angle], bin_comb, piad)[0]
 
-                # Add LIAD bins to the row
-                row.update(liad_dict)
+                        ### pgap ###
+                        pgap_leaf = 1.0 - leaf_data["I"]
+                        pgap_wood = 1.0 - wood_data["I"]
+                        pgap_comb = 1.0 - comb_data["I"]
 
-                voxel_rows.append(row)
+                        ### CI from G ###
+                        CI_leaf = (-math.log(pgap_leaf) / (G_leaf_est * LAI)
+                            if (LAI > 0 and G_leaf_est > 0 and
+                                0 < pgap_leaf < 1) else np.nan)
+                        CI_wood = (-math.log(pgap_wood) / (G_wood_est * WAI)
+                            if (WAI > 0 and G_wood_est > 0 and
+                                0 < pgap_wood < 1) else np.nan)
+                        CI_comb = (-math.log(pgap_comb) / (G_comb_est * PAI)
+                            if (PAI > 0 and G_comb_est > 0 and
+                                0 < pgap_comb < 1) else np.nan)
+                        
+                        # ### LAD / WAD / PAD metrics ###
+                        # lad = compute_lad_metrics(
+                        #     hits_leaf=leaf_data["n_hits"],
+                        #     N=leaf_data["N"],
+                        #     G_leaf=G_leaf_est,
+                        #     delta_bar=leaf_data["delta_bar"],
+                        #     mean_z=leaf_data["mean_z"],
+                        #     mean_delta_e=leaf_data["mean_delta_e"],
+                        #     var_delta_e=leaf_data["var_delta_e"],
+                        #     lambda_1=lambda_1
+                        # )
+
+                        # wad = compute_lad_metrics(
+                        #     hits_leaf=wood_data["n_hits"],
+                        #     N=wood_data["N"],
+                        #     G_leaf=G_wood_est,
+                        #     delta_bar=wood_data["delta_bar"],
+                        #     mean_z=wood_data["mean_z"],
+                        #     mean_delta_e=wood_data["mean_delta_e"],
+                        #     var_delta_e=wood_data["var_delta_e"],
+                        #     lambda_1=lambda_1
+                        # )
+
+                        # pad = compute_pad_metrics(
+                        #     hits_lw=comb_data["n_hits"],
+                        #     hits_leaf=leaf_data["n_hits"],
+                        #     N=comb_data["N"],
+                        #     G_lw=G_comb_est,
+                        #     delta_bar=comb_data["delta_bar"],
+                        #     sum_z_lw=comb_data["sum_z"],
+                        #     sum_z_e_lw=comb_data["sum_z_e"],
+                        #     sum_hits_z_e_leaf=leaf_data["sum_hits_z_e"],
+                        #     sum_hits_z_e_lw=comb_data["sum_hits_z_e"],
+                        #     alpha=alpha,
+                        
+                        ### data prep ###
+                        leaf_fraction = (leaf_data["n_hits"] / comb_data["n_hits"]
+                                if comb_data["n_hits"] else np.nan)
+                        wood_fraction = (wood_data["n_hits"] / comb_data["n_hits"]
+                                if comb_data["n_hits"] else np.nan)
+                        
+                        row = {
+                            "voxel_cx": float(voxel_center[0]), "voxel_cy": float(voxel_center[1]), "voxel_cz": float(voxel_center[2]),
+                            "face": face_lbl, "angle_deg": angle,
+                            # reference densities
+                            "LAI_ref": float(LAI) if LAI is not None else np.nan, 
+                            "WAI_ref": float(WAI) if WAI is not None else np.nan,
+                            "PAI_ref": float(PAI) if PAI is not None else np.nan,
+                            "LAD_ref": float(LAD) if LAD is not None else np.nan,
+                            "WAD_ref": float(WAD) if WAD is not None else np.nan,
+                            "PAD_ref": float(PAD) if PAD is not None else np.nan,
+                            # ray and hit values
+                            "total_num_rays": int(comb_data["N"]) if comb_data["N"] is not None else np.nan,
+                            "total_num_hits": int(comb_data["n_hits"]) if comb_data["n_hits"] is not None else np.nan,
+                            "total_missed_rays": int(comb_data["N"] - comb_data["n_hits"]) if comb_data["N"] is not None and comb_data["n_hits"] is not None else np.nan,
+                            # hits per component
+                            "n_hits_leaf": int(leaf_data["n_hits"]) if leaf_data["n_hits"] is not None else np.nan,
+                            "n_hits_wood": int(wood_data["n_hits"]) if wood_data["n_hits"] is not None else np.nan,
+                            "n_hits_comb": int(comb_data["n_hits"]) if comb_data["n_hits"] is not None else np.nan,
+                            # observed I
+                            "I_leaf": float(leaf_data["I"]) if leaf_data["I"] is not None else np.nan,
+                            "I_wood": float(wood_data["I"]) if wood_data["I"] is not None else np.nan,
+                            "I_comb": float(comb_data["I"]) if comb_data["I"] is not None else np.nan,
+                            # observed pgap
+                            "pgap_leaf": float(pgap_leaf) if not np.isnan(pgap_leaf) else np.nan,
+                            "pgap_wood": float(pgap_wood) if not np.isnan(pgap_wood) else np.nan,
+                            "pgap_comb": float(pgap_comb) if not np.isnan(pgap_comb) else np.nan,
+                            # path length
+                            "mean_path_length_leaf": float(leaf_data["mean_path_length"]) if leaf_data["mean_path_length"] is not None else np.nan,
+                            "mean_path_length_wood": float(wood_data["mean_path_length"]) if wood_data["mean_path_length"] is not None else np.nan,
+                            "mean_path_length_comb": float(comb_data["mean_path_length"]) if comb_data["mean_path_length"] is not None else np.nan,
+                            # free path length
+                            "mean_free_path_length_leaf": float(leaf_data["mean_free_path_length"]) if leaf_data["mean_free_path_length"] is not None else np.nan,
+                            "mean_free_path_length_wood": float(wood_data["mean_free_path_length"]) if wood_data["mean_free_path_length"] is not None else np.nan,
+                            "mean_free_path_length_comb": float(comb_data["mean_free_path_length"]) if comb_data["mean_free_path_length"] is not None else np.nan,
+                            # effective free path length
+                            "mean_eff_free_path_length_leaf": float(leaf_data["mean_eff_free_path_length"]) if leaf_data["mean_eff_free_path_length"] is not None else np.nan,
+                            "mean_eff_free_path_length_wood": float(wood_data["mean_eff_free_path_length"]) if wood_data["mean_eff_free_path_length"] is not None else np.nan,
+                            "mean_eff_free_path_length_comb": float(comb_data["mean_eff_free_path_length"]) if comb_data["mean_eff_free_path_length"] is not None else np.nan,
+                            # per-angle G
+                            "G_leaf_computed": float(G_leaf_est) if not np.isnan(G_leaf_est) else np.nan,
+                            "G_wood_computed":  float(G_wood_est) if not np.isnan(G_wood_est) else np.nan,
+                            "G_comb_computed":  float(G_comb_est) if not np.isnan(G_comb_est) else np.nan,
+                            # CI from true G(θ) 
+                            "CI_Leaf": float(CI_leaf) if not np.isnan(CI_leaf) else np.nan,
+                            "CI_Wood": float(CI_wood) if not np.isnan(CI_wood) else np.nan,
+                            "CI_Comb": float(CI_comb) if not np.isnan(CI_comb) else np.nan,
+                            "alpha":   float(alpha) if alpha is not None else np.nan,
+                            "leaf_fraction": float(leaf_fraction) if not np.isnan(leaf_fraction) else np.nan,
+                            "wood_fraction": float(wood_fraction) if not np.isnan(wood_fraction) else np.nan,
+
+                            
+                        }
+
+                        row.update(liad_dict)
+                        row.update(wiad_dict)
+                        row.update(piad_dict)
+                        row['scene'] = scene
+
+                        all_results.append(row)
+
+            except Exception as e:
+                raise RuntimeError(
+                    f"Error processing grouped stats for voxel at {voxel_center}: {e}"
+                ) from e
     
     except Exception as e:
         raise RuntimeError(
@@ -1441,7 +1596,7 @@ def process_voxel(
         ) from e
 
     # print(f"[DEBUG] Processed voxel at {voxel_center} with size {voxel_size}, generated {len(voxel_rows)} rows.")
-    return voxel_rows, []
+    return all_results
 
 # NEW Clipping parallel logic
 
@@ -1498,10 +1653,10 @@ def clip_one_thread(voxel_center, voxel_size):
     return (voxel_center, leaf_v, leaf_f, wood_v, wood_f)
 
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process voxel batch.")
     parser.add_argument("scene_file", type=str, help="Path to the single .obj scene file. This will automatically extract leaf and wood meshes.")
+    parser.add_argument("--scene_formats", type=str, nargs='+', default=["combined"], help="Scene formats to process (default: ['combined']), use 'leaf' for leaf-only and 'wood' for wood-only.")
     parser.add_argument("--voxel_sizes", type=float, nargs='+', default=[0.2, 0.5, 1.0, 2.0], help="Voxel sizes for processing (default: [0.2, 0.5, 1.0, 2.0]).")
     parser.add_argument("--ray_spacing", type=float, default=0.005, help="Ray spacing for ray tracing (default: 0.1).")
     parser.add_argument("--wood_volume_voxel_size", type=float, default=0.01, help="Voxel size for wood volume calculation (default: 0.01).")
@@ -1511,6 +1666,17 @@ if __name__ == "__main__":
     parser.add_argument("--max_workers", type=int, default=32, help="Maximum number of parallel workers (default: 32).")
     parser.add_argument("--debug", action='store_true', help="If set, debug outputs will be saved.")
     args = parser.parse_args()
+
+    # Print a nice statement outlining chosen inputs
+    print(f"Processing scene file: {args.scene_file}")
+    print(f"Scene formats: {args.scene_formats}")
+    print(f"Voxel sizes: {args.voxel_sizes}")
+    print(f"Ray spacing: {args.ray_spacing}")
+    print(f"Wood volume voxel size: {args.wood_volume_voxel_size}")
+    print(f"Wood volume threshold: {args.wood_volume_threshold}")
+    print(f"Leaf off: {args.leaf_off}")
+    print(f"Max workers: {args.max_workers}")
+    print(f"Debug mode: {args.debug}")
 
     # Clear the joblib.Memory cache to ensure any updates are applied:
     memory.clear(warn=True)
@@ -1555,12 +1721,13 @@ if __name__ == "__main__":
 
     # Store a global setting for leaf-off
     LEAF_OFF = args.leaf_off
+    global DEBUG_MODE
+    global DEBUG_PATH
     DEBUG_MODE = args.debug
     if DEBUG_MODE:
         DEBUG_PATH = os.path.join(os.path.dirname(args.scene_file), "debug")
-        if os.path.exists(DEBUG_PATH):
-            os.rmdir(DEBUG_PATH)
-        os.makedirs(DEBUG_PATH)
+        if not os.path.exists(DEBUG_PATH):
+            os.makedirs(DEBUG_PATH)
 
     voxel_sizes = args.voxel_sizes
     ray_spacing = args.ray_spacing
@@ -1597,6 +1764,7 @@ if __name__ == "__main__":
     n_workers = min(args.max_workers, num_cpus)
 
     angles = [0.0000001, 10, 20, 30, 40, 50, 60, 70, 80, 89.9999]  # Example angles in degrees
+    ANGLE_ORDER = sorted(angles)
 
 
     # Process each voxel center in parallel and collect results
@@ -1662,16 +1830,16 @@ if __name__ == "__main__":
 
 
 
-        def process_voxel_wrapper(voxel_center, leaf_mesh, wood_mesh, voxel_size, angles, wood_volume_points, lambda_1):
+        def process_voxel_wrapper(voxel_center, leaf_mesh, wood_mesh, scenes, voxel_size, angles, wood_volume_points, lambda_1):
             try:
-                args = (voxel_center, voxel_size, leaf_mesh, wood_mesh, angles, wood_volume_points, lambda_1)
-                result, placeholder = process_voxel(*args)
+                args = (voxel_center, voxel_size, leaf_mesh, wood_mesh, scenes, angles, wood_volume_points, lambda_1)
+                result = process_voxel(*args)
                 # print(f" Processed voxel {args[0]} successfully.")
-                return result, placeholder
+                return result
             except Exception as e:
                 print(f"Error processing voxel {args[0]}: {e}")
                 traceback.print_exc()
-                return [], []
+                return []
             
         def clip_mesh_wrapper(
                 voxel_centers, 
@@ -1738,7 +1906,10 @@ if __name__ == "__main__":
 
                 ## DEBUG ##
                 if DEBUG_MODE:
-                    test_mesh_path = os.path.join(DEBUG_PATH, f"clipped_leaf_mesh_{voxel_size}_{vc}.ply")
+                    debug_dir = os.path.join(DEBUG_PATH, f"voxel_size={voxel_size}", f"voxel_{vc[0]:.2f}_{vc[1]:.2f}_{vc[2]:.2f}")
+                    os.makedirs(debug_dir, exist_ok=True)
+
+                    test_mesh_path = os.path.join(debug_dir, f"leaf_mesh_{vc[0]:.2f}_{vc[1]:.2f}_{vc[2]:.2f}.ply")
                     o3d.io.write_triangle_mesh(test_mesh_path, o3d_leaf_mesh)
             else:
                 clipped_leaf_meshes.append(None)
@@ -1752,7 +1923,9 @@ if __name__ == "__main__":
 
                 ## DEBUG ##
                 if DEBUG_MODE:
-                    test_mesh_path = os.path.join(DEBUG_PATH, f"clipped_wood_mesh_{voxel_size}_{vc}.ply")
+                    debug_dir = os.path.join(DEBUG_PATH, f"voxel_size={voxel_size}", f"voxel_{vc[0]:.2f}_{vc[1]:.2f}_{vc[2]:.2f}")
+                    os.makedirs(debug_dir, exist_ok=True)
+                    test_mesh_path = os.path.join(debug_dir, f"wood_mesh_{vc[0]:.2f}_{vc[1]:.2f}_{vc[2]:.2f}.ply")
                     o3d.io.write_triangle_mesh(test_mesh_path, o3d_wood_mesh)
             else:
                 clipped_wood_meshes.append(None)
@@ -1765,6 +1938,7 @@ if __name__ == "__main__":
 
         worker = partial(
             process_voxel_wrapper,
+            scenes=args.scene_formats,
             voxel_size=voxel_size,
             angles=angles,
             wood_volume_points=wood_volume_points,
@@ -1775,47 +1949,51 @@ if __name__ == "__main__":
         start02 = dt.datetime.now()
         print(f"Preprocessing time: {clip_time}")
 
-        results = []
+        voxel_results = []
         for i, (vc, lm, wm) in enumerate(tqdm(zip(clipped_voxel_centres, clipped_leaf_meshes, clipped_wood_meshes), total=len(clipped_voxel_centres), desc="Processing voxels", unit="voxel")):
-            result, _ = worker(vc, lm, wm)
-            df = pd.DataFrame(result)
-            results.append(df)
+            all_results = worker(vc, lm, wm)
+            voxel_results.extend(all_results)
+
+        # Create a dataframe of voxel_results and subsequently filter by scene column
+        df = pd.DataFrame(voxel_results)
+        assert "scene" in df.columns, "No 'scene' column found in voxel results."
+
+        scenes_present = df["scene"].dropna().unique().tolist()
 
         total_time = dt.datetime.now() - start
         raytrace_time = dt.datetime.now() - start02
 
-        # Save the results to a CSV file
-        df = pd.concat(results, ignore_index=True)
-
-        # Convert results to a DataFrame and save to CSV
-        # This csv will ne save in a subfolder to csv_path for preliminary results
-        df = pd.concat(results, ignore_index=True)
-        output_basename = os.path.basename(args.scene_file).replace('.obj', f'_results_{voxel_size}.csv') if LEAF_OFF is False else os.path.basename(args.scene_file).replace('.obj', f'_results_{voxel_size}_leaf_off.csv')
-        output_path = os.path.join(os.path.dirname(args.scene_file), output_basename)
-        df.to_csv(output_path, index=False)
+        for scene in scenes_present:
+            df_s = df[df["scene"] == scene].copy()
+            output_basename = os.path.basename(args.scene_file).replace('.obj', f'_{scene}_results_{voxel_size}.csv') if LEAF_OFF is False else os.path.basename(args.scene_file).replace('.obj', f'_{scene}_results_{voxel_size}_leaf_off.csv')
+            output_path = os.path.join(os.path.dirname(args.scene_file), output_basename)
+            df_s.to_csv(output_path, index=False)
+            print(f"Saved {len(df_s)} rows for scene '{scene}' to {output_path}.")
 
         ### DEBUG TOTAL LEAF AREA ###
-        if DEBUG_MODE:
-            # Compute total leaf area only for unique voxel centers
-            unique_voxels = df.drop_duplicates(subset=['voxel_cx', 'voxel_cy', 'voxel_cz'])
-            total_leaf_area = unique_voxels['LAI_Leaf'].sum() * (voxel_size ** 2)
-            leaf_area_test_path = os.path.join(DEBUG_PATH, os.path.basename(args.scene_file).replace('.obj', f'_leaf_area_test.csv'))
-            debug_df = pd.DataFrame([{
-                "voxel_size": voxel_size,
-                "measured_leaf_area": total_leaf_area
-            }])
+        # if DEBUG_MODE:
+        #     # Compute total leaf area only for unique voxel centers
+        #     unique_voxels = df.drop_duplicates(subset=['voxel_cx', 'voxel_cy', 'voxel_cz'])
+        #     total_leaf_area = unique_voxels['lai'].sum() * (voxel_size ** 2)
+        #     total_wood_area = unique_voxels['wai'].sum() * (voxel_size ** 2)
+        #     leaf_area_test_path = os.path.join(DEBUG_PATH, os.path.basename(args.scene_file).replace('.obj', f'_leaf_area_test.csv'))
+        #     debug_df = pd.DataFrame([{
+        #         "voxel_size": voxel_size,
+        #         "measured_leaf_area": total_leaf_area
+        #     }])
             
-            if os.path.exists(leaf_area_test_path):
-                df_exist = pd.read_csv(leaf_area_test_path)
-                df_exist = pd.concat([df_exist, debug_df], ignore_index=True)
-                df_exist.to_csv(leaf_area_test_path, index=False)
-            else:
-                debug_df.to_csv(leaf_area_test_path, index=False)
+        #     if os.path.exists(leaf_area_test_path):
+        #         df_exist = pd.read_csv(leaf_area_test_path)
+        #         df_exist = pd.concat([df_exist, debug_df], ignore_index=True)
+        #         df_exist.to_csv(leaf_area_test_path, index=False)
+        #     else:
+        #         debug_df.to_csv(leaf_area_test_path, index=False)
 
         # Save performance results to a separate CSV file
         clip_time = clip_time.total_seconds()
         raytrace_time = raytrace_time.total_seconds()
         total_time = total_time.total_seconds()
+
         def per_voxel(time):
             return time / len(clipped_voxel_centres) if clipped_voxel_centres else 0
         

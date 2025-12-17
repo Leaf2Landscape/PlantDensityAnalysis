@@ -54,8 +54,8 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args": [
-                "/home/capheus/projects/1066_etri_RF3_6_inc200_diamond_plano/1066_etri_RF3_6_inc200_diamond_plano.obj",
-                "--voxel_sizes", "0.2"
+                "/home/capheus/projects/1015_tree/1015_emac_RF1_9.0_1.7_4_inc125_diamond_erecto.obj",
+                "--voxel_sizes", "2.0", "--scene_formats", "leaf", "wood", "combined", "--debug"
             ]
         },
         {
