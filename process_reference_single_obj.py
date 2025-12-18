@@ -835,61 +835,21 @@ def simulate_voxel_grouped(scene, leaf_gids, wood_gids,
     if leaf_gids is not None:
         m_leaf = np.isin(gids, leaf_gids) & valid_hits_mask
         dist_leaf[m_leaf] = dists[m_leaf]
+        _is_leaf = True
+    else:
+        # No leaf in voxel scene
+        _is_leaf = False
+
     if wood_gids is not None:
         m_wood = np.isin(gids, wood_gids) & valid_hits_mask
         dist_wood[m_wood] = dists[m_wood]
+        _is_wood = True
+    else:
+        # No wood in voxel scene
+        _is_wood = False
 
-    # Combined (leaf+wood): first hit distance among the two
-    comb_dist = np.minimum(dist_leaf, dist_wood)  # (F,A,R)
-    hit_any   = np.isfinite(comb_dist)            # (F,A,R)
-    hit_leaf  = np.isfinite(dist_leaf)            # (F,A,R)
-    hit_wood  = np.isfinite(dist_wood)            # (F,A,R)
-
-    # Path lengths inside voxel
-    path_lengths = np.zeros_like(dists, dtype=np.float32)
-    path_lengths[valid_rays_mask] = (t_far[valid_rays_mask] - t_near[valid_rays_mask])
-
-    # free_path_length for combined: distance from t_near to first intersection (leaf or wood)
-    free_path_length_comb = path_lengths.copy()
-    free_path_length_comb[hit_any] = comb_dist[hit_any] - t_near[hit_any]
-
-    # free_path_length for leaf-only: distance from t_near to leaf intersection
-    free_path_length_leaf = path_lengths.copy()
-    free_path_length_leaf[hit_leaf] = dists[hit_leaf] - t_near[hit_leaf]
-
-    # free_path_length for wood-only: distance from t_near to wood intersection
-    free_path_length_wood = path_lengths.copy()
-    free_path_length_wood[hit_wood] = dists[hit_wood] - t_near[hit_wood]
-
-    # Effective free path length transforms (you already have compute_efpl_array)
-    # Compute only on valid rays to avoid NaNs
-    eff_free_path_length_path = np.zeros_like(path_lengths, dtype=np.float32)
-    eff_free_path_length_comb = np.zeros_like(free_path_length_comb, dtype=np.float32)
-    eff_free_path_length_leaf = np.zeros_like(free_path_length_leaf, dtype=np.float32)
-    eff_free_path_length_wood = np.zeros_like(free_path_length_wood, dtype=np.float32)
-
-    vf = valid_rays_mask
-    eff_free_path_length_path[vf]   = compute_efpl_array(path_lengths[vf], lambda_1).astype(np.float32)
-    eff_free_path_length_comb[vf]   = compute_efpl_array(free_path_length_comb[vf], lambda_1).astype(np.float32)
-    eff_free_path_length_leaf[vf]   = compute_efpl_array(free_path_length_leaf[vf], lambda_1).astype(np.float32)
-    eff_free_path_length_wood[vf]   = compute_efpl_array(free_path_length_wood[vf], lambda_1).astype(np.float32)
-
-    # Aggregation helpers along axis=2 (per group)
-    N = valid_rays_mask.sum(axis=2).astype(np.int32)                 # (F,A)
-    n_hits_lw   = hit_any.sum(axis=2).astype(np.int32)               # (F,A)
-    n_hits_leaf = hit_leaf.sum(axis=2).astype(np.int32)              # (F,A)
-    n_hits_wood = hit_wood.sum(axis=2).astype(np.int32)              # (F,A)
-
-    sum_path_lengths   = path_lengths.sum(axis=2)                                  # (F,A)
-
-    sum_free_path_length_comb    = free_path_length_comb.sum(axis=2)                                   # (F,A)
-    mean_free_path_length_comb   = np.divide(sum_free_path_length_comb, N, out=np.zeros_like(sum_free_path_length_comb), where=(N > 0))
-
-    sum_free_path_length_leaf  = free_path_length_leaf.sum(axis=2)                                 # (F,A)
-    mean_free_path_length_leaf = np.divide(sum_free_path_length_leaf, N, out=np.zeros_like(sum_free_path_length_leaf), where=(N > 0))
-
-    sum_free_path_length_wood  = free_path_length_wood.sum(axis=2)                                 # (F,A)
-    mean_free_path_length_wood = np.divide(sum_free_path_length_wood, N, out=np.zeros_like(sum_free_path_length_wood), where=(N > 0))
+    ### Combined Stats First ###
+    # Use some shared variables later for leaf and wood statistics if present
 
     # eff_free_path_length means/vars (ddof=1); compute sums and sums of squares
     def mean_var_ddof1(x, N):
@@ -903,67 +863,160 @@ def simulate_voxel_grouped(scene, leaf_gids, wood_gids,
         var[(N <= 1)] = 0.0
         return mean, var
 
+    # Combined (leaf+wood): first hit distance among the two
+    if _is_leaf is True or _is_wood is True:
+        comb_dist = np.minimum(dist_leaf, dist_wood)  # (F,A,R)
+    else:
+        comb_dist = np.full_like(dists, np.inf, dtype=np.float32)
+        comb_dist[valid_hits_mask] = dists[valid_hits_mask]
+
+    hit_any   = np.isfinite(comb_dist)            # (F,A,R)
+    path_lengths = np.zeros_like(dists, dtype=np.float32)
+    path_lengths[valid_rays_mask] = (t_far[valid_rays_mask] - t_near[valid_rays_mask])
+    mean_path_length = np.nanmean(path_lengths, axis=2)          # (F,A)
+    sum_path_length  = path_lengths.sum(axis=2)                  # (F,A)
+    free_path_length_comb = path_lengths.copy()
+    free_path_length_comb[hit_any] = comb_dist[hit_any] - t_near[hit_any]
+    eff_free_path_length_comb = np.zeros_like(free_path_length_comb, dtype=np.float32)
+    eff_free_path_length_comb[valid_rays_mask] = compute_efpl_array(free_path_length_comb[valid_rays_mask], lambda_1).astype(np.float32)
+    sum_eff_free_path_length_comb = np.sum(eff_free_path_length_comb, axis=2)
+    N = valid_rays_mask.sum(axis=2).astype(np.int32)                 # (F,A)
+    n_hits_lw   = hit_any.sum(axis=2).astype(np.int32)               # (F,A)
+    sum_path_lengths   = path_lengths.sum(axis=2)                                  # (F,A)
+    sum_free_path_length_comb    = free_path_length_comb.sum(axis=2)            # (F,A)
+    mean_free_path_length_comb   = np.nanmean(free_path_length_comb, axis=2)          # (F,A)
     mean_eff_free_path_length_comb, var_eff_free_path_length_comb = mean_var_ddof1(eff_free_path_length_comb, N)
-    mean_eff_free_path_length_leaf, var_eff_free_path_length_leaf = mean_var_ddof1(eff_free_path_length_leaf, N)
-    mean_eff_free_path_length_wood, var_eff_free_path_length_wood = mean_var_ddof1(eff_free_path_length_wood, N)
-
-    # Sum of eff_free_path_length over hits-only
     sum_hits_eff_free_path_length_comb   = (eff_free_path_length_comb * hit_any).sum(axis=2)
-    sum_hits_eff_free_path_length_leaf = (eff_free_path_length_leaf * hit_leaf).sum(axis=2)
-    sum_hits_eff_free_path_length_wood = (eff_free_path_length_wood * hit_wood).sum(axis=2)
 
-    # Build per-(face, angle) dicts that match your original structure
-    stats_comb  = [[None for _ in range(A)] for _ in range(F)]
-    stats_leaf= [[None for _ in range(A)] for _ in range(F)]
-    stats_wood= [[None for _ in range(A)] for _ in range(F)]
-
+    stats_comb = [[None for _ in range(A)] for _ in range(F)]
     for f in range(F):
         for a in range(A):
             stats_comb[f][a] = dict(
                 N=int(N[f, a]),
                 n_hits=int(n_hits_lw[f, a]),
                 I=(float(n_hits_lw[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
-                mean_path_length=float(mean_free_path_length_comb[f, a]),
-                sum_path_length=float(sum_path_lengths[f, a]),
+                mean_path_length=float(mean_path_length[f, a]),
+                sum_path_length=float(sum_path_length[f, a]),
                 sum_free_path_length=float(sum_free_path_length_comb[f, a]),
                 mean_free_path_length=float(mean_free_path_length_comb[f, a]),
                 mean_eff_free_path_length=float(mean_eff_free_path_length_comb[f, a]),
                 var_eff_free_path_length=float(var_eff_free_path_length_comb[f, a]),
-                sum_eff_free_path_length=float((eff_free_path_length_comb).sum(axis=2)[f, a]),
+                sum_eff_free_path_length=float(sum_eff_free_path_length_comb[f, a]),
                 sum_hits_eff_free_path_length=float(sum_hits_eff_free_path_length_comb[f, a]),
-                mean_eff_free_path_length_free=float(mean_eff_free_path_length_comb[f, a]),
-                var_eff_free_path_length_free=float(var_eff_free_path_length_comb[f, a]),
             )
-            stats_leaf[f][a] = dict(
-                N=int(N[f, a]),
-                n_hits=int(n_hits_leaf[f, a]),
-                I=(float(n_hits_leaf[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
-                mean_path_length=float(mean_eff_free_path_length_leaf[f, a]),
-                sum_path_length=float(sum_path_lengths[f, a]),
-                sum_free_path_length=float(sum_free_path_length_leaf[f, a]),
-                mean_free_path_length=float(mean_free_path_length_leaf[f, a]),
-                mean_eff_free_path_length=float(mean_eff_free_path_length_leaf[f, a]),
-                var_eff_free_path_length=float(var_eff_free_path_length_leaf[f, a]),
-                sum_eff_free_path_length=float((eff_free_path_length_leaf).sum(axis=2)[f, a]),
-                sum_hits_eff_free_path_length=float(sum_hits_eff_free_path_length_leaf[f, a]),
-                mean_eff_free_path_length_free=float(mean_eff_free_path_length_leaf[f, a]),
-                var_eff_free_path_length_free=float(var_eff_free_path_length_leaf[f, a])       
-            )
-            stats_wood[f][a] = dict(
-                N=int(N[f, a]),
-                n_hits=int(n_hits_wood[f, a]),
-                I=(float(n_hits_wood[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
-                mean_path_length=float(mean_free_path_length_wood[f, a]),
-                sum_path_length=float(sum_path_lengths[f, a]),
-                sum_free_path_length=float(sum_free_path_length_wood[f, a]),
-                mean_free_path_length=float(mean_free_path_length_wood[f, a]),
-                mean_eff_free_path_length=float(mean_eff_free_path_length_wood[f, a]),
-                var_eff_free_path_length=float(var_eff_free_path_length_wood[f, a]),
-                sum_eff_free_path_length=float((eff_free_path_length_wood).sum(axis=2)[f, a]),
-                sum_hits_eff_free_path_length=float(sum_hits_eff_free_path_length_wood[f, a]),
-                mean_eff_free_path_length_free=float(mean_eff_free_path_length_wood[f, a]),
-                var_eff_free_path_length_free=float(var_eff_free_path_length_wood[f, a])
-            )
+
+    ### Leaf-only Stats ###
+    if _is_leaf:
+        hit_leaf  = np.isfinite(dist_leaf)            # (F,A,R)
+
+        free_path_length_leaf = path_lengths.copy()
+        free_path_length_leaf[hit_leaf] = dists[hit_leaf] - t_near[hit_leaf]
+        sum_free_path_length_leaf = free_path_length_leaf.sum(axis=2)
+        eff_free_path_length_leaf = np.zeros_like(free_path_length_leaf, dtype=np.float32)
+        eff_free_path_length_leaf[valid_rays_mask] = compute_efpl_array(free_path_length_leaf[valid_rays_mask], lambda_1).astype(np.float32)
+        sum_eff_free_path_length_leaf = np.sum(eff_free_path_length_leaf, axis=2)
+        n_hits_leaf = hit_leaf.sum(axis=2).astype(np.int32)
+
+        mean_free_path_length_leaf = np.nanmean(free_path_length_leaf, axis=2)
+        mean_eff_free_path_length_leaf, var_eff_free_path_length_leaf = mean_var_ddof1(eff_free_path_length_leaf, N)
+        sum_hits_eff_free_path_length_leaf = (eff_free_path_length_leaf * hit_leaf).sum(axis=2)
+
+        stats_leaf = [[None for _ in range(A)] for _ in range(F)]
+        for f in range(F):
+            for a in range(A):
+                stats_leaf[f][a] = dict(
+                    N=int(N[f, a]),
+                    n_hits=int(n_hits_leaf[f, a]),
+                    I=(float(n_hits_leaf[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
+                    mean_path_length=float(mean_path_length[f, a]),
+                    sum_path_length=float(sum_path_length[f, a]),
+                    sum_free_path_length=float(sum_free_path_length_leaf[f, a]),
+                    mean_free_path_length=float(mean_free_path_length_leaf[f, a]),
+                    mean_eff_free_path_length=float(mean_eff_free_path_length_leaf[f, a]),
+                    var_eff_free_path_length=float(var_eff_free_path_length_leaf[f, a]),
+                    sum_eff_free_path_length=float(sum_eff_free_path_length_leaf[f, a]),
+                    sum_hits_eff_free_path_length=float(sum_hits_eff_free_path_length_leaf[f, a]),
+                )
+        
+    else:
+        stats_leaf = [[None for _ in range(A)] for _ in range(F)]
+        for f in range(F):
+            for a in range(A):
+                stats_leaf[f][a] = dict(
+                    N=0,
+                    n_hits=0,
+                    I=0.0,
+                    mean_path_length=0.0,
+                    sum_path_length=0.0,
+                    sum_free_path_length=0.0,
+                    mean_free_path_length=0.0,
+                    mean_eff_free_path_length=0.0,
+                    var_eff_free_path_length=0.0,
+                    sum_eff_free_path_length=0.0,
+                    sum_hits_eff_free_path_length=0.0,
+                )
+
+    ### Wood-only Stats ###
+    if _is_wood:
+        hit_wood  = np.isfinite(dist_wood)            # (F,A,R)
+        # free_path_length for wood-only: distance from t_near to wood intersection
+        free_path_length_wood = path_lengths.copy()
+        free_path_length_wood[hit_wood] = dists[hit_wood] - t_near[hit_wood]
+
+        # Effective free path length transforms (you already have compute_efpl_array)
+        # Compute only on valid rays to avoid NaNs
+        eff_free_path_length_path = np.zeros_like(path_lengths, dtype=np.float32)
+        eff_free_path_length_wood = np.zeros_like(free_path_length_wood, dtype=np.float32)
+
+        eff_free_path_length_wood[valid_rays_mask]   = compute_efpl_array(free_path_length_wood[valid_rays_mask], lambda_1).astype(np.float32)
+
+        n_hits_wood = hit_wood.sum(axis=2).astype(np.int32)              # (F,A)
+
+        sum_free_path_length_wood  = free_path_length_wood.sum(axis=2)                                 # (F,A)
+        mean_free_path_length_wood = np.divide(sum_free_path_length_wood, N, out=np.zeros_like(sum_free_path_length_wood), where=(N > 0))
+        mean_eff_free_path_length_wood, var_eff_free_path_length_wood = mean_var_ddof1(eff_free_path_length_wood, N)
+
+        sum_hits_eff_free_path_length_wood = (eff_free_path_length_wood * hit_wood).sum(axis=2)
+
+        stats_wood= [[None for _ in range(A)] for _ in range(F)]
+
+        for f in range(F):
+            for a in range(A):
+                stats_wood[f][a] = dict(
+                    N=int(N[f, a]),
+                    n_hits=int(n_hits_wood[f, a]),
+                    I=(float(n_hits_wood[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
+                    mean_path_length=float(mean_path_length[f, a]),
+                    sum_path_length=float(sum_path_length[f, a]),
+                    sum_free_path_length=float(sum_free_path_length_wood[f, a]),
+                    mean_free_path_length=float(mean_free_path_length_wood[f, a]),
+                    mean_eff_free_path_length=float(mean_eff_free_path_length_wood[f, a]),
+                    var_eff_free_path_length=float(var_eff_free_path_length_wood[f, a]),
+                    sum_eff_free_path_length=float((eff_free_path_length_wood).sum(axis=2)[f, a]),
+                    sum_hits_eff_free_path_length=float(sum_hits_eff_free_path_length_wood[f, a]),
+                    mean_eff_free_path_length_free=float(mean_eff_free_path_length_wood[f, a]),
+                    var_eff_free_path_length_free=float(var_eff_free_path_length_wood[f, a])
+                )
+
+    else:
+        stats_wood = [[None for _ in range(A)] for _ in range(F)]
+        for f in range(F):
+            for a in range(A):
+                stats_wood[f][a] = dict(
+                    N=0,
+                    n_hits=0,
+                    I=0.0,
+                    mean_path_length=0.0,
+                    sum_path_length=0.0,
+                    sum_free_path_length=0.0,
+                    mean_free_path_length=0.0,
+                    mean_eff_free_path_length=0.0,
+                    var_eff_free_path_length=0.0,
+                    sum_eff_free_path_length=0.0,
+                    sum_hits_eff_free_path_length=0.0,
+                    mean_eff_free_path_length_free=0.0,
+                    var_eff_free_path_length_free=0.0
+                )
 
     return stats_comb, stats_leaf, stats_wood
 
@@ -1385,14 +1438,6 @@ def process_voxel(
             f"Error computing LIAD for voxel at {voxel_center}: {e}"
         ) from e
 
-    # Build voxel scene
-    try:
-        voxel_scene, leaf_gid, wood_gid = build_voxel_scene(o3d_leaf, o3d_wood)
-    except Exception as e:
-        raise RuntimeError(
-            f"Error building voxel scene for voxel at {voxel_center}: {e}"
-        ) from e
-    
     # Build ray tensor for all rays in voxel
     rays_FAR6, face_order, angles_sorted = build_ray_tensor_for_voxel(
     voxel_center=voxel_center, 
@@ -1411,6 +1456,7 @@ def process_voxel(
                     continue
 
                 voxel_scene, leaf_gid, wood_gid = build_voxel_scene(o3d_leaf, None)
+                # print(f"leaf --> {leaf_gid}, {wood_gid}")
                 
                 
                 
@@ -1422,6 +1468,7 @@ def process_voxel(
                     continue
 
                 voxel_scene, leaf_gid, wood_gid = build_voxel_scene(None, o3d_wood)
+                # print(f"wood --> {leaf_gid}, {wood_gid}")
                 
 
             elif scene == "combined":
@@ -1457,15 +1504,15 @@ def process_voxel(
 
                         ### G ###
                         G_leaf_est = np.nan
-                        if leaf_data["n_hits"] >= MIN_HITS and bin_leaf.size > 0:
+                        if bin_leaf.size > 0:
                             G_leaf_est = compute_G_function_binwise([angle], bin_leaf, liad)[0]
 
                         G_wood_est = np.nan
-                        if wood_data["n_hits"] >= MIN_HITS and bin_wood.size > 0:
+                        if bin_wood.size > 0:
                             G_wood_est = compute_G_function_binwise([angle], bin_wood, wiad)[0]
 
                         G_comb_est = np.nan
-                        if comb_data["n_hits"] >= MIN_HITS and bin_comb.size > 0:
+                        if bin_comb.size > 0:
                             G_comb_est = compute_G_function_binwise([angle], bin_comb, piad)[0]
 
                         ### pgap ###
@@ -1540,9 +1587,9 @@ def process_voxel(
                             "total_num_hits": int(comb_data["n_hits"]) if comb_data["n_hits"] is not None else np.nan,
                             "total_missed_rays": int(comb_data["N"] - comb_data["n_hits"]) if comb_data["N"] is not None and comb_data["n_hits"] is not None else np.nan,
                             # hits per component
-                            "n_hits_leaf": int(leaf_data["n_hits"]) if leaf_data["n_hits"] is not None else np.nan,
-                            "n_hits_wood": int(wood_data["n_hits"]) if wood_data["n_hits"] is not None else np.nan,
-                            "n_hits_comb": int(comb_data["n_hits"]) if comb_data["n_hits"] is not None else np.nan,
+                            "n_hits_leaf": int(leaf_data["n_hits"]) if (leaf_data["n_hits"] is not None and not np.isnan(leaf_data["n_hits"])) else np.nan,
+                            "n_hits_wood": int(wood_data["n_hits"]) if (wood_data["n_hits"] is not None and not np.isnan(wood_data["n_hits"])) else np.nan,
+                            "n_hits_comb": int(comb_data["n_hits"]) if (comb_data["n_hits"] is not None and not np.isnan(comb_data["n_hits"])) else np.nan,
                             # observed I
                             "I_leaf": float(leaf_data["I"]) if leaf_data["I"] is not None else np.nan,
                             "I_wood": float(wood_data["I"]) if wood_data["I"] is not None else np.nan,
