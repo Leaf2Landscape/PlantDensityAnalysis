@@ -870,21 +870,23 @@ def simulate_voxel_grouped(scene, leaf_gids, wood_gids,
         comb_dist = np.full_like(dists, np.inf, dtype=np.float32)
         comb_dist[valid_hits_mask] = dists[valid_hits_mask]
 
+    N = valid_rays_mask.sum(axis=2).astype(np.int32)                 # (F,A)
     hit_any   = np.isfinite(comb_dist)            # (F,A,R)
+    n_hits_lw   = hit_any.sum(axis=2).astype(np.int32)               # (F,A)
+    
     path_lengths = np.zeros_like(dists, dtype=np.float32)
     path_lengths[valid_rays_mask] = (t_far[valid_rays_mask] - t_near[valid_rays_mask])
-    mean_path_length = np.nanmean(path_lengths, axis=2)          # (F,A)
+    mean_path_length = np.divide(path_lengths.sum(axis=2), N, out=np.zeros_like(path_lengths.sum(axis=2)), where=(N > 0))  # (F,A)
     sum_path_length  = path_lengths.sum(axis=2)                  # (F,A)
     free_path_length_comb = path_lengths.copy()
     free_path_length_comb[hit_any] = comb_dist[hit_any] - t_near[hit_any]
     eff_free_path_length_comb = np.zeros_like(free_path_length_comb, dtype=np.float32)
     eff_free_path_length_comb[valid_rays_mask] = compute_efpl_array(free_path_length_comb[valid_rays_mask], lambda_1).astype(np.float32)
     sum_eff_free_path_length_comb = np.sum(eff_free_path_length_comb, axis=2)
-    N = valid_rays_mask.sum(axis=2).astype(np.int32)                 # (F,A)
-    n_hits_lw   = hit_any.sum(axis=2).astype(np.int32)               # (F,A)
+    
     sum_path_lengths   = path_lengths.sum(axis=2)                                  # (F,A)
     sum_free_path_length_comb    = free_path_length_comb.sum(axis=2)            # (F,A)
-    mean_free_path_length_comb   = np.nanmean(free_path_length_comb, axis=2)          # (F,A)
+    mean_free_path_length_comb   = np.divide(sum_free_path_length_comb, N, out=np.zeros_like(sum_free_path_length_comb), where=(N > 0))  # (F,A)
     mean_eff_free_path_length_comb, var_eff_free_path_length_comb = mean_var_ddof1(eff_free_path_length_comb, N)
     sum_hits_eff_free_path_length_comb   = (eff_free_path_length_comb * hit_any).sum(axis=2)
 
@@ -1491,6 +1493,10 @@ def process_voxel(
             try:
                 for f_idx, face_lbl in enumerate(face_order):
                     for a_idx, angle in enumerate(angles_sorted):
+                        dx = rays_FAR6[f_idx, a_idx, 0, 3]
+                        dy = rays_FAR6[f_idx, a_idx, 0, 4]
+                        dz = rays_FAR6[f_idx, a_idx, 0, 5]
+
                         comb_data = stats_comb_grouped[f_idx][a_idx]
                         leaf_data = stats_leaf_grouped[f_idx][a_idx]
                         wood_data = stats_wood_grouped[f_idx][a_idx]
@@ -1521,50 +1527,15 @@ def process_voxel(
                         pgap_comb = 1.0 - comb_data["I"]
 
                         ### CI from G ###
-                        CI_leaf = (-math.log(pgap_leaf) / (G_leaf_est * LAI)
-                            if (LAI > 0 and G_leaf_est > 0 and
-                                0 < pgap_leaf < 1) else np.nan)
-                        CI_wood = (-math.log(pgap_wood) / (G_wood_est * WAI)
-                            if (WAI > 0 and G_wood_est > 0 and
-                                0 < pgap_wood < 1) else np.nan)
-                        CI_comb = (-math.log(pgap_comb) / (G_comb_est * PAI)
-                            if (PAI > 0 and G_comb_est > 0 and
-                                0 < pgap_comb < 1) else np.nan)
-                        
-                        # ### LAD / WAD / PAD metrics ###
-                        # lad = compute_lad_metrics(
-                        #     hits_leaf=leaf_data["n_hits"],
-                        #     N=leaf_data["N"],
-                        #     G_leaf=G_leaf_est,
-                        #     delta_bar=leaf_data["delta_bar"],
-                        #     mean_z=leaf_data["mean_z"],
-                        #     mean_delta_e=leaf_data["mean_delta_e"],
-                        #     var_delta_e=leaf_data["var_delta_e"],
-                        #     lambda_1=lambda_1
-                        # )
-
-                        # wad = compute_lad_metrics(
-                        #     hits_leaf=wood_data["n_hits"],
-                        #     N=wood_data["N"],
-                        #     G_leaf=G_wood_est,
-                        #     delta_bar=wood_data["delta_bar"],
-                        #     mean_z=wood_data["mean_z"],
-                        #     mean_delta_e=wood_data["mean_delta_e"],
-                        #     var_delta_e=wood_data["var_delta_e"],
-                        #     lambda_1=lambda_1
-                        # )
-
-                        # pad = compute_pad_metrics(
-                        #     hits_lw=comb_data["n_hits"],
-                        #     hits_leaf=leaf_data["n_hits"],
-                        #     N=comb_data["N"],
-                        #     G_lw=G_comb_est,
-                        #     delta_bar=comb_data["delta_bar"],
-                        #     sum_z_lw=comb_data["sum_z"],
-                        #     sum_z_e_lw=comb_data["sum_z_e"],
-                        #     sum_hits_z_e_leaf=leaf_data["sum_hits_z_e"],
-                        #     sum_hits_z_e_lw=comb_data["sum_hits_z_e"],
-                        #     alpha=alpha,
+                        CI_leaf = (-math.log(pgap_leaf) / (G_leaf_est * LAD * leaf_data["mean_path_length"])
+                            if (LAD is not None and LAD > 0 and G_leaf_est > 0 and
+                                0 < pgap_leaf < 1 and leaf_data["mean_path_length"] is not None and leaf_data["mean_path_length"] > 0) else np.nan)
+                        CI_wood = (-math.log(pgap_wood) / (G_wood_est * WAD * wood_data["mean_path_length"])
+                            if (WAD is not None and WAD > 0 and G_wood_est > 0 and
+                                0 < pgap_wood < 1 and wood_data["mean_path_length"] is not None and wood_data["mean_path_length"] > 0) else np.nan)
+                        CI_comb = (-math.log(pgap_comb) / (G_comb_est * PAD * comb_data["mean_path_length"])
+                            if (PAD is not None and PAD > 0 and G_comb_est > 0 and
+                                0 < pgap_comb < 1 and comb_data["mean_path_length"] is not None and comb_data["mean_path_length"] > 0) else np.nan)
                         
                         ### data prep ###
                         leaf_fraction = (leaf_data["n_hits"] / comb_data["n_hits"]
@@ -1574,7 +1545,8 @@ def process_voxel(
                         
                         row = {
                             "voxel_cx": float(voxel_center[0]), "voxel_cy": float(voxel_center[1]), "voxel_cz": float(voxel_center[2]),
-                            "face": face_lbl, "angle_deg": angle,
+                            "face": face_lbl, "viewing_angle": angle,
+                            "dx": dx, "dy": dy, "dz": dz,
                             # reference densities
                             "LAI_ref": float(LAI) if LAI is not None else np.nan, 
                             "WAI_ref": float(WAI) if WAI is not None else np.nan,
@@ -1705,6 +1677,7 @@ if __name__ == "__main__":
     parser.add_argument("scene_file", type=str, help="Path to the single .obj scene file. This will automatically extract leaf and wood meshes.")
     parser.add_argument("--scene_formats", type=str, nargs='+', default=["combined"], help="Scene formats to process (default: ['combined']), use 'leaf' for leaf-only and 'wood' for wood-only.")
     parser.add_argument("--voxel_sizes", type=float, nargs='+', default=[0.2, 0.5, 1.0, 2.0], help="Voxel sizes for processing (default: [0.2, 0.5, 1.0, 2.0]).")
+    parser.add_argument("--angles", type=float, nargs='+', default=[0,10,20,30,40,50,60,70,80,90], help="Rotation angles in degrees for ray tracing, which are your zenith viewing angles (default: [0,10,20,30,40,50,60,70,80,90]).")
     parser.add_argument("--ray_spacing", type=float, default=0.005, help="Ray spacing for ray tracing (default: 0.1).")
     parser.add_argument("--wood_volume_voxel_size", type=float, default=0.01, help="Voxel size for wood volume calculation (default: 0.01).")
     parser.add_argument("--wood_volume_threshold", type=int, default=4, help="Threshold for wood volume calculation (default: 4).")
@@ -1718,6 +1691,7 @@ if __name__ == "__main__":
     print(f"Processing scene file: {args.scene_file}")
     print(f"Scene formats: {args.scene_formats}")
     print(f"Voxel sizes: {args.voxel_sizes}")
+    print(f"Angles: {args.angles}")
     print(f"Ray spacing: {args.ray_spacing}")
     print(f"Wood volume voxel size: {args.wood_volume_voxel_size}")
     print(f"Wood volume threshold: {args.wood_volume_threshold}")
@@ -1810,7 +1784,15 @@ if __name__ == "__main__":
     num_cpus = max(1, num_cpus)
     n_workers = min(args.max_workers, num_cpus)
 
-    angles = [0.0000001, 10, 20, 30, 40, 50, 60, 70, 80, 89.9999]  # Example angles in degrees
+    # Ensure 0 and 90 degree angles, if included, are increased/decreased by a tiny epsilon
+    angles = set(args.angles)
+    if 0 in angles:
+        angles.remove(0)
+        angles.add(0.0001)
+    if 90 in angles:
+        angles.remove(90)
+        angles.add(89.9999)
+    # Sort angles and pass to global
     ANGLE_ORDER = sorted(angles)
 
 

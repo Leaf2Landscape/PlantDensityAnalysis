@@ -55,7 +55,7 @@
             "console": "integratedTerminal",
             "args": [
                 "/home/capheus/projects/1015_tree/1015_emac_RF1_9.0_1.7_4_inc125_diamond_erecto.obj",
-                "--voxel_sizes", "2.0", "1.0", "0.2", "0.5", "--scene_formats", "combined"
+                "--voxel_sizes", "2.0", "--scene_formats", "combined"
             ]
         },
         {
