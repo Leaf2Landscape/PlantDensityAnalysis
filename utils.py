@@ -2812,18 +2812,19 @@ def traverse_voxels(voxel_references, ray_partition, memory_limit_bytes, min_chu
     optimal_chunk_size = int(memory_limit_bytes / (memory_per_voxel))
     optimal_chunk_size = max(min_chunk_size, min(optimal_chunk_size, max_chunk_size))
 
-    print(f"[traverse_voxels] Memory diagnostics:")
-    print(f"  - Number of unique rays (U): {U}")
-    # print(f"  - Number of voxels: {len(voxel_centres)}")
-    # print(f"  - Memory limit (bytes): {memory_limit_bytes}")
-    # print(f"  - Broadcast memory per voxel: {broadcast_memory} bytes")
-    # print(f"  - Intermediate memory per voxel: {intermediate_memory} bytes")
-    # print(f"  - Hit mask memory per voxel: {hit_mask_memory} bytes")
-    # print(f"  - Box intersection memory per voxel: {box_intersection_memory} bytes")
-    # print(f"  - Mask memory per voxel: {mask_memory} bytes")
-    # print(f"  - Total memory per voxel: {memory_per_voxel} bytes ({memory_per_voxel / (1024**2):.2f} MB)")
-    print(f"  - Optimal chunk size: {optimal_chunk_size} voxels")
-    # print(f"  - Min chunk size: {min_chunk_size}, Max chunk size: {max_chunk_size}")
+    if debug:
+        print(f"[traverse_voxels] Memory diagnostics:")
+        print(f"  - Number of unique rays (U): {U}")
+        print(f"  - Number of voxels: {len(voxel_centres)}")
+        print(f"  - Memory limit (bytes): {memory_limit_bytes}")
+        print(f"  - Broadcast memory per voxel: {broadcast_memory} bytes")
+        print(f"  - Intermediate memory per voxel: {intermediate_memory} bytes")
+        print(f"  - Hit mask memory per voxel: {hit_mask_memory} bytes")
+        print(f"  - Box intersection memory per voxel: {box_intersection_memory} bytes")
+        print(f"  - Mask memory per voxel: {mask_memory} bytes")
+        print(f"  - Total memory per voxel: {memory_per_voxel} bytes ({memory_per_voxel / (1024**2):.2f} MB)")
+        print(f"  - Optimal chunk size: {optimal_chunk_size} voxels")
+        print(f"  - Min chunk size: {min_chunk_size}, Max chunk size: {max_chunk_size}")
 
     # Iterate through voxel sizes and subsequently chunks
     hit_masks = []
@@ -5019,6 +5020,7 @@ def add_normals_weights_to_valid_rays(valid_rays_dir, knn=6, debug=False):
             print("Duplicate indices found in leaf_idx. This may cause assignment errors.")
             raise ValueError("Duplicate indices found in leaf_idx. Please check your data for duplicates.")
 
+        print(f"Calculating normals and weights for {leaf_points.shape[0]} leaf points...")
         # Calculate normals and weights on all leaf hits
         normals, weights = compute_normals_weights_from_points(points=leaf_points, knn=knn)
         del leaf_points
@@ -5216,3 +5218,91 @@ def fix_incorrect_intersections(valid_rays_dir, num_jobs=-1):
     )
     for _ in tqdm(results, desc="Processing intersection files"):
         pass
+
+
+def test_helios_settings(helios_dir, use_class, leaf_object_ids, wood_object_ids, output_dir):
+    """
+    Test helios settings by plotting a sample of points from the helios files.
+    
+    Args:
+        helios_dir (str): Directory containing helios .xyz files.
+        use_class (bool): Whether to use classification or hit_object_id for identifying leaf/wood.
+        leaf_object_ids (list): List of object IDs corresponding to leaf points.
+        wood_object_ids (list): List of object IDs corresponding to wood points.
+        valid_rays_dir (str): Directory to save the output plot.
+
+    Returns:
+        None
+
+    User can check saved image to verify if leaf and wood points are set correctly.
+    """
+    import csv
+    import glob
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # Check classification and object_ids
+    helios_files = glob.glob(os.path.join(helios_dir, '*.xyz'))
+    if helios_files:
+        test_file = helios_files[0]     # Just use the first file
+        class_col = 9 if use_class else 8      # if not use_class, assume use hit_object_id
+        num_test_points = 1000
+
+        num_rows = 0
+        leaf_points = []
+        wood_points = []
+        other_points = []
+        with open(test_file, newline="") as f:
+            reader = csv.reader(f, delimiter=' ')
+            while num_rows < num_test_points:
+                for row in reader:
+                    x = float(row[0])
+                    y = float(row[1])
+                    z = float(row[2])
+
+                    class_id = int(row[class_col])
+                    if class_id in leaf_object_ids:
+                        leaf_points.append([x,y,z])
+                    elif class_id in wood_object_ids:
+                        wood_points.append([x,y,z])
+                    else:
+                        other_points.append([x,y,z])
+                    num_rows += 1
+
+        if len(leaf_points) > 0 or len(wood_points) > 0 or len(other_points) > 0:
+            # Convert to numpy
+            leaf_points = np.array(leaf_points, dtype=np.float32)
+            wood_points = np.array(wood_points, dtype=np.float32)
+            other_points = np.array(other_points, dtype=np.float32)
+            
+            # Plot point cloud
+            fig = plt.figure(figsize=(10, 6))
+            ax = fig.add_subplot(111)
+
+            # Plot leaf points in green
+            if leaf_points.size > 0:
+                ax.scatter(leaf_points[:, 0], leaf_points[:, 2], c='green', s=1, label='Leaf')
+
+            # Plot wood points in brown
+            if wood_points.size > 0:
+                ax.scatter(wood_points[:, 0], wood_points[:, 2], c='saddlebrown', s=1, label='Wood')
+
+            # Plot other points in blue
+            if other_points.size > 0:
+                ax.scatter(other_points[:, 0], other_points[:, 2], c='blue', s=1, label='Other')
+
+            print("Plotting leaf and wood points to check classification...")
+            ax.set_xlabel('X')
+            ax.set_ylabel('Z')
+            ax.set_title(f'Leaf and Wood Point Check - File {os.path.basename(test_file)}')
+            ax.legend()
+
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+                plt.savefig(os.path.join(output_dir, f'file_{os.path.basename(test_file)}_leaf_wood_check.png'))
+                plt.close()
+                print(f"Saved leaf and wood check plot to {output_dir}")
+                return True
+            except Exception as e:
+                print(f"Error saving plot: {e}")
+                return False
