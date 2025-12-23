@@ -59,15 +59,37 @@
             ]
         },
         {
-            "name": "single_tree_leaf_off",
+            "name": "single_tree_helios",
             "type": "debugpy",
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
             "args": [
-                "/home/capheus/projects/RAJA_TEST/1011_etri_plano_diamond.obj",
-                "--voxel_sizes", "2.0",
-                "--leaf_off"
+                "/home/capheus/projects/1001_etri_erecto_diamond",
+                "--use_class"
+            ]
+        },
+        {
+            "name": "single_tree_helios_test",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": [
+                "/home/capheus/projects/1001_etri_erecto_diamond",
+                "--use_class",
+                "--test_mode"
+            ]
+        },
+        {
+            "name": "single_tree_metrics",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": [
+                "/home/capheus/projects/1001_etri_erecto_diamond",
+                "--average_leaf_area", "0.003582"
             ]
         }
     ]
