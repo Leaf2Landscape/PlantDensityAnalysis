@@ -1509,17 +1509,22 @@ def process_voxel(
                             wood_data = {k: np.nan for k in wood_data}
 
                         ### G ###
+                        # Convert dz to zenith angle in degrees
+                        # Normalize direction vector and extract zenith angle
+                        dir_norm = math.sqrt(dx**2 + dy**2 + dz**2)
+                        zenith_angle = math.degrees(math.acos(abs(dz) / dir_norm)) if dir_norm > 0 else 0.0
+
                         G_leaf_est = np.nan
                         if bin_leaf.size > 0:
-                            G_leaf_est = compute_G_function_binwise([angle], bin_leaf, liad)[0]
+                            G_leaf_est = compute_G_function_binwise([zenith_angle], bin_leaf, liad)[0]
 
                         G_wood_est = np.nan
                         if bin_wood.size > 0:
-                            G_wood_est = compute_G_function_binwise([angle], bin_wood, wiad)[0]
+                            G_wood_est = compute_G_function_binwise([zenith_angle], bin_wood, wiad)[0]
 
                         G_comb_est = np.nan
                         if bin_comb.size > 0:
-                            G_comb_est = compute_G_function_binwise([angle], bin_comb, piad)[0]
+                            G_comb_est = compute_G_function_binwise([zenith_angle], bin_comb, piad)[0]
 
                         ### pgap ###
                         pgap_leaf = 1.0 - leaf_data["I"]
@@ -1545,7 +1550,7 @@ def process_voxel(
                         
                         row = {
                             "voxel_cx": float(voxel_center[0]), "voxel_cy": float(voxel_center[1]), "voxel_cz": float(voxel_center[2]),
-                            "face": face_lbl, "viewing_angle": angle,
+                            "face": face_lbl, "zenith_angle": zenith_angle,
                             "dx": dx, "dy": dy, "dz": dz,
                             # reference densities
                             "LAI_ref": float(LAI) if LAI is not None else np.nan, 
@@ -1677,7 +1682,7 @@ if __name__ == "__main__":
     parser.add_argument("scene_file", type=str, help="Path to the single .obj scene file. This will automatically extract leaf and wood meshes.")
     parser.add_argument("--scene_formats", type=str, nargs='+', default=["combined"], help="Scene formats to process (default: ['combined']), use 'leaf' for leaf-only and 'wood' for wood-only.")
     parser.add_argument("--voxel_sizes", type=float, nargs='+', default=[0.2, 0.5, 1.0, 2.0], help="Voxel sizes for processing (default: [0.2, 0.5, 1.0, 2.0]).")
-    parser.add_argument("--angles", type=float, nargs='+', default=[0,10,20,30,40,50,60,70,80,90], help="Rotation angles in degrees for ray tracing, which are your zenith viewing angles (default: [0,10,20,30,40,50,60,70,80,90]).")
+    parser.add_argument("--num_angle_bins", type=int, default=18, help="Number of angle bins for ray tracing (default: 18).")
     parser.add_argument("--ray_spacing", type=float, default=0.005, help="Ray spacing for ray tracing (default: 0.1).")
     parser.add_argument("--wood_volume_voxel_size", type=float, default=0.01, help="Voxel size for wood volume calculation (default: 0.01).")
     parser.add_argument("--wood_volume_threshold", type=int, default=4, help="Threshold for wood volume calculation (default: 4).")
@@ -1784,8 +1789,10 @@ if __name__ == "__main__":
     num_cpus = max(1, num_cpus)
     n_workers = min(args.max_workers, num_cpus)
 
-    # Ensure 0 and 90 degree angles, if included, are increased/decreased by a tiny epsilon
-    angles = set(args.angles)
+    # Cut 0 to 90 degrees into discrete bins from num_angle_bins
+    angles = np.linspace(0, 90, args.num_angle_bins + 1)  # Create bins from 0 to 90 degrees
+    angle_centers = (angles[:-1] + angles[1:]) / 2  # Calculate the centers of the bins
+    angles = set(angle_centers)
     if 0 in angles:
         angles.remove(0)
         angles.add(0.0001)
