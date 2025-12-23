@@ -1696,7 +1696,7 @@ if __name__ == "__main__":
     print(f"Processing scene file: {args.scene_file}")
     print(f"Scene formats: {args.scene_formats}")
     print(f"Voxel sizes: {args.voxel_sizes}")
-    print(f"Angles: {args.angles}")
+    print(f"Number of Angle Bins: {args.num_angle_bins}")
     print(f"Ray spacing: {args.ray_spacing}")
     print(f"Wood volume voxel size: {args.wood_volume_voxel_size}")
     print(f"Wood volume threshold: {args.wood_volume_threshold}")
@@ -1791,7 +1791,7 @@ if __name__ == "__main__":
 
     # Cut 0 to 90 degrees into discrete bins from num_angle_bins
     angles = np.linspace(0, 90, args.num_angle_bins + 1)  # Create bins from 0 to 90 degrees
-    angle_centers = (angles[:-1] + angles[1:]) / 2  # Calculate the centers of the bins
+    angle_centers = np.round((angles[:-1] + angles[1:]) / 2, 1)  # Calculate the centers of the bins
     angles = set(angle_centers)
     if 0 in angles:
         angles.remove(0)
