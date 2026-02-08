@@ -21,6 +21,7 @@ from scipy.sparse.csgraph import connected_components
 import time
 import dask.dataframe as dd
 from dask import delayed
+from numba import njit, prange
 
 
 # Dask test modules
@@ -525,102 +526,155 @@ def _gen_dataframe(schema):
     df = pd.DataFrame({name: pd.Series(dtype=dtype) for name, dtype in fields})
     return df
 
-def compute_normals_weights_from_points(points, voxel_size=10.0, knn=6):
-    from tqdm import tqdm
-    import open3d as o3d
-    import numpy as np
-    from collections import defaultdict
-    from joblib import Parallel, delayed
+def compute_normals_weights_from_points(points, voxel_size=20.0, knn=6):
     """
-    Get normals and weights from points.
+    Get normals and weights from points, optimized for Dask map_partitions.
+    Uses numba JIT compilation and vectorized operations.
     
     INPUTS:
-        points: A numpy array of points
+        points: A numpy array of points (N, 3)
+        voxel_size: Size of voxels for spatial binning
         knn: The number of nearest neighbours to consider
 
     OUTPUTS:
-        normals: The normals of the points
-        weights: The weights of the points
+        normals: The normals of the points (N, 3)
+        weights: The weights of the points (N,)
     """
+    import numpy as np
+    from scipy.spatial import cKDTree
+    
+    
+    points = np.asarray(points, dtype=np.float64)
+    
     if len(points) < knn:
-        return np.ones(len(points)), np.ones(len(points))
+        return np.zeros((len(points), 3), dtype=np.float64), np.ones(len(points), dtype=np.float64)
 
-    # Fast voxel indexing
-    print("Initialising voxels")
-    voxel_indices = (points / voxel_size).astype(int)
-    voxel_keys = np.char.add(
-    np.char.add(voxel_indices[:, 0].astype(str), '_'),
-    np.char.add(voxel_indices[:, 1].astype(str), '_')
+    # Fast voxel-based spatial partitioning (no parallelization overhead)
+    voxel_indices = (points / voxel_size).astype(np.int32)
+    voxel_keys = (
+        voxel_indices[:, 0].astype(np.int64) * 1000000 +
+        voxel_indices[:, 1].astype(np.int64) * 1000 +
+        voxel_indices[:, 2].astype(np.int64)
     )
-    voxel_keys = np.char.add(voxel_keys, voxel_indices[:, 2].astype(str))
-
-    voxel_dict = defaultdict(list)
-
-    def add_to_voxel_dict(idx_key_tuple):
-        idx, key = idx_key_tuple
-        return key, (idx, points[idx])
-
-    # Use joblib to parallelize the assignment
-    results = Parallel(n_jobs=-1)(
-        delayed(add_to_voxel_dict)(item) for item in tqdm(enumerate(voxel_keys), total=len(voxel_keys), desc="Indexing voxels")
-    )
-
-    for key, value in results:
-        voxel_dict[key].append(value)
-
-    # # Compute the normals with open3d
-    # pcd = o3d.geometry.PointCloud()
-    # pcd.points = o3d.utility.Vector3dVector(points)
-    # voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=10.0)
-
-    normals = np.zeros((len(points), 3))
-    weights = np.zeros(len(points))
-
-    def process_voxel(voxel_data):
-        idxs, pts = zip(*voxel_data)
-        voxel_pcd = o3d.geometry.PointCloud()
-        voxel_pcd.points = o3d.utility.Vector3dVector(pts)
-        voxel_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=knn))
-        distances = np.asarray(voxel_pcd.compute_nearest_neighbor_distance())
-        voxel_normals = np.asarray(voxel_pcd.normals)
-        voxel_weights = 1 / (distances + 1e-9)
-        return idxs, voxel_normals, voxel_weights
-
-    for key in tqdm(voxel_dict.keys(), desc="Processing voxels"):
-        idxs, voxel_normals, voxel_weights = process_voxel(voxel_dict[key])
-        for i, idx in enumerate(idxs):
-            normals[idx] = voxel_normals[i]
-            weights[idx] = voxel_weights[i]
-
+    
+    # Group by voxel using argsort (faster than dict for large arrays)
+    sort_idx = np.argsort(voxel_keys)
+    sorted_keys = voxel_keys[sort_idx]
+    split_indices = np.where(np.diff(sorted_keys) != 0)[0] + 1
+    
+    normals = np.zeros((len(points), 3), dtype=np.float64)
+    weights = np.ones(len(points), dtype=np.float64)
+    
+    # Process each voxel independently
+    voxel_starts = np.concatenate(([0], split_indices))
+    voxel_ends = np.concatenate((split_indices, [len(points)]))
+    
+    for start, end in zip(voxel_starts, voxel_ends):
+        voxel_point_indices = sort_idx[start:end]
+        voxel_points = points[voxel_point_indices]
+        
+        # Skip voxels with too few points
+        if len(voxel_points) < knn:
+            continue
+        
+        # Use scipy cKDTree for fast KNN within voxel
+        tree = cKDTree(voxel_points)
+        distances, neighbor_indices = tree.query(
+            voxel_points, 
+            k=min(knn, len(voxel_points)),
+            workers=1  # Single-threaded within partition
+        )
+        
+        # Compute PCA normals for each point using neighbors
+        voxel_normals = _compute_normals_vectorized(voxel_points, neighbor_indices)
+        voxel_weights = 1.0 / (distances[:, -1] + 1e-9)
+        
+        normals[voxel_point_indices] = voxel_normals
+        weights[voxel_point_indices] = voxel_weights
+    
     return normals, weights
 
-    def unique_key_from_voxel_centre(voxel_centre):
-        return f"{voxel_centre[0]}_{voxel_centre[1]}_{voxel_centre[2]}"
 
-    # Helper to get voxel id for a point
-    points_array = np.asarray(pcd.points)
-    for idx, point in tqdm(enumerate(points_array), total=len(points_array), desc="Assigning points to voxels"):
-        voxel_id = unique_key_from_voxel_centre(voxel_grid.get_voxel(point))
-        if voxel_id not in voxel_dict:
-            voxel_dict[voxel_id] = []
-        voxel_dict[voxel_id].append((idx, point))
+@njit(parallel=False)
+def _compute_normals_vectorized(points, neighbor_indices):
+    """
+    Compute normals using PCA on neighboring points.
+    Numba JIT compiled for speed.
+    
+    INPUTS:
+        points: Points array (N, 3)
+        neighbor_indices: KNN neighbor indices (N, K)
+    
+    OUTPUTS:
+        normals: Unit normal vectors (N, 3)
+    """
+    n_points = points.shape[0]
+    normals = np.zeros((n_points, 3), dtype=np.float64)
+    
+    for i in range(n_points):
+        # Get neighbor points
+        neighbor_pts = points[neighbor_indices[i]]
+        
+        # Compute centroid manually (Numba doesn't support np.mean with axis)
+        centroid = np.zeros(3)
+        for j in range(neighbor_pts.shape[0]):
+            for k in range(3):
+                centroid[k] += neighbor_pts[j, k]
+        for k in range(3):
+            centroid[k] /= neighbor_pts.shape[0]
+        
+        # Center points
+        centered = neighbor_pts - centroid
+        
+        # Compute covariance matrix (3x3)
+        cov = np.zeros((3, 3))
+        for j in range(centered.shape[0]):
+            for a in range(3):
+                for b in range(3):
+                    cov[a, b] += centered[j, a] * centered[j, b]
+        cov /= centered.shape[0]
+        
+        # Eigenvalue decomposition via power iteration (fast for 3x3)
+        # The normal is the eigenvector with smallest eigenvalue
+        normal = _compute_smallest_eigenvector_3x3(cov)
+        
+        normals[i] = normal
+    
+    return normals
 
-    # Iterate over voxels with progress bar
-    for voxel, points in tqdm(voxel_dict.items(), total=len(voxel_dict), desc="Estimating normals/weights per voxel"):
-        idxs, points = zip(*points)
 
-        voxel_pcd = o3d.geometry.PointCloud()
-        voxel_pcd.points = o3d.utility.Vector3dVector(points)
-        voxel_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=knn))
-        distances = np.asarray(voxel_pcd.compute_nearest_neighbor_distance())
-        voxel_normals = np.asarray(voxel_pcd.normals)
-        voxel_weights = 1 / (distances + 1e-9)
-
-        for i, idx in enumerate(idxs):
-            normals[idx] = voxel_normals[i]
-            weights[idx] = voxel_weights[i]
-
-    return normals, weights
+@njit
+def _compute_smallest_eigenvector_3x3(cov):
+    """
+    Compute the eigenvector of the smallest eigenvalue for 3x3 matrix.
+    Uses power iteration for speed.
+    """
+    # Start with random vector
+    v = np.array([1.0, 0.0, 0.0])
+    
+    # Power iteration to find largest eigenvector of (I - cov) = smallest of cov
+    # Invert via: find largest eigenvalue of -cov
+    for _ in range(10):  # Usually converges in 2-3 iterations
+        v_new = np.zeros(3)
+        for i in range(3):
+            for j in range(3):
+                v_new[i] -= cov[i, j] * v[j]  # Negate to find smallest
+        
+        # Normalize
+        norm = np.sqrt(v_new[0]**2 + v_new[1]**2 + v_new[2]**2)
+        if norm > 1e-10:
+            v_new /= norm
+        else:
+            break
+        
+        v = v_new
+    
+    # Normalize final result
+    norm = np.sqrt(v[0]**2 + v[1]**2 + v[2]**2)
+    if norm > 1e-10:
+        v /= norm
+    
+    return v
 
 # Create a unique ID for a voxel
 def create_voxel_id(voxel_size, x, y, z):
@@ -2570,7 +2624,7 @@ def potential_intersections_debug():
 
 
 # Function used for taking valid_rays parquet files and references to establish voxel_ray intersections per valid_rays file
-def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug=False, epsilon=1e-6):
+def voxel_ray_intersections(valid_rays_dir, references_dir, voxel_chunk_size=100, temp_dir=None, debug=False, epsilon=1e-6):
     import os
     import glob
     import pandas as pd
@@ -2586,13 +2640,17 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
     if os.environ.get('SLURM_CPUS_PER_TASK') is not None:
         print(f"Detected SLURM_CPUS_PER_TASK={os.environ.get('SLURM_CPUS_PER_TASK')}")
         avail_cpu = int(os.environ.get('SLURM_CPUS_PER_TASK'))
-        threads_per_worker = 2 # hard code this for your system
-        mem_threshold = 1.0
+        nthreads = 2 # hard code this for your system
+        mem_threshold = 0.9
     else:
         avail_cpu = psutil.cpu_count(logical=False)
-        threads_per_worker = psutil.cpu_count(logical=True) // avail_cpu
-        mem_threshold = 0.8
-        print(f"No SLURM_CPUS_PER_TASK detected, using system CPU count: {avail_cpu} physical cores with {threads_per_worker} threads per worker.")
+        nthreads = psutil.cpu_count(logical=True)
+        mem_threshold = 0.75
+        print(f"No SLURM_CPUS_PER_TASK detected, using system CPU count: {avail_cpu} physical cores with {nthreads} threads.")
+
+    optimal_workers = max(1, round(avail_cpu / 2))
+    threads_per_worker = max(1, nthreads // optimal_workers)
+    print(f"Optimal Dask configuration: {optimal_workers} workers with {threads_per_worker} threads each.")
 
     # avail_cpu = int(os.environ.get('SLURM_CPUS_PER_TASK', psutil.cpu_count(logical=True)))
     avail_mem = int(float(os.environ.get('SLURM_MEM_PER_NODE', psutil.virtual_memory().available // (1024 * 1024))) * mem_threshold) # in MB
@@ -2615,10 +2673,6 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
                 temp_dir = "/tmp"
                 print("Using fallback temporary directory: /tmp")
 
-    total_threads = avail_cpu * threads_per_worker
-    optimal_threads_per_worker = 8
-    optimal_workers = max(1, total_threads // optimal_threads_per_worker)
-
     memory_worker = avail_mem / optimal_workers
     avail_mem_string_for_dask = f"{int(memory_worker)}MB"
     print(f"[voxel_ray_intersections] Starting Dask with memory_limit={avail_mem_string_for_dask}")
@@ -2626,7 +2680,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
     client = _start_dask_client(
         memory_limit=avail_mem_string_for_dask,
         n_workers=optimal_workers,
-        threads_per_worker=optimal_threads_per_worker,
+        threads_per_worker=threads_per_worker,
         memory_target_fraction=0.6,
         memory_spill_fraction=0.75,
         memory_pause_fraction=0.95,
@@ -2673,7 +2727,7 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
     for file in valid_rays_files:
         leg_id = int(os.path.splitext(os.path.basename(file))[0].split("_")[1])
         print(f"[voxel_ray_intersections] Loading valid rays file for leg {leg_id}: {file}")
-        df = dd.read_parquet(file, engine='pyarrow', blocksize="25MB")
+        df = dd.read_parquet(file, engine='pyarrow', blocksize="15MB")
         print(f"[voxel_ray_intersections] Leg {leg_id} partitions: {df.npartitions}")
         meta = pd.DataFrame(columns=voxel_ray_intersection_schema.names)
 
@@ -2681,24 +2735,25 @@ def voxel_ray_intersections(valid_rays_dir, references_dir, temp_dir=None, debug
         # num_rays = df.map_partitions(len).compute().max()
         # num_voxels = len(voxel_references)
         # estimated_memory_per_partition = estimate_broadcast_memory(num_rays=num_rays, num_voxels=num_voxels)
-        result = df.map_partitions(
-            map_ray_partition_to_function,
-            voxel_group=voxel_references,
-            temp_dir=temp_dir,
-            meta=meta
-        )
+        # result = df.map_partitions(
+        #     map_ray_partition_to_function,
+        #     voxel_group=voxel_references,
+        #     temp_dir=temp_dir,
+        #     meta=meta
+        # )
 
 
-        # chunk_results = []
-        # for start in range(0, voxel_references.shape[0], voxel_chunk_size):
-        #     vchunk = voxel_references.iloc[start:start + voxel_chunk_size]
-        #     r = df.map_partitions(
-        #         map_ray_partition_to_function,
-        #         voxel_group=vchunk,
-        #         temp_dir=temp_dir,
-        #         meta=meta
-        #     )
-        #     chunk_results.append(r)
+        chunk_results = []
+        for start in range(0, voxel_references.shape[0], voxel_chunk_size):
+            vchunk = voxel_references.iloc[start:start + voxel_chunk_size]
+            r = df.map_partitions(
+                map_ray_partition_to_function,
+                voxel_group=vchunk,
+                temp_dir=temp_dir,
+                meta=meta
+            )
+            chunk_results.append(r)
+        result = dd.concat(chunk_results, axis=0, interleave_partitions=True)
     
         # result = dd.concat(chunk_results, axis=0, interleave_partitions=True)
         voxel_ray_intersections[leg_id] = result
@@ -2819,38 +2874,63 @@ def traverse_voxels(voxel_references, ray_partition, memory_limit_bytes, min_chu
 
     ### Traversal 1: Rough cull to reduce to potential voxel-ray intersections using ray-sphere intersection ###
 
-    # Calculate broadcast memory for ray-sphere intersection
-    broadcast_memory = 3 * U * 3 * 8    # Broadcast arrays: 3 arrays of (V_chunk, U, 3) × 8 bytes (float64)
-    intermediate_memory = 4 * U * 8     # Intermediate float arrays: oc, b, c, discriminant (conservative estimate)
-    hit_mask_memory = U * 1             # Hit mask: (V_chunk, U) × 1 byte (bool)
-    # Calculate broadcast memory for box intersection
-    box_intersection_memory = (2 * 3 * 8) + (2 * U * 0.5 * 3 * 8)   # Box intersection (when hits exist, worst case all hit):
-    mask_memory = 2 * U * 1      # Unique mask and final mask: (V_chunk, U) × 1 byte (bool)
-    buffer = 1.25  # Safety buffer
+    # Calculate memory usage more accurately
+    # Ray-sphere intersection temporaries
+    oc_memory = U * 3 * 8           # oc = origins - voxel_centres (before deletion)
+    b_memory = U * 8                # b vector
+    c_memory = U * 8                # c vector
+    discriminant_memory = U * 8     # discriminant
     
-    # Total memory per voxel in chunk
-    memory_per_voxel = (
-        broadcast_memory + 
-        intermediate_memory + 
-        hit_mask_memory + 
-        box_intersection_memory + 
-        mask_memory
+    # Box intersection (when potential hits exist)
+    # In worst case, assume ~50% of rays hit sphere, need AABB arrays
+    potential_hit_ratio = 0.5
+    t1_t2_memory = int(U * potential_hit_ratio * 3 * 8 * 2)  # t1 and t2 arrays
+    t_enter_exit_memory = int(U * potential_hit_ratio * 8 * 2)  # t_enter, t_exit
+    
+    # Voxel bounds (for each chunk)
+    voxel_bounds_memory = 3 * 8 * 2  # voxel_mins, voxel_maxs (3 coords each)
+    
+    # Direction safety check creates temp arrays
+    direction_temp_memory = U * 3 * 8 * 2  # small_dir mask + potential_directions copy
+    
+    # Broadcast/indexing temporaries
+    broadcast_memory = U * 3 * 8 * 3  # origins_b, directions_b, voxel_centres_b
+    
+    # Hit pair list (worst case: all rays hit)
+    hit_pairs_memory = int(U * potential_hit_ratio * 16)  # List of (voxel_idx, ray_idx) tuples
+    
+    # Safety buffer for overhead and intermediate operations
+    buffer = 1.5
+    
+    total_memory_per_chunk = (
+        oc_memory +
+        b_memory +
+        c_memory +
+        discriminant_memory +
+        t1_t2_memory +
+        t_enter_exit_memory +
+        voxel_bounds_memory +
+        direction_temp_memory +
+        broadcast_memory +
+        hit_pairs_memory
     ) * buffer
-    optimal_chunk_size = int(memory_limit_bytes / (memory_per_voxel))
-    optimal_chunk_size = max(min_chunk_size, min(optimal_chunk_size, max_chunk_size))
+    
+    optimal_chunk_size = max(
+        min_chunk_size,
+        min(
+            int(memory_limit_bytes / total_memory_per_chunk),
+            max_chunk_size
+        )
+    )
 
-    print(f"[traverse_voxels] Memory diagnostics:")
-    print(f"  - Number of unique rays (U): {U}")
-    # print(f"  - Number of voxels: {len(voxel_centres)}")
-    # print(f"  - Memory limit (bytes): {memory_limit_bytes}")
-    # print(f"  - Broadcast memory per voxel: {broadcast_memory} bytes")
-    # print(f"  - Intermediate memory per voxel: {intermediate_memory} bytes")
-    # print(f"  - Hit mask memory per voxel: {hit_mask_memory} bytes")
-    # print(f"  - Box intersection memory per voxel: {box_intersection_memory} bytes")
-    # print(f"  - Mask memory per voxel: {mask_memory} bytes")
-    # print(f"  - Total memory per voxel: {memory_per_voxel} bytes ({memory_per_voxel / (1024**2):.2f} MB)")
-    print(f"  - Optimal chunk size: {optimal_chunk_size} voxels")
-    # print(f"  - Min chunk size: {min_chunk_size}, Max chunk size: {max_chunk_size}")
+    if debug:
+        print(f"[traverse_voxels] Memory diagnostics:")
+        print(f"  - Number of unique rays (U): {U}")
+        print(f"  - Number of voxels: {len(voxel_centres)}")
+        print(f"  - Memory limit (bytes): {memory_limit_bytes}")
+        print(f"  - Broadcast memory per voxel: {broadcast_memory} bytes")
+        print(f"  - Optimal chunk size: {optimal_chunk_size} voxels")
+        print(f"  - Min chunk size: {min_chunk_size}, Max chunk size: {max_chunk_size}")
 
     # Iterate through voxel sizes and subsequently chunks
     hit_masks = []
@@ -5464,7 +5544,7 @@ def lad_bl_suite(num_rays,
                      (P_first, P_equal, P_int, P_ideal, P_exact)))
 
 def get_voxel_metrics(
-        intersections_ddf, 
+        intersections_files: list[str], 
         lambda_1, 
         cpus: int | None = None,
         mem: int | None = None,
@@ -5499,21 +5579,23 @@ def get_voxel_metrics(
     from dask.distributed import Client
     from collections import defaultdict
 
-    mem_string_for_dask, n_workers, threads_per_worker, _ = _determine_dask_resources(
-        cpus=cpus,
-        mem=mem,
-        optimal_threads=optimal_threads
-    )
+    if os.environ.get('SLURM_CPUS_PER_TASK'):
+        # Using HPC
+        avail_cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', psutil.cpu_count(logical=True)))
+        nthreads = avail_cpus * 2 # Hardcode this for your HPC
+    else:
+        # Local machine, use all available CPUs but only 2 threads per worker to avoid oversubscription
+        avail_cpus = psutil.cpu_count(logical=False)
+        nthreads = psutil.cpu_count(logical=True) # Use logical count for threads to allow hyperthreading
 
-    _start_dask_client(
-        n_workers=n_workers,
-        threads_per_worker=threads_per_worker,
-        memory_limit=mem_string_for_dask,
-        memory_target_fraction=0.7,
-        memory_spill_fraction=0.9,
-        memory_pause_fraction=0.95,
-        processes=True
-    )
+    optimal_workers = max(1, round(avail_cpus / 2)) # Reduce number of workers to avoid oversubscription; adjust as needed based on your workload and cluster
+    threads_per_worker = max(1, nthreads // optimal_workers) # Distribute threads across workers
+
+    avail_mem = int(float(os.environ.get('SLURM_MEM_PER_NODE', psutil.virtual_memory().available // (1024 * 1024)))) # in MB
+    avail_mem = avail_mem * 0.9 // 1024 # Use 80% of available memory and convert to GB
+    mem_limit = avail_mem // optimal_workers
+    mem_limit = f"{mem_limit}GB"
+    _start_dask_client(memory_limit=mem_limit, n_workers=optimal_workers, threads_per_worker=threads_per_worker)
 
     # Per voxel function
     def calculate_voxel_metrics_per_voxel(voxel_df, min_rays=6, epsilon=1e-9):
@@ -6035,6 +6117,19 @@ def get_voxel_metrics(
     schema = voxel_metrics_schema_singlereturn if not is_multireturn else voxel_metrics_schema_multireturn
     meta = _gen_dataframe(schema)
 
+    # Read all parquets into dask dataframe
+    dfs = []
+    for file in intersections_files:
+        if os.path.exists(file):
+            df = dd.read_parquet(file, engine='pyarrow', blocksize="25MB")
+
+            dfs.append(df)
+
+    if len(dfs) == 0:
+        raise ValueError("No valid voxel_ray_intersection files found.")
+    
+    # Combine all dataframes into one
+    voxel_intersections_df = dd.concat(dfs, axis=0, ignore_index=True)
     # Ensure 'voxel_id' remains a column and group by it directly to compute per-voxel metrics
     # (don't set 'voxel_id' as the DataFrame index, since subsequent grouping expects it as a column)
     # Map to per-voxel calculation via dask groupby.apply with the provided meta
@@ -6494,72 +6589,109 @@ def add_normals_weights_to_valid_rays(valid_rays_dir, knn=6, debug=False):
 
     # Read the valid rays files
     files = glob.glob(os.path.join(valid_rays_dir, "*valid_rays.parquet"))
-    dfs = []
-    for file in files:
-        df = dd.read_parquet(file, engine='pyarrow')
-        dfs.append(df)
-
+    
+    if len(files) == 0:
+        raise ValueError("No valid rays parquet files found.")
+    
+    print(f"Loading {len(files)} files...")
     valid_ray_dir = os.path.dirname(files[0])
-
-    if len(dfs) == 0:
-        raise ValueError("No valid voxel_ray_intersection files found.")
     
-    print(f"Loading {len(dfs)} files...")
+    # Use lazy dask computation
+    dfs = [dd.read_parquet(file, engine='pyarrow') for file in files]
+    valid_rays_ddf = dd.concat(dfs, axis=0, ignore_index=True)
     
-    # Combine all dataframes into one
-    valid_rays_df = dd.concat(dfs, axis=0, ignore_index=True)
-    valid_rays_df = valid_rays_df.reset_index(drop=True)
+    # Define a function to process partitions lazily
+    def add_normals_weights_to_partition(partition, knn=6):
+        """Add normals and weights to leaf points in a partition."""
+        # Select only leaf points
+        leaf_mask = partition['is_leaf'] & ~partition['point_x'].isna()
+        leaf_points = partition.loc[leaf_mask, ['point_x', 'point_y', 'point_z']].to_numpy()
+        
+        # Initialize columns with NaN
+        partition['normal_x'] = np.nan
+        partition['normal_y'] = np.nan
+        partition['normal_z'] = np.nan
+        partition['point_weight'] = np.nan
+        
+        # Only compute if there are leaf points
+        if len(leaf_points) > 0:
+            normals, weights = compute_normals_weights_from_points(points=leaf_points, knn=knn)
+            partition.loc[leaf_mask, 'normal_x'] = normals[:, 0]
+            partition.loc[leaf_mask, 'normal_y'] = normals[:, 1]
+            partition.loc[leaf_mask, 'normal_z'] = normals[:, 2]
+            partition.loc[leaf_mask, 'point_weight'] = weights
+        
+        return partition
+    
+    print(f"Calculating normals and weights for leaf points (lazy)...")
+    # Apply the function to each partition lazily
+    valid_rays_ddf = valid_rays_ddf.map_partitions(
+        add_normals_weights_to_partition,
+        knn=knn,
+        meta=valid_rays_ddf._meta.assign(
+            normal_x=np.float64(),
+            normal_y=np.float64(),
+            normal_z=np.float64(),
+            point_weight=np.float64()
+        )
+    )
+    
+    print("Saving results to parquet files...")
+    # Compute all normals and weights once, then save per-leg
+    print("Computing normals and weights for all partitions...")
     with ProgressBar():
-        valid_rays_df = valid_rays_df.compute()
-        valid_rays_df = valid_rays_df.reset_index(drop=True)  # Ensure indices are unique and sequential
-
-        # Select only leaf points (where is_leaf is True and point_x is not NaN)
-        leaf_mask = valid_rays_df['is_leaf'].values & ~valid_rays_df['point_x'].isna().values
-        leaf_points = valid_rays_df.loc[leaf_mask, ['point_x', 'point_y', 'point_z']].to_numpy()
-        leaf_idx = valid_rays_df.index[leaf_mask]
-
-        # Check for duplicate leaf_idx
-        if leaf_idx.duplicated().any():
-            print("Duplicate indices found in leaf_idx. This may cause assignment errors.")
-            raise ValueError("Duplicate indices found in leaf_idx. Please check your data for duplicates.")
-
-        # Calculate normals and weights on all leaf hits
-        normals, weights = compute_normals_weights_from_points(points=leaf_points, knn=knn)
-        del leaf_points
-
-        with ProgressBar():
-            # Add normals and weights to the valid rays dataframe (only for leaf points)
-            leaf_df = pd.DataFrame({
-                'normal_x': normals[:, 0].astype(np.float64()),
-                'normal_y': normals[:, 1].astype(np.float64()),
-                'normal_z': normals[:, 2].astype(np.float64()),
-                'point_weight': weights.astype(np.float64())
-            }, index=leaf_idx)
-            valid_rays_df.update(leaf_df)                                  
-        # Save updated valid_rays parquet files per leg
-        output_files = []
-
-        print("Saving results...")
-
-        grouped_df = valid_rays_df.groupby('leg_id')
-        DEBUG_PRINT = False
-        def save_group(group):
-            nonlocal DEBUG_PRINT
-            leg_id = group['leg_id'].iloc[0]
-            output_file = os.path.join(valid_ray_dir, f"leg_{leg_id}_valid_rays.parquet")
-
-            if debug and not DEBUG_PRINT:
-                print("Debugging enabled:")
-                DEBUG_PRINT = True
-                print(group[~group['point_x'].isna() & group['is_leaf'] == True].head())
-
-            group.to_parquet(output_file, engine='pyarrow', index=False, schema=valid_rays_schema)
-            output_files.append(output_file)
+        valid_rays_computed = valid_rays_ddf.compute()
+    
+    # Group by leg_id and save each leg separately
+    for leg_id in valid_rays_computed['leg_id'].unique():
+        output_file = os.path.join(valid_ray_dir, f"leg_{leg_id}_valid_rays.parquet")
+        leg_df = valid_rays_computed[valid_rays_computed['leg_id'] == leg_id]
+        
+        # Remove old file if it exists to allow overwrite
+        backup_file = None
+        if os.path.exists(output_file):
+            backup_file = output_file + ".backup"
+            shutil.copy(output_file, backup_file)
+        
+        try:
+            print(f"Saving leg {leg_id} with normals and weights...")
+            leg_df.to_parquet(
+                output_file,
+                engine='pyarrow',
+                compression='snappy',
+                index=False,
+                schema=valid_rays_schema
+            )
+            # Remove backup if write was successful
+            if backup_file and os.path.exists(backup_file):
+                os.remove(backup_file)
             print(f"Saved {output_file}")
+        except Exception as e:
+            # Restore backup if write failed
+            if backup_file and os.path.exists(backup_file):
+                shutil.move(backup_file, output_file)
+            print(f"Error writing {output_file}: {e}")
+            raise
 
-        grouped_df.apply(save_group, include_groups=True)
+        # grouped_df = valid_rays_df.groupby('leg_id')
+        # DEBUG_PRINT = False
+        # def save_group(group):
+        #     nonlocal DEBUG_PRINT
+        #     leg_id = group['leg_id'].iloc[0]
+        #     output_file = os.path.join(valid_ray_dir, f"leg_{leg_id}_valid_rays.parquet")
 
-        print(f"Saved {len(output_files)} valid rays files with normals and weights.")
+        #     if debug and not DEBUG_PRINT:
+        #         print("Debugging enabled:")
+        #         DEBUG_PRINT = True
+        #         print(group[~group['point_x'].isna() & group['is_leaf'] == True].head())
+
+        #     group.to_parquet(output_file, engine='pyarrow', index=False, schema=valid_rays_schema)
+        #     output_files.append(output_file)
+        #     print(f"Saved {output_file}")
+
+        # grouped_df.apply(save_group, include_groups=True)
+
+        # print(f"Saved {len(output_files)} valid rays files with normals and weights.")
 
 def add_normals_weights_from_intersection_files(files, knn=6):
     """
@@ -6720,3 +6852,91 @@ def fix_incorrect_intersections(valid_rays_dir, num_jobs=-1):
     )
     for _ in tqdm(results, desc="Processing intersection files"):
         pass
+
+
+def test_helios_settings(helios_dir, use_class, leaf_object_ids, wood_object_ids, output_dir):
+    """
+    Test helios settings by plotting a sample of points from the helios files.
+    
+    Args:
+        helios_dir (str): Directory containing helios .xyz files.
+        use_class (bool): Whether to use classification or hit_object_id for identifying leaf/wood.
+        leaf_object_ids (list): List of object IDs corresponding to leaf points.
+        wood_object_ids (list): List of object IDs corresponding to wood points.
+        valid_rays_dir (str): Directory to save the output plot.
+
+    Returns:
+        None
+
+    User can check saved image to verify if leaf and wood points are set correctly.
+    """
+    import csv
+    import glob
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # Check classification and object_ids
+    helios_files = glob.glob(os.path.join(helios_dir, '*.xyz'))
+    if helios_files:
+        test_file = helios_files[0]     # Just use the first file
+        class_col = 9 if use_class else 8      # if not use_class, assume use hit_object_id
+        num_test_points = 1000
+
+        num_rows = 0
+        leaf_points = []
+        wood_points = []
+        other_points = []
+        with open(test_file, newline="") as f:
+            reader = csv.reader(f, delimiter=' ')
+            while num_rows < num_test_points:
+                for row in reader:
+                    x = float(row[0])
+                    y = float(row[1])
+                    z = float(row[2])
+
+                    class_id = int(row[class_col])
+                    if class_id in leaf_object_ids:
+                        leaf_points.append([x,y,z])
+                    elif class_id in wood_object_ids:
+                        wood_points.append([x,y,z])
+                    else:
+                        other_points.append([x,y,z])
+                    num_rows += 1
+
+        if len(leaf_points) > 0 or len(wood_points) > 0 or len(other_points) > 0:
+            # Convert to numpy
+            leaf_points = np.array(leaf_points, dtype=np.float32)
+            wood_points = np.array(wood_points, dtype=np.float32)
+            other_points = np.array(other_points, dtype=np.float32)
+            
+            # Plot point cloud
+            fig = plt.figure(figsize=(10, 6))
+            ax = fig.add_subplot(111)
+
+            # Plot leaf points in green
+            if leaf_points.size > 0:
+                ax.scatter(leaf_points[:, 0], leaf_points[:, 2], c='green', s=1, label='Leaf')
+
+            # Plot wood points in brown
+            if wood_points.size > 0:
+                ax.scatter(wood_points[:, 0], wood_points[:, 2], c='saddlebrown', s=1, label='Wood')
+
+            # Plot other points in blue
+            if other_points.size > 0:
+                ax.scatter(other_points[:, 0], other_points[:, 2], c='blue', s=1, label='Other')
+
+            print("Plotting leaf and wood points to check classification...")
+            ax.set_xlabel('X')
+            ax.set_ylabel('Z')
+            ax.set_title(f'Leaf and Wood Point Check - File {os.path.basename(test_file)}')
+            ax.legend()
+
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+                plt.savefig(os.path.join(output_dir, f'file_{os.path.basename(test_file)}_leaf_wood_check.png'))
+                plt.close()
+                print(f"Saved leaf and wood check plot to {output_dir}")
+                return True
+            except Exception as e:
+                print(f"Error saving plot: {e}")
+                return False

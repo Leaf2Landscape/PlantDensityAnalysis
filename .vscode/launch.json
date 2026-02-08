@@ -54,6 +54,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args": [
+<<<<<<< HEAD
                 "/home/capheus/projects/1066_etri_RF3_6_inc200_diamond_plano/1066_etri_RF3_6_inc200_diamond_plano.obj",
                 "--voxel_sizes", "2.0"
             ]
@@ -66,18 +67,44 @@
             "console": "integratedTerminal",
             "args": [
                 "/scratch/project/veg3d/uqjrivor/ref_test/1066_etri_RF3_6_inc200_diamond_plano.obj",
+=======
+                "/home/capheus/projects/1015_tree/1015_emac_RF1_9.0_1.7_4_inc125_diamond_erecto.obj",
+                "--voxel_sizes", "2.0", "--scene_formats", "combined"
+>>>>>>> main
             ]
         },
         {
-            "name": "single_tree_leaf_off",
+            "name": "single_tree_helios",
             "type": "debugpy",
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
             "args": [
-                "/home/capheus/projects/RAJA_TEST/1011_etri_plano_diamond.obj",
-                "--voxel_sizes", "2.0",
-                "--leaf_off"
+                "/home/capheus/projects/AMAPVox_test/POTR2_uniform/tls_sim_POTR2_uniform",
+                "--use_class"
+            ]
+        },
+        {
+            "name": "single_tree_helios_test",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": [
+                "/home/capheus/projects/AMAPVox_test/POTR2_uniform/tls_sim_POTR2_uniform",
+                "--use_class",
+                "--test_mode"
+            ]
+        },
+        {
+            "name": "single_tree_metrics",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": [
+                "/home/capheus/projects/AMAPVox_test/POTR2_uniform/tls_sim_POTR2_uniform",
+                "--average_leaf_area", "0.00188"
             ]
         }
     ]
