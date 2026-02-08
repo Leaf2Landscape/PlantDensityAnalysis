@@ -81,19 +81,19 @@ if __name__ == "__main__":
             exit(0)
 
     # Step 1: Prepare Helios data
-    # try:
-    #     prepare_helios_data(
-    #         input_dir=helios_dir,
-    #         output_dir=valid_rays_dir,
-    #         references_dir=reference_dir,
-    #         leaf_object_ids=args.leaf_ids,
-    #         wood_object_ids=args.wood_ids,
-    #         use_class = args.use_class,
-    #         debug=args.debug
-    #     )
-    # except Exception as e:
-    #     raise RuntimeError(f"Error during Helios data preparation: {e}")
-    # print("Helios data preparation completed. Proceeding to normals and voxel-ray intersections...")
+    try:
+        prepare_helios_data(
+            input_dir=helios_dir,
+            output_dir=valid_rays_dir,
+            references_dir=reference_dir,
+            leaf_object_ids=args.leaf_ids,
+            wood_object_ids=args.wood_ids,
+            use_class = args.use_class,
+            debug=args.debug
+        )
+    except Exception as e:
+        raise RuntimeError(f"Error during Helios data preparation: {e}")
+    print("Helios data preparation completed. Proceeding to normals and voxel-ray intersections...")
 
     # Step 2: Compute normals and weights from points
     try:
