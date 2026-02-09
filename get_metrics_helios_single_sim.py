@@ -1,4 +1,4 @@
-from utils import calculate_lambda_1, get_voxel_metrics
+from utils import calculate_lambda_1, get_voxel_metrics, get_voxel_metrics_dask
 
 import os
 import glob
@@ -28,70 +28,50 @@ if __name__ == "__main__":
         os.makedirs(results_dir, exist_ok=True)
     except Exception as e:
         raise OSError(f"Error creating results directory {results_dir}: {e}")
-    
 
     # Setup chosen files to analyse
     legs = args.legs
     voxel_sizes = args.voxel_sizes
 
     intersection_files = []
-    leg_str = "all" if legs is None else "_".join(map(str, legs))
-    if legs is None and voxel_sizes is None:
-        # Use all files in valid_rays_dir
-        intersection_files = glob.glob(os.path.join(valid_rays_dir, "*_intersections.parquet"))
-    elif legs is None and isinstance(voxel_sizes, list):
-        # Use all legs but only specified voxel sizes
-        for voxel_size in voxel_sizes:
-            pattern = os.path.join(valid_rays_dir, f"leg_*_voxel_{voxel_size}_intersections.parquet")
-            intersection_files.extend(glob.glob(pattern))
-    elif isinstance(legs, list) and voxel_sizes is None:
-        # Use all voxel sizes but only specified legs
-        for leg in legs:
-            pattern = os.path.join(valid_rays_dir, f"*_leg_{leg}_*_intersections.parquet")
-            intersection_files.extend(glob.glob(pattern))
+
+    # If voxel_ray_intersections parquet folder is found within valid_rays_dir, use it instead of looking for parquet files directly in valid_rays_dir
+    voxel_ray_intersections_dir = os.path.join(valid_rays_dir, "voxel_ray_intersections")
+    if os.path.exists(voxel_ray_intersections_dir) and os.path.isdir(voxel_ray_intersections_dir):
+        intersection_files.append(voxel_ray_intersections_dir)
+        
     else:
-        # Use only specified legs and voxel sizes
-        for leg in legs:
+        leg_str = "all" if legs is None else "_".join(map(str, legs))
+        if legs is None and voxel_sizes is None:
+            # Use all files in valid_rays_dir
+            intersection_files = glob.glob(os.path.join(valid_rays_dir, "*_intersections.parquet"))
+        elif legs is None and isinstance(voxel_sizes, list):
+            # Use all legs but only specified voxel sizes
             for voxel_size in voxel_sizes:
-                pattern = os.path.join(valid_rays_dir, f"*leg_{leg}_voxel_{voxel_size}_intersections.parquet")
+                pattern = os.path.join(valid_rays_dir, f"leg_*_voxel_{voxel_size}_intersections.parquet")
                 intersection_files.extend(glob.glob(pattern))
+        elif isinstance(legs, list) and voxel_sizes is None:
+            # Use all voxel sizes but only specified legs
+            for leg in legs:
+                pattern = os.path.join(valid_rays_dir, f"*_leg_{leg}_*_intersections.parquet")
+                intersection_files.extend(glob.glob(pattern))
+        else:
+            # Use only specified legs and voxel sizes
+            for leg in legs:
+                for voxel_size in voxel_sizes:
+                    pattern = os.path.join(valid_rays_dir, f"*leg_{leg}_voxel_{voxel_size}_intersections.parquet")
+                    intersection_files.extend(glob.glob(pattern))
 
     if len(intersection_files) == 0:
         raise RuntimeError(f"No intersection files found matching the specified criteria in {valid_rays_dir}.")
     
-    # Split files into discrete voxel sizes
-    voxel_size_to_files = {}
-    for file in intersection_files:
-        basename = os.path.basename(file)
-        parts = basename.split("_")
-        try:
-            voxel_index = parts.index("voxel")
-            voxel_size = float(parts[voxel_index + 1])
-        except (ValueError, IndexError):
-            raise RuntimeError(f"Could not parse voxel size from filename: {basename}")
-        if voxel_size not in voxel_size_to_files:
-            voxel_size_to_files[voxel_size] = []
-        voxel_size_to_files[voxel_size].append(file)
-
-    # Analyse metrics for each voxel size
-    for voxel_size, files in voxel_size_to_files.items():
-        print(f"Processing voxel size: {voxel_size} with {len(files)} files.")
-
-        # Calculate lambda_1 metric
-        lambda_1 = calculate_lambda_1(
-            voxel_size=voxel_size,
-            average_leaf_area=args.average_leaf_area,
-        )
-        print(f"Calculated Lambda_1: {lambda_1}")
-
-        # Calculate voxel metrics
-        voxel_metrics = get_voxel_metrics(
-            intersections_files=files,
-            lambda_1=lambda_1,
-            debug=args.debug
-        )
-
-        # Save voxel metrics to CSV
-        output_csv = os.path.join(results_dir, f"voxel_metrics_leg_{leg_str}_voxel_{voxel_size}.csv")
-        voxel_metrics.to_csv(output_csv, index=False)
-        print(f"Saved voxel metrics to {output_csv}")
+    # Compute metrics and pass in desired output path
+    voxel_metrics_df = get_voxel_metrics(
+        intersections_files=intersection_files, 
+        average_leaf_area=args.average_leaf_area, 
+        output_dir=results_dir,
+        scan_ids=legs if legs is not None else None,
+        voxel_sizes=voxel_sizes if voxel_sizes is not None else None,
+        debug=args.debug,
+        optimal_threads=2
+    )
