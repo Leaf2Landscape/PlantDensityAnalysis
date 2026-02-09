@@ -4135,7 +4135,7 @@ def get_voxel_metrics(intersections_files, lambda_1, beam_divergence=0.35, is_mu
 
         num_rays = voxel_df['ray_id'][valid_ray_mask].nunique()
         if num_rays <= 0:
-            statement= f"Voxel {voxel_df['voxel_id'].values[0]} has no rays."
+            statement= f"Voxel {voxel_id} has no rays."
             print(statement)
             return data_df
 
