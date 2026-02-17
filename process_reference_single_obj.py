@@ -50,9 +50,10 @@ def get_memory_usage():
         used_memory = psutil.virtual_memory().used / (1024 ** 2)  # Convert to MB
         print(f"Not Slurm... Used memory: {used_memory:.2f} MB")
 
-def calculate_wood_volume(wood_mesh: trimesh.Trimesh, voxel_size: float=0.01, threshold: int=4, cache_size=10000) -> str:
+def calculate_wood_volume(wood_mesh: trimesh.Trimesh, voxel_size: float=0.01, threshold: int=4, cache_size=50000) -> np.ndarray:
     """
     Calculate the wood volume of a mesh by voxelizing it.
+    Vectorized approach: batch all points per x-slice and cast rays in one operation.
     """
     if wood_mesh.is_empty:
         print("Wood mesh is empty, cannot calculate volume.")
@@ -71,7 +72,7 @@ def calculate_wood_volume(wood_mesh: trimesh.Trimesh, voxel_size: float=0.01, th
     
     # Get bounding box of the mesh
     aabb = o3d_wood_mesh.get_axis_aligned_bounding_box()
-    print (f"Bounding box of wood mesh: {aabb}")
+    print(f"Bounding box of wood mesh: {aabb}")
     offset = voxel_size * 0.01
 
     # Create grid coordinates
@@ -87,79 +88,69 @@ def calculate_wood_volume(wood_mesh: trimesh.Trimesh, voxel_size: float=0.01, th
     mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(o3d_wood_mesh)
     scene.add_triangles(mesh_t)
 
-    # Prepare rays
+    # Ray directions
     directions = np.array([
         [1.0001, 0.0001, 0.0001],
-            [-1.0001, 0.0001, 0.0001],
-            [0.0001, 1.0001, 0.0001],
-            [0.0001, -1.0001, 0.0001],
-            [0.0001, 0.0001, 1.0001],
-            [0.0001, 0.0001, -1.0001]
-        ], dtype=np.float32)
+        [-1.0001, 0.0001, 0.0001],
+        [0.0001, 1.0001, 0.0001],
+        [0.0001, -1.0001, 0.0001],
+        [0.0001, 0.0001, 1.0001],
+        [0.0001, 0.0001, -1.0001]
+    ], dtype=np.float32)
     
     inside_points = []
+    n_directions = len(directions)
 
     for xi, x_val in enumerate(tqdm(x, desc="Processing X-slices")):
-        slice_points = []
-        slice_indices = []
-
-        for yi, y_val in enumerate(y):
-            for zi, z_val in enumerate(z):
-                point = np.array([x_val, y_val, z_val], dtype=np.float32)
-                slice_points.append(point)
-                slice_indices.append((xi, yi, zi))
-
-        for i in range(0, len(slice_points), cache_size):
-            end_idx = min(i + cache_size, len(slice_points))
-            chunk_points = slice_points[i:end_idx]
-                
-            # Check each direction for each point
-            for direction in directions:
-                # Create rays for all points in this direction
-                rays = []
-                for point in chunk_points:
-                    ray = np.concatenate([point, direction])
-                    rays.append(ray)
-                
-                # Convert to tensor for batch processing
-                rays_tensor = o3d.core.Tensor(np.array(rays), dtype=o3d.core.Dtype.Float32)
-                
-                # Get intersection counts for all rays at once
-                intersection_counts = scene.count_intersections(rays_tensor).numpy()
-                
-                # Update inside counts for each point
-                if 'inside_counts' not in locals():
-                    inside_counts = np.zeros(len(chunk_points), dtype=np.int32)
-                
-                # Add odd intersections (indicates inside)
-                inside_counts += (intersection_counts % 2).astype(np.int32)
-            
-            # Identify inside points based on threshold
-            for j in range(len(chunk_points)):
-                if inside_counts[j] >= threshold:
-                    inside_points.append(chunk_points[j])
-            
-            # Reset for next batch
-            if 'inside_counts' in locals():
-                del inside_counts
+        # Generate all y,z points for this x-slice
+        yy, zz = np.meshgrid(y, z, indexing='ij')
+        xx = np.full_like(yy, x_val, dtype=np.float32)
+        slice_points = np.column_stack([xx.ravel(), yy.ravel(), zz.ravel()]).astype(np.float32)
+        n_points = len(slice_points)
         
-        # Print progress every 10 x-slices
-        if xi % 10 == 0 and xi > 0:
+        # Count intersections across all directions
+        inside_counts = np.zeros(n_points, dtype=np.int32)
+        
+        # Process all directions in one vectorized call
+        # Repeat points for each direction
+        points_repeated = np.repeat(slice_points, n_directions, axis=0)  # (n_points * n_dirs, 3)
+        dirs_tiled = np.tile(directions, (n_points, 1))  # (n_points * n_dirs, 3)
+        
+        # Create rays tensor: concatenate origins and directions
+        rays = np.column_stack([points_repeated, dirs_tiled]).astype(np.float32)
+        rays_tensor = o3d.core.Tensor(rays, dtype=o3d.core.Dtype.Float32)
+        
+        # Get all intersections at once
+        intersections = scene.count_intersections(rays_tensor).numpy()
+        
+        # Reshape back to (n_points, n_directions) and count odd intersections per point
+        intersections = intersections.reshape(n_points, n_directions)
+        inside_counts = (intersections % 2).sum(axis=1).astype(np.int32)
+        
+        # Identify inside points based on threshold
+        mask = inside_counts >= threshold
+        inside_points.append(slice_points[mask])
+        
+        # Progress reporting
+        if (xi + 1) % max(1, len(x) // 10) == 0:
             elapsed = dt.datetime.now() - start_time
             percent_complete = (xi + 1) / len(x) * 100
-            est_total_time = elapsed / percent_complete * 100
-            remaining = (est_total_time - elapsed).total_seconds()
-            
-            print(f"Progress: {percent_complete:.1f}% complete, " +
-                    f"ETA: {remaining/60:.1f} minutes, " + 
-                    f"Found {len(inside_points)} inside points so far")
+            if percent_complete > 0:
+                est_total_time = elapsed.total_seconds() / percent_complete * 100
+                remaining = est_total_time - elapsed.total_seconds()
+                print(f"Progress: {percent_complete:.1f}% complete, "
+                      f"ETA: {remaining/60:.1f} minutes, "
+                      f"Found {sum(len(p) for p in inside_points)} inside points so far")
     
-    # Convert to numpy array
-    inside_points = np.array(inside_points)
+    # Concatenate all inside points
+    if inside_points:
+        inside_points = np.vstack(inside_points)
+    else:
+        inside_points = np.array([], dtype=np.float32).reshape(0, 3)
     
     if len(inside_points) == 0:
         print(f"No inside points found. Try a different threshold or check mesh.")
-        return
+        return None
     
     return inside_points
 
@@ -1683,12 +1674,12 @@ if __name__ == "__main__":
     parser.add_argument("--scene_formats", type=str, nargs='+', default=["combined"], help="Scene formats to process (default: ['combined']), use 'leaf' for leaf-only and 'wood' for wood-only.")
     parser.add_argument("--voxel_sizes", type=float, nargs='+', default=[0.2, 0.5, 1.0, 2.0], help="Voxel sizes for processing (default: [0.2, 0.5, 1.0, 2.0]).")
     parser.add_argument("--num_angle_bins", type=int, default=18, help="Number of angle bins for ray tracing (default: 18).")
-    parser.add_argument("--ray_spacing", type=float, default=0.005, help="Ray spacing for ray tracing (default: 0.1).")
+    parser.add_argument("--ray_spacing", type=float, default=0.005, help="Ray spacing for ray tracing (default: 0.005).")
     parser.add_argument("--wood_volume_voxel_size", type=float, default=0.01, help="Voxel size for wood volume calculation (default: 0.01).")
     parser.add_argument("--wood_volume_threshold", type=int, default=4, help="Threshold for wood volume calculation (default: 4).")
     parser.add_argument("--cross_section_area", type=float, default=0.003, help="Cross section area for wood volume calculation (default: 0.01).")
     parser.add_argument("--leaf_off", action='store_true', help="If set, leaf mesh will not be included in raytracing.")
-    parser.add_argument("--max_workers", type=int, default=32, help="Maximum number of parallel workers (default: 32).")
+    parser.add_argument("--max_workers", type=int, default=32, help="Maximum number of parallel workers (default: 32) will max to num_cpus.")
     parser.add_argument("--debug", action='store_true', help="If set, debug outputs will be saved.")
     args = parser.parse_args()
 
