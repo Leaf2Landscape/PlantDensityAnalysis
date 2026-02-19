@@ -95,17 +95,7 @@ if __name__ == "__main__":
         raise RuntimeError(f"Error during Helios data preparation: {e}")
     print("Helios data preparation completed. Proceeding to normals and voxel-ray intersections...")
 
-    # Step 2: Compute normals and weights from points
-    try:
-        add_normals_weights_to_valid_rays(
-            valid_rays_dir=valid_rays_dir,
-            debug=args.debug
-        )
-    except Exception as e:
-        raise RuntimeError(f"Error during normals and weights computation: {e}")
-    print("Normals and weights computation completed. Proceeding to voxel-ray intersections...")
-
-    # Step 3: Calculate voxel-ray intersections for chosen voxel sizes
+    # Step 2: Calculate voxel-ray intersections for chosen voxel sizes
     try:
         voxel_ray_intersections_nodask(
             valid_rays_dir=valid_rays_dir,
