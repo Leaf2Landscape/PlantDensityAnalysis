@@ -89,7 +89,8 @@
             "console": "integratedTerminal",
             "args": [
                 "/home/capheus/projects/AMAPVox_test/second_test/ACPL_erectophile",
-                "--average_leaf_area", "0.00925440473872253"
+                "--average_leaf_area", "0.00925440473872253",
+                "--debug"
             ]
         }
     ]
