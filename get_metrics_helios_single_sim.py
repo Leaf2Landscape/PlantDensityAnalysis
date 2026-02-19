@@ -1,4 +1,4 @@
-from utils import calculate_lambda_1, get_voxel_metrics, get_voxel_metrics_dask
+from utils import calculate_lambda_1, get_voxel_metrics, get_voxel_metrics_nodask
 
 import os
 import glob
@@ -33,41 +33,16 @@ if __name__ == "__main__":
     legs = args.legs
     voxel_sizes = args.voxel_sizes
 
-    intersection_files = []
-
     # If voxel_ray_intersections parquet folder is found within valid_rays_dir, use it instead of looking for parquet files directly in valid_rays_dir
     voxel_ray_intersections_dir = os.path.join(valid_rays_dir, "voxel_ray_intersections")
     if os.path.exists(voxel_ray_intersections_dir) and os.path.isdir(voxel_ray_intersections_dir):
-        intersection_files.append(voxel_ray_intersections_dir)
-        
+        intersection_folder = voxel_ray_intersections_dir
     else:
-        leg_str = "all" if legs is None else "_".join(map(str, legs))
-        if legs is None and voxel_sizes is None:
-            # Use all files in valid_rays_dir
-            intersection_files = glob.glob(os.path.join(valid_rays_dir, "*_intersections.parquet"))
-        elif legs is None and isinstance(voxel_sizes, list):
-            # Use all legs but only specified voxel sizes
-            for voxel_size in voxel_sizes:
-                pattern = os.path.join(valid_rays_dir, f"leg_*_voxel_{voxel_size}_intersections.parquet")
-                intersection_files.extend(glob.glob(pattern))
-        elif isinstance(legs, list) and voxel_sizes is None:
-            # Use all voxel sizes but only specified legs
-            for leg in legs:
-                pattern = os.path.join(valid_rays_dir, f"*_leg_{leg}_*_intersections.parquet")
-                intersection_files.extend(glob.glob(pattern))
-        else:
-            # Use only specified legs and voxel sizes
-            for leg in legs:
-                for voxel_size in voxel_sizes:
-                    pattern = os.path.join(valid_rays_dir, f"*leg_{leg}_voxel_{voxel_size}_intersections.parquet")
-                    intersection_files.extend(glob.glob(pattern))
-
-    if len(intersection_files) == 0:
-        raise RuntimeError(f"No intersection files found matching the specified criteria in {valid_rays_dir}.")
+        intersection_folder = valid_rays_dir
     
     # Compute metrics and pass in desired output path
-    voxel_metrics_df = get_voxel_metrics(
-        intersections_files=intersection_files, 
+    voxel_metrics_df = get_voxel_metrics_nodask(
+        intersections_folder=intersection_folder, 
         average_leaf_area=args.average_leaf_area, 
         output_dir=results_dir,
         scan_ids=legs if legs is not None else None,
