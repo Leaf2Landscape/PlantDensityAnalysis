@@ -502,7 +502,7 @@ def compute_normals_weights_from_points_parallel(
         n_jobs = max(1, num_bins // 4)  # Use 1/4 of bins per job for better parallelization
     print(f"  Computing normals & weights (n_jobs={n_jobs}):")
     jobs = [delayed(_process_bin)(s, e) for s, e in zip(starts, ends)]
-    chunks = Parallel(n_jobs=n_jobs, prefer="processes", batch_size="auto", verbose=0)(
+    chunks = Parallel(n_jobs=n_jobs, prefer="processes", batch_size="auto", verbose=0, env_var='LOKY_DISABLE_RESOURCE_TRACKER=1')(
         tqdm(jobs, total=num_bins, desc="    Bins", unit=" bin", ncols=80, leave=True)
     )
     
@@ -626,7 +626,9 @@ def _compute_normals_vectorized(points, neighbor_indices):
         # The normal is the eigenvector with smallest eigenvalue
         normal = _compute_smallest_eigenvector_3x3(cov)
         
-        normals[i] = normal
+        # Explicitly assign each component to avoid broadcasting issues
+        for k in range(3):
+            normals[i, k] = normal[k]
     
     return normals
 

@@ -54,8 +54,8 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args": [
-                "/home/capheus/projects/1015_tree/1015_emac_RF1_9.0_1.7_4_inc125_diamond_erecto.obj",
-                "--voxel_sizes", "2.0", "--scene_formats", "combined"
+                "/home/capheus/projects/AMAPVox_test/second_test/ACPL_erectophile/ACPL.obj",
+                "--voxel_sizes", "0.2", "--scene_formats", "combined"
             ]
         },
         {
@@ -92,6 +92,28 @@
                 "--average_leaf_area", "0.00925440473872253",
                 "--debug"
             ]
-        }
+        },
+        {
+            "name": "ACPL_existing",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": [
+                "/home/capheus/projects/AMAPVox_test/second_test/leafWoodSep/unlabelled/ACPL_erectophile_combined.txt",
+                "--voxel_sizes", "1.0", "--ray_spacing", "0.01", "--existing_csv", "/home/capheus/projects/AMAPVox_test/second_test/ACPL_erectophile/references/ACPL_combined_results_1.0_merged.csv",
+            ]
+        },
+        {
+            "name": "ACPL_2.0",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": [
+                "/home/capheus/projects/AMAPVox_test/second_test/leafWoodSep/unlabelled/ACPL_erectophile_combined.txt",
+                "--voxel_sizes", "2.0", "--ray_spacing", "0.1"
+            ]
+        },
     ]
 }

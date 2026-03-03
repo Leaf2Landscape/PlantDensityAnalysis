@@ -10,6 +10,8 @@ import open3d as o3d
 import open3d.core as o3c
 o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
 
+from math import comb, factorial
+
 import datetime as dt
 from typing import Optional
 import sys
@@ -643,98 +645,557 @@ def rotate_rays(orig, dirs, angle_deg, vc, axis="x"):
     d = dirs @ R.T
     return o, d
 
-def simulate_combined_mesh_with_points(scene, leaf_gid, wood_gid,
-                                       voxel_center, voxel_size,
-                                       ray_origins, ray_dirs, lambda_1):
-    hit_details = []
-    voxel_center = np.asarray(voxel_center, dtype=np.float32)
-    bmin = voxel_center - 0.5 * voxel_size
-    bmax = voxel_center + 0.5 * voxel_size
+def simulate_voxel_grouped_with_multi(scene, leaf_gids, wood_gids,
+                                      voxel_center, voxel_size,
+                                      rays_FAR6,  # shape (F,A,R,6), float32
+                                      lambda_1,
+                                      scene_name="scene"):
+    """
+    Vectorized per-(face, angle) aggregation that matches your stats dictionaries.
+    Returns:
+        stats_lw[F][A], stats_leaf[F][A], stats_wood[F][A] (dicts)
+    """
+
+    import numpy as np
+    import gc
+
+    F, A, R, _ = rays_FAR6.shape
+    vc = np.asarray(voxel_center, dtype=np.float32)
+    bmin = vc - 0.5 * voxel_size
+    bmax = vc + 0.5 * voxel_size
+
+    O = rays_FAR6[..., 0:3]  # (F,A,R,3)
+    D = rays_FAR6[..., 3:6]  # (F,A,R,3)
+
+    # Compute t_near, t_far for ray-box intersection
     t_near, t_far = ray_box_intersection_vectorized(
-        ray_origins, ray_dirs, bmin, bmax)
-    valid_rays_mask = (t_near <= t_far) & (t_far >= 0)
-    N = int(valid_rays_mask.sum())
-    if N == 0:
-        return {k: 0.0 for k in (
-            "N","n_hits","I","delta_bar","sum_delta","sum_z","mean_z",
-            "mean_delta_e","var_delta_e","sum_z_e","sum_hits_z_e",
-            "mean_efpl_free","var_efpl_free"
-        )}, hit_details
+        O.reshape(-1, 3), D.reshape(-1, 3), bmin, bmax
+    )
+    t_near = t_near.reshape(F, A, R)
+    t_far = t_far.reshape(F, A, R)
+    valid_rays_mask = (t_near <= t_far) & (t_far >= 0.0)  # (F,A,R)
 
-    rays_np = np.hstack([ray_origins, ray_dirs]).astype(np.float32)
-    # print(f"Simulating {N} rays for voxel at {voxel_center} with size {voxel_size}.")
-    hits = scene.cast_rays(o3c.Tensor(rays_np, dtype=o3c.float32))
-    # print(f"Ray casting completed for voxel at {voxel_center}.")
-    gids = hits["geometry_ids"].numpy()
-    dists = hits["t_hit"].numpy()
+    # ------------------------------------------------------------
+    # Multi-hit counts + first hits derived solely from list_intersections
+    # (Removed count_intersections and any cast_rays dependence)
+    # ------------------------------------------------------------
+    counts_leaf = None
+    counts_wood = None
 
-    # Mask infinite t_hits
+    # Initialize first-hit tensors we will populate from list_intersections()
+    first_hits = np.full((F, A, R), np.inf, dtype=np.float32)
+    first_gids = np.zeros((F, A, R), dtype=np.uint32)
+
+    try:
+        ans_list = scene.list_intersections(o3c.Tensor(rays_FAR6, dtype=o3c.float32))
+
+        counts_leaf = np.zeros((F, A, R), dtype=np.int32) if leaf_gids is not None else None
+        counts_wood = np.zeros((F, A, R), dtype=np.int32) if wood_gids is not None else None
+
+        # -------------------------
+        # Pattern 1: ragged dict
+        # -------------------------
+        if isinstance(ans_list, dict) and ("geometry_ids" in ans_list):
+            geom_ids = ans_list["geometry_ids"].numpy().astype(np.uint32)  # (K,)
+            ray_idx  = ans_list.get("ray_ids", None)
+            t_hits   = ans_list.get("t_hit", None)
+
+            if ray_idx is not None:
+                ray_idx = ray_idx.numpy().astype(np.int64)  # (K,)
+
+                # Map flat ray index -> (f,a,r)
+                Ar = A * R
+                f_idx = (ray_idx // Ar).astype(np.int64)
+                a_idx = ((ray_idx % Ar) // R).astype(np.int64)
+                r_idx = (ray_idx % R).astype(np.int64)
+
+                # First-hit extraction:
+                # Find the first (smallest t) per unique ray index
+                if t_hits is not None:
+                    t_hits_arr = t_hits.numpy().astype(np.float32)  # (K,)
+
+                    # argsort by (ray_idx, t_hits) so the first occurrence per ray is the smallest t
+                    order = np.lexsort((t_hits_arr, ray_idx))
+                    ray_idx_sorted = ray_idx[order]
+                    t_hits_sorted  = t_hits_arr[order]
+                    gids_sorted    = geom_ids[order]
+
+                    # keep first occurrence for each ray
+                    unique_rays, first_pos = np.unique(ray_idx_sorted, return_index=True)
+                    f_first = (unique_rays // Ar).astype(np.int64)
+                    a_first = ((unique_rays % Ar) // R).astype(np.int64)
+                    r_first = (unique_rays % R).astype(np.int64)
+
+                    # assign first t and gid
+                    first_hits[f_first, a_first, r_first] = t_hits_sorted[first_pos]
+                    first_gids[f_first, a_first, r_first] = gids_sorted[first_pos]
+
+                # Per-class multi-hit counts:
+                if (counts_leaf is not None) or (counts_wood is not None):
+                    if leaf_gids is not None:
+                        m_leaf = np.isin(geom_ids, np.asarray(leaf_gids, dtype=np.uint32))
+                        np.add.at(counts_leaf, (f_idx[m_leaf], a_idx[m_leaf], r_idx[m_leaf]), 1)
+                    if wood_gids is not None:
+                        m_wood = np.isin(geom_ids, np.asarray(wood_gids, dtype=np.uint32))
+                        np.add.at(counts_wood, (f_idx[m_wood], a_idx[m_wood], r_idx[m_wood]), 1)
+
+                # cleanup
+                del f_idx, a_idx, r_idx
+                gc.collect()
+
+            # If no ray_ids, we cannot map per-ray; per-class counts/first-hit remain as initialized.
+
+        # -------------------------
+        # Pattern 2: list/tuple per-ray
+        # -------------------------
+        elif isinstance(ans_list, (list, tuple)) and (len(ans_list) == F * A * R):
+            idx = 0
+            for f in range(F):
+                for a in range(A):
+                    for r in range(R):
+                        item = ans_list[idx]
+                        idx += 1
+
+                        # Accept a few shapes
+                        # Gather arrays (if missing, skip gracefully)
+                        if isinstance(item, dict):
+                            geom_ids = np.asarray(item.get("geometry_ids", []), dtype=np.uint32)
+                            t_arr    = np.asarray(item.get("t_hits", []), dtype=np.float32)
+                        else:
+                            geom_ids = np.asarray(getattr(item, "geometry_ids", []), dtype=np.uint32)
+                            t_arr    = np.asarray(getattr(item, "t_hits", []), dtype=np.float32)
+
+                        # First-hit per ray (smallest positive t)
+                        if t_arr.size:
+                            # choose smallest t; if multiple equal, the first index in that array
+                            k = np.argmin(t_arr)
+                            t_first = t_arr[k]
+                            gid_first = geom_ids[k] if geom_ids.size else 0
+                            first_hits[f, a, r] = t_first
+                            first_gids[f, a, r] = gid_first
+
+                        # Multi-hit class counts for this ray
+                        if counts_leaf is not None and leaf_gids is not None and geom_ids.size:
+                            counts_leaf[f, a, r] = int(np.isin(geom_ids, leaf_gids).sum())
+                        if counts_wood is not None and wood_gids is not None and geom_ids.size:
+                            counts_wood[f, a, r] = int(np.isin(geom_ids, wood_gids).sum())
+
+        else:
+            # Unknown structure; keep defaults (no per-class counts; first_hits remain inf)
+            pass
+
+        # If a class was requested but yielded all zeros, set to None to match your previous behavior
+        if (leaf_gids is None) or (counts_leaf is not None and not np.any(counts_leaf)):
+            counts_leaf = None
+        if (wood_gids is None) or (counts_wood is not None and not np.any(counts_wood)):
+            counts_wood = None
+
+    except Exception as e:
+        # list_intersections not available; no per-class counts and no first hits
+        counts_leaf = None
+        counts_wood = None
+        print(f"[warn] list_intersections() unavailable: {e}")
+
+    # ------------------------------------------------------------
+    # Legacy first-hit stats now come from first_hits/first_gids above
+    # ------------------------------------------------------------
+    gids  = first_gids
+    dists = first_hits
+
+    if leaf_gids is not None:
+        m_leaf = np.isin(gids, leaf_gids)
+    else:
+        m_leaf = np.zeros_like(gids, dtype=bool)
+
+    if wood_gids is not None:
+        m_wood = np.isin(gids, wood_gids)
+    else:
+        m_wood = np.zeros_like(gids, dtype=bool)
+
+    # Valid hits inside voxel slab (as before)
     valid_hits_mask = np.isfinite(dists) & (dists >= t_near) & (dists <= t_far) & (dists >= 0) & valid_rays_mask
 
-    dist_leaf = np.full_like(dists, np.inf)
-    dist_wood = np.full_like(dists, np.inf)
-    if leaf_gid is not None:
-        m = (gids == leaf_gid) & valid_hits_mask
-        dist_leaf[m] = dists[m]
-    if wood_gid is not None:
-        m = (gids == wood_gid) & valid_hits_mask
-        dist_wood[m] = dists[m]
+    dist_leaf = np.full_like(dists, np.inf, dtype=np.float32)
+    dist_wood = np.full_like(dists, np.inf, dtype=np.float32)
+    dist_leaf[m_leaf & valid_hits_mask] = dists[m_leaf & valid_hits_mask]
+    dist_wood[m_wood & valid_hits_mask] = dists[m_wood & valid_hits_mask]
 
+    # Combined: first hit of either class
     comb_dist = np.minimum(dist_leaf, dist_wood)
-    hit_any = np.isfinite(comb_dist) # & (comb_dist < np.inf)
-    n_hits_lw = int(hit_any.sum())
-    hit_leaf = np.isfinite(dist_leaf)
-    n_hits_leaf = int(hit_leaf.sum())
+    comb_dist[~np.isfinite(comb_dist) & valid_hits_mask] = dists[~np.isfinite(comb_dist) & valid_hits_mask]
 
-    delta = np.zeros_like(dists)
-    delta[valid_rays_mask] = t_far[valid_rays_mask] - t_near[valid_rays_mask]
-    z_arr = delta.copy()
-    z_arr[hit_any] = comb_dist[hit_any] - t_near[hit_any]
+    # ------------------------------------------------------------
+    # (Unchanged) path-length, EFPL, and stats assembly
+    # ------------------------------------------------------------
+    def mean_var_ddof1(x, N):
+        mx = x.sum(axis=2)
+        mean = np.divide(mx, N, out=np.zeros_like(mx), where=(N > 0))
+        mx2 = (x**2).sum(axis=2)
+        numer = mx2 - (mx * mx) / np.maximum(N, 1)
+        denom = np.maximum(N - 1, 1)
+        var = numer / denom
+        var[(N <= 1)] = 0.0
+        return mean, var
 
-    efpl_d = compute_efpl_array(delta[valid_rays_mask], lambda_1)
-    efpl_f = compute_efpl_array(z_arr[valid_rays_mask],  lambda_1)
+    N = valid_rays_mask.sum(axis=2).astype(np.int32)  # (F,A)
+    hit_any = np.isfinite(comb_dist)                  # (F,A,R)
 
-    stats_lw = dict(
-        N=N,
-        n_hits=n_hits_lw,
-        I=n_hits_lw / N if N else 0.0,
-        delta_bar=delta[valid_rays_mask].mean() if N else 0.0,
-        sum_delta=delta[valid_rays_mask].sum(),
-        sum_z=z_arr[valid_rays_mask].sum(),
-        mean_z=z_arr[valid_rays_mask].mean() if N else 0.0,
-        mean_delta_e=efpl_d.mean() if N else 0.0,
-        var_delta_e=efpl_d.var(ddof=1) if N > 1 else 0.0,
-        sum_z_e=efpl_f.sum(),
-        sum_hits_z_e=efpl_f[hit_any[valid_rays_mask]].sum() if n_hits_lw else 0.0,
-        mean_efpl_free=efpl_f.mean() if N else 0.0,
-        var_efpl_free=efpl_f.var(ddof=1) if N > 1 else 0.0,
-    )
+    path_lengths = np.zeros_like(dists, dtype=np.float32)
+    path_lengths[valid_rays_mask] = (t_far[valid_rays_mask] - t_near[valid_rays_mask])
 
-    delta = np.zeros_like(dists)
-    delta[valid_rays_mask] = t_far[valid_rays_mask] - t_near[valid_rays_mask]
-    z_arr = delta.copy()
-    z_arr[hit_leaf] = dists[hit_leaf] - t_near[hit_leaf]
+    free_path_length_comb = path_lengths.copy()
+    free_path_length_comb[hit_any] = comb_dist[hit_any] - t_near[hit_any]
 
-    efpl_d = compute_efpl_array(delta[valid_rays_mask], lambda_1)
-    efpl_f = compute_efpl_array(z_arr[valid_rays_mask],  lambda_1)
+    eff_free_path_length_comb = np.zeros_like(free_path_length_comb, dtype=np.float32)
+    eff_free_path_length_comb[valid_rays_mask] = compute_efpl_array(
+        free_path_length_comb[valid_rays_mask], lambda_1
+    ).astype(np.float32)
 
-    stats_leaf = dict(
-        N=N,
-        n_hits=n_hits_leaf,
-        I=n_hits_leaf / N if N else 0.0,
-        delta_bar=delta[valid_rays_mask].mean() if N else 0.0,
-        sum_delta=delta[valid_rays_mask].sum(),
-        sum_z=z_arr[valid_rays_mask].sum(),
-        mean_z=z_arr[valid_rays_mask].mean() if N else 0.0,
-        mean_delta_e=efpl_d.mean() if N else 0.0,
-        var_delta_e=efpl_d.var(ddof=1) if N > 1 else 0.0,
-        sum_z_e=efpl_f.sum(),
-        sum_hits_z_e=efpl_f[hit_leaf[valid_rays_mask]].sum() if n_hits_leaf else 0.0,
-        mean_efpl_free=efpl_f.mean() if N else 0.0,
-        var_efpl_free=efpl_f.var(ddof=1) if N > 1 else 0.0,
-    )
-    return stats_lw, stats_leaf, hit_details
+    sum_path_length = path_lengths.sum(axis=2)
+    mean_path_length = np.divide(sum_path_length, N, out=np.zeros_like(sum_path_length), where=(N > 0))
+    sum_free_path_length_comb = free_path_length_comb.sum(axis=2)
+    mean_free_path_length_comb = np.divide(sum_free_path_length_comb, N, out=np.zeros_like(sum_free_path_length_comb), where=(N > 0))
 
+    mean_eff_free_path_length_comb, var_eff_free_path_length_comb = mean_var_ddof1(eff_free_path_length_comb, N)
+    sum_hits_eff_free_path_length_comb = (eff_free_path_length_comb * hit_any).sum(axis=2)
+    n_hits_lw = hit_any.sum(axis=2).astype(np.int32)
+
+    # ------------------------------------------------------------
+    # MULTI-HIT (Option A/B) per (face, angle) — unchanged wiring
+    # (still uses counts_all / counts_leaf / counts_wood if present)
+    # ------------------------------------------------------------
+    
+    # ---------- Combinatorial bases (no factorials in hot loops) ----------
+
+    def _build_pascal_table(n_max: int) -> np.ndarray:
+        C = np.zeros((n_max + 1, n_max + 1), dtype=np.float64)
+        C[0, 0] = 1.0
+        for n in range(1, n_max + 1):
+            C[n, 0] = 1.0
+            for k in range(1, n + 1):
+                C[n, k] = C[n - 1, k - 1] + (C[n - 1, k] if k <= n - 1 else 0.0)
+        return C
+
+    def _precompute_B_omegas(omega_grid: np.ndarray, n_max: int, C: np.ndarray) -> np.ndarray:
+        O = omega_grid.size
+        B = np.zeros((O, n_max + 1, n_max + 1), dtype=np.float64)
+        for j, om in enumerate(omega_grid):
+            one_minus = 1.0 - om
+            powers = one_minus ** np.arange(0, n_max + 1)  # 0..n_max
+            for n in range(1, n_max + 1):
+                k_idx = np.arange(1, n + 1)
+                B[j, n, k_idx] = C[n - 1, k_idx - 1] * powers[n - k_idx]
+        return B
+
+    def _compute_T_vec(ol: float, n_max: int) -> np.ndarray:
+        """T[k] = ( (ωλ)^k / k! ), k>=1; T[0]=0."""
+        T = np.zeros(n_max + 1, dtype=np.float64)
+        if n_max >= 1:
+            T[1] = ol
+            for k in range(2, n_max + 1):
+                T[k] = T[k - 1] * ol / k
+        return T
+
+    # ---------- PMF table (log-space) ----------
+
+    class LogPMFCache:
+        """
+        Cache of log P(n | λ_i, ω_j) for n=0..n_max and the entire (λ,ω) grid.
+        Reuse this across combined / leaf / wood to avoid recomputation.
+        """
+        def __init__(self, lam_grid: np.ndarray, omega_grid: np.ndarray, n_max: int):
+            self.lam_grid = lam_grid.astype(np.float64)
+            self.omega_grid = omega_grid.astype(np.float64)
+            self.n_max = int(n_max)
+            self.logP_all = None  # shape (n_max+1, G) where G = L*O
+
+            self._build()
+
+        def _build(self):
+            L = self.lam_grid.size
+            O = self.omega_grid.size
+            G = L * O
+            C = _build_pascal_table(self.n_max)
+            B = _precompute_B_omegas(self.omega_grid, self.n_max, C)
+
+            logP_all = np.empty((self.n_max + 1, G), dtype=np.float64)
+            eps = 1e-300
+            idx = 0
+            for i in range(L):
+                lam = float(self.lam_grid[i])
+                e_neg = np.exp(-lam)
+                for j in range(O):
+                    om = float(self.omega_grid[j])
+                    ol = om * lam
+                    T = _compute_T_vec(ol, self.n_max)
+                    ssum = B[j] @ T  # length (n_max+1); ssum[0] = 0
+                    p = np.empty(self.n_max + 1, dtype=np.float64)
+                    p[0] = e_neg
+                    if self.n_max >= 1:
+                        p[1:] = e_neg * ssum[1:]
+                    logP_all[:, idx] = np.log(np.maximum(p, eps))
+                    idx += 1
+            self.logP_all = logP_all
+
+    # ---------- Histogram builder ----------
+
+    def build_histograms(counts_FAR: np.ndarray,
+                        valid_mask_FAR: np.ndarray,
+                        n_max: int) -> np.ndarray:
+        F, A, R = counts_FAR.shape
+        M = F * A
+        counts = counts_FAR.reshape(M, R)
+        mask = valid_mask_FAR.reshape(M, R)
+        H = np.zeros((M, n_max + 1), dtype=np.int64)
+        for m in range(M):
+            if mask[m].any():
+                vals = counts[m, mask[m]]
+                H[m] = np.bincount(vals, minlength=n_max + 1)
+        return H
+
+    # ---------- Batched MLE (one matmul + argmax) ----------
+
+    def mle_clustered_batched_np(counts_FAR: np.ndarray,
+                                valid_mask_FAR: np.ndarray,
+                                lam_grid: np.ndarray,
+                                omega_grid: np.ndarray,
+                                precomputed: LogPMFCache | None = None):
+        # max observed count across valid rays
+        n_max = int(np.max(np.where(valid_mask_FAR, counts_FAR, 0)))
+        n_max = max(n_max, 0)
+
+        cache = precomputed
+        if (cache is None or
+            cache.n_max != n_max or
+            cache.lam_grid.shape != lam_grid.shape or
+            cache.omega_grid.shape != omega_grid.shape or
+            np.any(cache.lam_grid != lam_grid) or
+            np.any(cache.omega_grid != omega_grid)):
+            cache = LogPMFCache(lam_grid, omega_grid, n_max)
+
+        H = build_histograms(counts_FAR.astype(np.int32), valid_mask_FAR, n_max)     # (M, n_max+1)
+        LL_all = H.astype(np.float64).dot(cache.logP_all)                            # (M, G)
+
+        best_idx = np.argmax(LL_all, axis=1)
+        L = lam_grid.size
+        O = omega_grid.size
+        lam_idx = best_idx // O
+        omg_idx = best_idx % O
+
+        best_lambda = lam_grid[lam_idx]
+        best_omega  = omega_grid[omg_idx]
+        best_ll     = LL_all[np.arange(LL_all.shape[0]), best_idx]
+
+        return best_lambda, best_omega, best_ll, cache
+    
+    def _compute_multihit_stats(counts_FAR, valid_rays_mask_FA, F, A,
+                                lam_grid=None, omega_grid=None, pmf_cache=None):
+        if lam_grid is None:
+            lam_grid = np.linspace(1e-3, 3.0, 60)
+        if omega_grid is None:
+            omega_grid = np.linspace(1e-3, 0.999, 60)
+
+        # Basic per-(F,A) stats (vectorized)
+        n_rays_multihit = valid_rays_mask_FA.sum(axis=2).astype(np.int32)
+        safeN = np.maximum(n_rays_multihit, 1)
+        masked = np.where(valid_rays_mask_FA, counts_FAR, 0)
+
+        sum_x  = masked.sum(axis=2).astype(np.float64)
+        sum_x2 = (masked**2).sum(axis=2).astype(np.float64)
+
+        mean_count = sum_x / safeN
+        var_count = np.zeros_like(mean_count, dtype=np.float64)
+        has2 = n_rays_multihit > 1
+        var_count[has2] = (sum_x2[has2] - (sum_x[has2]**2) / n_rays_multihit[has2]) / (n_rays_multihit[has2] - 1)
+
+        pgap_count = np.zeros_like(mean_count, dtype=np.float64)
+        nz = n_rays_multihit > 0
+        pgap_count[nz] = (np.where(valid_rays_mask_FA[nz], counts_FAR[nz] == 0, False).sum(axis=1)) / n_rays_multihit[nz]
+
+        lambda_eff = mean_count.copy()
+
+        # ---- Batched MLE for all directions (no loops) ----
+        lam_hat_flat, omg_hat_flat, ll_hat_flat, pmf_cache = mle_clustered_batched_np(
+            counts_FAR, valid_rays_mask_FA, lam_grid, omega_grid, precomputed=pmf_cache
+        )
+        lambda_B = lam_hat_flat.reshape(F, A)
+        omega_B  = omg_hat_flat.reshape(F, A)
+        loglik_B = ll_hat_flat.reshape(F, A)
+
+        # Assemble result in your existing dict shape
+        stats_result = [[None for _ in range(A)] for _ in range(F)]
+        for f in range(F):
+            for a in range(A):
+                stats_result[f][a] = dict(
+                    n_rays_multihit=int(n_rays_multihit[f, a]) if n_rays_multihit[f, a] > 0 else 0,
+                    pgap_count=float(pgap_count[f, a]) if n_rays_multihit[f, a] > 0 else np.nan,
+                    mean_count=float(mean_count[f, a]) if n_rays_multihit[f, a] > 0 else np.nan,
+                    var_count=float(var_count[f, a])  if n_rays_multihit[f, a] > 0 else np.nan,
+                    lambda_eff_hat_poisson=float(lambda_eff[f, a]) if n_rays_multihit[f, a] > 0 else np.nan,
+                    lambda_hat_clustered=float(lambda_B[f, a]) if n_rays_multihit[f, a] > 0 else np.nan,
+                    Omega_B_clustered=float(omega_B[f, a]) if n_rays_multihit[f, a] > 0 else np.nan,
+                    loglik_B=float(loglik_B[f, a]) if n_rays_multihit[f, a] > 0 else np.nan,
+                )
+
+        return stats_result, pmf_cache
+
+    # ------------------------------------------------------------
+    # Create dictionaries for combined multi-hit stats (if counts_all is available)
+    # ------------------------------------------------------------
+    # combined
+    stats_comb = [[None for _ in range(A)] for _ in range(F)]
+    for f in range(F):
+        for a in range(A):
+            stats_comb[f][a] = dict(
+                N=int(N[f, a]),
+                n_hits=int(n_hits_lw[f, a]),
+                I=(float(n_hits_lw[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
+                mean_path_length=float(mean_path_length[f, a]),
+                sum_path_length=float(sum_path_length[f, a]),
+                sum_free_path_length=float(sum_free_path_length_comb[f, a]),
+                mean_free_path_length=float(mean_free_path_length_comb[f, a]),
+                mean_eff_free_path_length=float(mean_eff_free_path_length_comb[f, a]),
+                var_eff_free_path_length=float(var_eff_free_path_length_comb[f, a]),
+                sum_eff_free_path_length=float(np.sum(eff_free_path_length_comb[f, a, :])),
+                sum_hits_eff_free_path_length=float(sum_hits_eff_free_path_length_comb[f, a]),
+            )
+
+    # Leaf-only stats (legacy distances)
+    if np.any(m_leaf):
+        hit_leaf = np.isfinite(dist_leaf)
+        free_path_length_leaf = path_lengths.copy()
+        free_path_length_leaf[hit_leaf] = dists[hit_leaf] - t_near[hit_leaf]
+        sum_free_path_length_leaf = free_path_length_leaf.sum(axis=2)
+        eff_free_path_length_leaf = np.zeros_like(free_path_length_leaf, dtype=np.float32)
+        eff_free_path_length_leaf[valid_rays_mask] = compute_efpl_array(
+            free_path_length_leaf[valid_rays_mask], lambda_1
+        ).astype(np.float32)
+        sum_eff_free_path_length_leaf = np.sum(eff_free_path_length_leaf, axis=2)
+        n_hits_leaf = hit_leaf.sum(axis=2).astype(np.int32)
+        mean_free_path_length_leaf = np.nanmean(free_path_length_leaf, axis=2)
+        mean_eff_free_path_length_leaf, var_eff_free_path_length_leaf = mean_var_ddof1(eff_free_path_length_leaf, N)
+        sum_hits_eff_free_path_length_leaf = (eff_free_path_length_leaf * hit_leaf).sum(axis=2)
+
+        stats_leaf = [[None for _ in range(A)] for _ in range(F)]
+        for f in range(F):
+            for a in range(A):
+                leaf_dict = dict(
+                    N=int(N[f, a]),
+                    n_hits=int(n_hits_leaf[f, a]),
+                    I=(float(n_hits_leaf[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
+                    mean_path_length=float(mean_path_length[f, a]),
+                    sum_path_length=float(sum_path_length[f, a]),
+                    sum_free_path_length=float(sum_free_path_length_leaf[f, a]),
+                    mean_free_path_length=float(mean_free_path_length_leaf[f, a]),
+                    mean_eff_free_path_length=float(mean_eff_free_path_length_leaf[f, a]),
+                    var_eff_free_path_length=float(var_eff_free_path_length_leaf[f, a]),
+                    sum_eff_free_path_length=float(sum_eff_free_path_length_leaf[f, a]),
+                    sum_hits_eff_free_path_length=float(sum_hits_eff_free_path_length_leaf[f, a]),
+                )
+                stats_leaf[f][a] = leaf_dict
+
+    else:
+        stats_leaf = [[None for _ in range(A)] for _ in range(F)]
+        for f in range(F):
+            for a in range(A):
+                stats_leaf[f][a] = dict(
+                    N=0, n_hits=0, I=0.0,
+                    mean_path_length=0.0, sum_path_length=0.0,
+                    sum_free_path_length=0.0, mean_free_path_length=0.0,
+                    mean_eff_free_path_length=0.0, var_eff_free_path_length=0.0,
+                    sum_eff_free_path_length=0.0, sum_hits_eff_free_path_length=0.0,
+                )
+
+    # Wood-only stats (legacy distances)
+    if np.any(m_wood):
+        hit_wood = np.isfinite(dist_wood)
+        free_path_length_wood = path_lengths.copy()
+        free_path_length_wood[hit_wood] = dists[hit_wood] - t_near[hit_wood]
+        eff_free_path_length_wood = np.zeros_like(free_path_length_wood, dtype=np.float32)
+        eff_free_path_length_wood[valid_rays_mask] = compute_efpl_array(
+            free_path_length_wood[valid_rays_mask], lambda_1
+        ).astype(np.float32)
+        n_hits_wood = hit_wood.sum(axis=2).astype(np.int32)
+        sum_free_path_length_wood = free_path_length_wood.sum(axis=2)
+        mean_free_path_length_wood = np.divide(sum_free_path_length_wood, N, out=np.zeros_like(sum_free_path_length_wood), where=(N > 0))
+        mean_eff_free_path_length_wood, var_eff_free_path_length_wood = mean_var_ddof1(eff_free_path_length_wood, N)
+        sum_hits_eff_free_path_length_wood = (eff_free_path_length_wood * hit_wood).sum(axis=2)
+
+        stats_wood = [[None for _ in range(A)] for _ in range(F)]
+        for f in range(F):
+            for a in range(A):
+                wood_dict = dict(
+                    N=int(N[f, a]),
+                    n_hits=int(n_hits_wood[f, a]),
+                    I=(float(n_hits_wood[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
+                    mean_path_length=float(mean_path_length[f, a]),
+                    sum_path_length=float(sum_path_length[f, a]),
+                    sum_free_path_length=float(sum_free_path_length_wood[f, a]),
+                    mean_free_path_length=float(mean_free_path_length_wood[f, a]),
+                    mean_eff_free_path_length=float(mean_eff_free_path_length_wood[f, a]),
+                    var_eff_free_path_length=float(var_eff_free_path_length_wood[f, a]),
+                    sum_eff_free_path_length=float(np.sum(eff_free_path_length_wood[f, a, :])),
+                    sum_hits_eff_free_path_length=float(sum_hits_eff_free_path_length_wood[f, a]),
+                    mean_eff_free_path_length_free=float(mean_eff_free_path_length_wood[f, a]),
+                    var_eff_free_path_length_free=float(var_eff_free_path_length_wood[f, a])
+                )
+                stats_wood[f][a] = wood_dict
+
+    else:
+        stats_wood = [[None for _ in range(A)] for _ in range(F)]
+        for f in range(F):
+            for a in range(A):
+                stats_wood[f][a] = dict(
+                    N=0, n_hits=0, I=0.0,
+                    mean_path_length=0.0, sum_path_length=0.0,
+                    sum_free_path_length=0.0, mean_free_path_length=0.0,
+                    mean_eff_free_path_length=0.0, var_eff_free_path_length=0.0,
+                    sum_eff_free_path_length=0.0, sum_hits_eff_free_path_length=0.0,
+                    mean_eff_free_path_length_free=0.0, var_eff_free_path_length_free=0.0
+                )
+
+    lam_grid = np.linspace(1e-3, 3.0, 60)
+    omega_grid = np.linspace(1e-3, 0.999, 60)
+    pmf_cache = None  # shared across combined/leaf/wood
+
+    # Recompute counts_all as the total number of intersections per ray (not sum of counts_leaf + counts_wood)
+    # If both classes are present, counts_all = max(counts_leaf, counts_wood) or use the union
+    # For now, use logical OR: a ray has a combined hit if it hit either leaf or wood
+    if counts_leaf is not None and counts_wood is not None:
+        counts_all = counts_leaf + counts_wood  # Per-ray: sum of intersections with both classes
+    elif counts_leaf is not None:
+        counts_all = counts_leaf.copy()
+    elif counts_wood is not None:
+        counts_all = counts_wood.copy()
+    else:
+        counts_all = None
+
+    if counts_all is not None:
+        multihit_stats_comb, pmf_cache = _compute_multihit_stats(
+            counts_all, valid_rays_mask, F, A, lam_grid, omega_grid, pmf_cache
+        )
+        for f in range(F):
+            for a in range(A):
+                stats_comb[f][a].update(multihit_stats_comb[f][a])
+
+    if counts_leaf is not None:
+        multihit_stats_leaf, pmf_cache = _compute_multihit_stats(
+            counts_leaf, valid_rays_mask, F, A, lam_grid, omega_grid, pmf_cache
+        )
+        for f in range(F):
+            for a in range(A):
+                stats_leaf[f][a].update(multihit_stats_leaf[f][a])
+
+    if counts_wood is not None:
+        multihit_stats_wood, pmf_cache = _compute_multihit_stats(
+            counts_wood, valid_rays_mask, F, A, lam_grid, omega_grid, pmf_cache
+        )
+        for f in range(F):
+            for a in range(A):
+                stats_wood[f][a].update(multihit_stats_wood[f][a])
+
+
+    return stats_comb, stats_leaf, stats_wood
 
 def simulate_voxel_grouped(scene, leaf_gids, wood_gids,
                            voxel_center, voxel_size,
@@ -768,6 +1229,19 @@ def simulate_voxel_grouped(scene, leaf_gids, wood_gids,
     # Each field returns with leading dims (F,A,R)
     gids   = hits["geometry_ids"].numpy()      # (F,A,R), uint32 or int64
     dists  = hits["t_hit"].numpy()             # (F,A,R), float32; inf for miss
+
+    # Multi-hit rays 
+    try:
+        ans_count = scene.count_intersections(o3c.Tensor(rays_FAR6, dtype=o3c.float32)).numpy()  # (F,A,R), int32
+        print(f"Counted {ans_count.sum()} intersections for {F*A*R} rays.")
+    except Exception as e:
+        print(f"Error counting intersections: {e}. This may be due to an older Open3D version that doesn't support count_intersections. Proceeding without multi-hit counts.")
+    
+    try:
+        ans_list = scene.list_intersections(o3c.Tensor(rays_FAR6, dtype=o3c.float32))  # list of (F,A,R) arrays
+        print(f"Retrieved list of {len(ans_list)} intersection arrays for rays.")
+    except Exception as e:
+        print(f"Error listing intersections: {e}. This may be due to an older Open3D version that doesn't support list_intersections. Proceeding without multi-hit details.")
 
     # If debugging, save xyz to ASCII .xyz, with scalar for Face, Angle, and Leaf/Wood hit
     if DEBUG_MODE:
@@ -1476,7 +1950,7 @@ def process_voxel(
                 raise ValueError(f"Unknown scene type: {scene}")
     
             # Use simulate_voxel_grouped for vectorized stats computation
-            stats_comb_grouped, stats_leaf_grouped, stats_wood_grouped = simulate_voxel_grouped(
+            stats_comb_grouped, stats_leaf_grouped, stats_wood_grouped = simulate_voxel_grouped_with_multi(
             voxel_scene, leaf_gid, wood_gid,
             voxel_center, voxel_size,
             rays_FAR6, lambda_1, scene_name=scene)
@@ -1589,7 +2063,31 @@ def process_voxel(
                             "alpha":   float(alpha) if alpha is not None else np.nan,
                             "leaf_fraction": float(leaf_fraction) if not np.isnan(leaf_fraction) else np.nan,
                             "wood_fraction": float(wood_fraction) if not np.isnan(wood_fraction) else np.nan,
-
+                            # multi-hit stats
+                            "n_rays_multihit_leaf": int(leaf_data.get("n_rays_multihit", np.nan)) if ("n_rays_multihit" in leaf_data and not np.isnan(leaf_data.get("n_rays_multihit", np.nan))) else np.nan,
+                            "pgap_count_leaf": float(leaf_data.get("pgap_count", np.nan)) if "pgap_count" in leaf_data else np.nan,
+                            "mean_count_leaf": float(leaf_data.get("mean_count", np.nan)) if "mean_count" in leaf_data else np.nan,
+                            "var_count_leaf": float(leaf_data.get("var_count", np.nan)) if "var_count" in leaf_data else np.nan,
+                            "lambda_eff_hat_poisson_leaf": float(leaf_data.get("lambda_eff_hat_poisson", np.nan)) if "lambda_eff_hat_poisson" in leaf_data else np.nan,
+                            "lambda_hat_clustered_leaf": float(leaf_data.get("lambda_hat_clustered", np.nan)) if "lambda_hat_clustered" in leaf_data else np.nan,
+                            "Omega_B_clustered_leaf": float(leaf_data.get("Omega_B_clustered", np.nan)) if "Omega_B_clustered" in leaf_data else np.nan,
+                            "loglik_B_leaf": float(leaf_data.get("loglik_B", np.nan)) if "loglik_B" in leaf_data else np.nan,
+                            "n_rays_multihit_wood": int(wood_data.get("n_rays_multihit", np.nan)) if ("n_rays_multihit" in wood_data and not np.isnan(wood_data.get("n_rays_multihit", np.nan))) else np.nan,
+                            "pgap_count_wood": float(wood_data.get("pgap_count", np.nan)) if "pgap_count" in wood_data else np.nan,
+                            "mean_count_wood": float(wood_data.get("mean_count", np.nan)) if "mean_count" in wood_data else np.nan,
+                            "var_count_wood": float(wood_data.get("var_count", np.nan)) if "var_count" in wood_data else np.nan,
+                            "lambda_eff_hat_poisson_wood": float(wood_data.get("lambda_eff_hat_poisson", np.nan)) if "lambda_eff_hat_poisson" in wood_data else np.nan,
+                            "lambda_hat_clustered_wood": float(wood_data.get("lambda_hat_clustered", np.nan)) if "lambda_hat_clustered" in wood_data else np.nan,
+                            "Omega_B_clustered_wood": float(wood_data.get("Omega_B_clustered", np.nan)) if "Omega_B_clustered" in wood_data else np.nan,
+                            "loglik_B_wood": float(wood_data.get("loglik_B", np.nan)) if "loglik_B" in wood_data else np.nan,
+                            "n_rays_multihit_comb": int(comb_data.get("n_rays_multihit", np.nan)) if ("n_rays_multihit" in comb_data and not np.isnan(comb_data.get("n_rays_multihit", np.nan))) else np.nan,
+                            "pgap_count_comb": float(comb_data.get("pgap_count", np.nan)) if "pgap_count" in comb_data else np.nan,
+                            "mean_count_comb": float(comb_data.get("mean_count", np.nan)) if "mean_count" in comb_data else np.nan,
+                            "var_count_comb": float(comb_data.get("var_count", np.nan)) if "var_count" in comb_data else np.nan,
+                            "lambda_eff_hat_poisson_comb": float(comb_data.get("lambda_eff_hat_poisson", np.nan)) if "lambda_eff_hat_poisson" in comb_data else np.nan,
+                            "lambda_hat_clustered_comb": float(comb_data.get("lambda_hat_clustered", np.nan)) if "lambda_hat_clustered" in comb_data else np.nan,
+                            "Omega_B_clustered_comb": float(comb_data.get("Omega_B_clustered", np.nan)) if "Omega_B_clustered" in comb_data else np.nan,
+                            "loglik_B_comb": float(comb_data.get("loglik_B", np.nan)) if "loglik_B" in comb_data else np.nan,
                             
                         }
 
