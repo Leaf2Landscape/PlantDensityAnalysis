@@ -634,34 +634,30 @@ def _compute_normals_vectorized(points, neighbor_indices):
 
 
 @njit
-def _compute_smallest_eigenvector_3x3(cov):
+def _compute_smallest_eigenvector_3x3(cov, eps = 1e-12):
     """
     Compute the eigenvector of the smallest eigenvalue for 3x3 matrix.
     Uses power iteration for speed.
     """
+    # Symmetrize to remove numerical skew
+    cov_s = 0.5 * (cov + cov.T)
+    I = np.eye(3)
+
     # Start with random vector
     v = np.array([1.0, 0.0, 0.0])
     
     # Power iteration to find largest eigenvector of (I - cov) = smallest of cov
     # Invert via: find largest eigenvalue of -cov
     for _ in range(10):  # Usually converges in 2-3 iterations
-        v_new = np.zeros(3)
-        for i in range(3):
-            for j in range(3):
-                v_new[i] -= cov[i, j] * v[j]  # Negate to find smallest
-        
-        # Normalize
-        norm = np.sqrt(v_new[0]**2 + v_new[1]**2 + v_new[2]**2)
-        if norm > 1e-10:
-            v_new /= norm
-        else:
-            break
-        
-        v = v_new
+        v_new = np.linalg.solve(I - cov_s + eps * I, v)  # Solve (I - cov) v_new = v
+        n = np.sqrt(v_new[0]**2 + v_new[1]**2 + v_new[2]**2)
+        if n <= 1e-20:
+            break  # Avoid division by zero
+        v = v_new / n  # Normalize
     
     # Normalize final result
     norm = np.sqrt(v[0]**2 + v[1]**2 + v[2]**2)
-    if norm > 1e-10:
+    if norm > 0.0:
         v /= norm
     
     return v
