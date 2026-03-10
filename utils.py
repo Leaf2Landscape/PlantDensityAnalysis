@@ -492,9 +492,11 @@ def compute_normals_weights_from_points_parallel(
         dists, nb = tree.query(pts, k=k, workers=1)
         # nb is (M, k) indices *within* pts; compute normals in this local frame
         nb = nb.astype(np.int64, copy=False)
-        loc_normals = _compute_normals_vectorized(pts, nb)
+        loc_normals, loc_confidences = _compute_normals_vectorized(pts, nb)
         # simple inverse-of-farthest-distance weight
         w = 1.0 / (dists[:, -1] + eps)
+        # attenuate weight using surface confidence (more planar = higher confidence = higher weight)
+        w *= loc_confidences
         return idx, loc_normals, w
 
     # Run bins in parallel with progress bar
@@ -595,9 +597,11 @@ def _compute_normals_vectorized(points, neighbor_indices):
     
     OUTPUTS:
         normals: Unit normal vectors (N, 3)
+        confidences: Surface variation confidence (N,)
     """
     n_points = points.shape[0]
     normals = np.zeros((n_points, 3), dtype=np.float64)
+    confidences = np.zeros(n_points, dtype=np.float64)
     
     for i in range(n_points):
         # Get neighbor points
@@ -624,13 +628,14 @@ def _compute_normals_vectorized(points, neighbor_indices):
         
         # Eigenvalue decomposition via power iteration (fast for 3x3)
         # The normal is the eigenvector with smallest eigenvalue
-        normal = _compute_smallest_eigenvector_3x3(cov)
+        normal, confidence = _compute_smallest_eigenvector_3x3(cov)
         
         # Explicitly assign each component to avoid broadcasting issues
         for k in range(3):
             normals[i, k] = normal[k]
+            confidences[i] = confidence
     
-    return normals
+    return normals, confidences
 
 
 @njit
@@ -638,6 +643,10 @@ def _compute_smallest_eigenvector_3x3(cov, eps = 1e-12):
     """
     Compute the eigenvector of the smallest eigenvalue for 3x3 matrix.
     Uses power iteration for speed.
+
+    Returns:
+        normal: The eigenvector corresponding to the smallest eigenvalue (unit vector)
+        confidence: 1 - surface_variation in [0,1] as a measure of how planar the neighborhood is
     """
     # Symmetrize to remove numerical skew
     cov_s = 0.5 * (cov + cov.T)
@@ -659,8 +668,19 @@ def _compute_smallest_eigenvector_3x3(cov, eps = 1e-12):
     norm = np.sqrt(v[0]**2 + v[1]**2 + v[2]**2)
     if norm > 0.0:
         v /= norm
+
+    # Calculate the confidence of the surface planes used to attenuate the weights later on
+    # λ_min ≈ Rayleigh(v) = v^T C v  ;  sum λ_i = trace(C)
+    lam3 = v[0] * (cov_s[0, 0] * v[0] + cov_s[0, 1] * v[1] + cov_s[0, 2] * v[2]) + \
+           v[1] * (cov_s[1, 0] * v[0] + cov_s[1, 1] * v[1] + cov_s[1, 2] * v[2]) + \
+           v[2] * (cov_s[2, 0] * v[0] + cov_s[2, 1] * v[1] + cov_s[2, 2] * v[2])
+    trace = cov_s[0, 0] + cov_s[1, 1] + cov_s[2, 2]
+    surf_var = 0.0
+    if trace > 0.0 and lam3 >= 0.0:
+        surf_var = lam3 / trace
+    confidence = 1.0 - min(1.0, max(0.0, surf_var))  # Invert so that more planar = higher confidence
     
-    return v
+    return v, confidence
 
 # Create a unique ID for a voxel
 def create_voxel_id(voxel_size, x, y, z):
