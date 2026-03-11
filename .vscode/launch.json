@@ -55,7 +55,7 @@
             "console": "integratedTerminal",
             "args": [
                 "/home/capheus/projects/AMAPVox_test/second_test/ACPL_erectophile/ACPL.obj",
-                "--voxel_sizes", "0.2", "--scene_formats", "combined"
+                "--voxel_sizes", "2.0", "--scene_formats", "combined"
             ]
         },
         {
@@ -65,7 +65,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args": [
-                "/home/capheus/projects/AMAPVox_test/second_test/ALGL4_spherical",
+                "/home/capheus/projects/AMAPVox_test/second_test/ACPL_erectophile",
                 "--use_class"
             ]
         },
