@@ -27,6 +27,8 @@ import subprocess
 import pyvista as pv
 from typing import List, Tuple, Union, Optional
 from pathlib import Path
+
+from utils import classify_liad_to_dewit
     
 from numba import njit, prange
 
@@ -524,16 +526,21 @@ def compute_LIAD_from_mesh(o3d_mesh, num_bins=18):
     """
     if (o3d_mesh is None) or (len(o3d_mesh.triangles) == 0):
         return np.array([]), np.array([]), np.nan
+    
     verts = np.asarray(o3d_mesh.vertices)
     tris = np.asarray(o3d_mesh.triangles)
     v0 = verts[tris[:, 1]] - verts[tris[:, 0]]
     v1 = verts[tris[:, 2]] - verts[tris[:, 0]]
+
     cross_prod = np.cross(v0, v1)
     areas = 0.5 * np.linalg.norm(cross_prod, axis=1)
     norms = np.linalg.norm(cross_prod, axis=1, keepdims=True)
     normals = np.divide(cross_prod, norms, where=(norms != 0))
+
     angle_facets = np.degrees(np.arccos(np.clip(normals[:, 2], -1, 1)))
     angle_facets = np.where(angle_facets > 90, 180 - angle_facets, angle_facets)
+    angle_facets = 90.0 - angle_facets  # Convert to plane such that vertical leaves are small angles and horizontal leaves are large
+
     mean_angle = angle_facets.mean() if angle_facets.size > 0 else np.nan
     bin_edges = np.linspace(0, 90, num_bins + 1)
     idx = np.digitize(angle_facets, bin_edges) - 1
@@ -573,7 +580,7 @@ def _grid(voxel_size, ray_spacing):
     For full coverage when rotating the voxel, use face_len = voxel_size * sqrt(2).
     This ensures the grid covers the diagonal of the voxel after rotation.
     """
-    face_len = voxel_size * np.sqrt(2)
+    face_len = (voxel_size * np.sqrt(2)) + 1e-6  # Add small epsilon to ensure all rays cover the diagonal corner
     s = np.arange(-face_len / 2, face_len / 2 + ray_spacing, ray_spacing)
     return np.meshgrid(s, s, indexing='xy')
 
@@ -1892,13 +1899,31 @@ def process_voxel(
         bin_wood, wiad, _ = compute_LIAD_from_mesh(o3d_wood) if o3d_wood else (np.array([]), np.array([]), None)
         bin_comb, piad, _ = compute_LIAD_from_mesh(o3d_leaf + o3d_wood) if (o3d_leaf and o3d_wood) else (np.array([]), np.array([]), None)
 
-        # Store LIAD/WIAD/PIAD bins and values
-        liad_dict = {f"LIAD_bin_{c:.1f}": float(v)
-                for c, v in zip(bin_leaf, liad)}
-        wiad_dict = {f"WIAD_bin_{c:.1f}": float(v)
-                for c, v in zip(bin_wood, wiad)}
-        piad_dict = {f"PIAD_bin_{c:.1f}": float(v)
-                for c, v in zip(bin_comb, piad)}
+        if liad.size > 0 and bin_leaf.size > 0:
+            liad_dewit, liad_dewit_rmse, liad_dewit_l1 = classify_liad_to_dewit(
+                liad=liad,
+                bin_centres_deg=bin_leaf,
+                return_scores=True
+            )
+            liad_dewit_rmse = np.nan if liad_dewit_rmse is None else liad_dewit_rmse
+            liad_dewit_l1 = np.nan if liad_dewit_l1 is None else liad_dewit_l1
+        else:
+            liad_dewit = "NA"
+            liad_dewit_rmse = np.nan
+            liad_dewit_l1 = np.nan
+
+        if piad.size > 0 and bin_comb.size> 0:
+            piad_dewit, piad_dewit_rmse, piad_dewit_l1 = classify_liad_to_dewit(
+                liad=piad,
+                bin_centres_deg=bin_comb,
+                return_scores=True
+            )
+            piad_dewit_rmse = np.nan if piad_dewit_rmse is None else piad_dewit_rmse
+            piad_dewit_l1 = np.nan if piad_dewit_l1 is None else piad_dewit_l1
+        else:
+            piad_dewit = "NA"
+            piad_dewit_rmse = np.nan
+            piad_dewit_l1 = np.nan
         
     except Exception as e:
         raise RuntimeError(
@@ -2060,6 +2085,15 @@ def process_voxel(
                             "CI_Leaf": float(CI_leaf) if not np.isnan(CI_leaf) else np.nan,
                             "CI_Wood": float(CI_wood) if not np.isnan(CI_wood) else np.nan,
                             "CI_Comb": float(CI_comb) if not np.isnan(CI_comb) else np.nan,
+                            "liad_json": json.dumps(liad.tolist()) if liad is not None else np.nan,
+                            "liad_dewit": liad_dewit,
+                            "liad_dewit_rmse": liad_dewit_rmse,
+                            "liad_dewit_l1": liad_dewit_l1,
+                            "wiad_json": json.dumps(wiad.tolist()) if wiad is not None else np.nan,
+                            "piad_json": json.dumps(piad.tolist()) if piad is not None else np.nan,
+                            "piad_dewit": piad_dewit,
+                            "piad_dewit_rmse": piad_dewit_rmse,
+                            "piad_dewit_l1": piad_dewit_l1,
                             "alpha":   float(alpha) if alpha is not None else np.nan,
                             "leaf_fraction": float(leaf_fraction) if not np.isnan(leaf_fraction) else np.nan,
                             "wood_fraction": float(wood_fraction) if not np.isnan(wood_fraction) else np.nan,
@@ -2090,10 +2124,6 @@ def process_voxel(
                             "loglik_B_comb": float(comb_data.get("loglik_B", np.nan)) if "loglik_B" in comb_data else np.nan,
                             
                         }
-
-                        row.update(liad_dict)
-                        row.update(wiad_dict)
-                        row.update(piad_dict)
                         row['scene'] = scene
 
                         all_results.append(row)

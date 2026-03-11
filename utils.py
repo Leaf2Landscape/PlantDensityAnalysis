@@ -34,6 +34,8 @@ import math
 import tempfile
 from typing import Dict, Tuple, List
 
+import json
+
 import numpy as np
 import pandas as pd
 
@@ -110,28 +112,17 @@ voxel_metrics_schema_singlereturn = pa.schema([
     pa.field('I_lw', pa.float64()),      # num_hits / num_rays (i.e. leaf and wood)
     pa.field('I_leaf', pa.float64()),  # num_leaf_hits / num_rays (i.e. leaf only)
     pa.field('I_wood', pa.float64()),  # num_wood_hits / num_rays (i.e. wood only)
-    pa.field('G_lw', pa.float64()),                    # G function calculated from leaf and wood hits
     pa.field('G_leaf', pa.float64()),               # G function calculated from leaf hits only
     pa.field('G_wood', pa.float64()),               # G function calculated from wood hits only
+    pa.field('G_all', pa.float64()),                # G function calculated from all hits
+    pa.field('angle_bin_centres', pa.string()),  # Angle distribution bin centres as a JSON string
+    pa.field('liad_json', pa.string()),         # LIAD histogram as JSON string
+    pa.field('liad_dewit', pa.string()),        # LIAD De Wit classification
+    pa.field('liad_dewit_rmse', pa.float64()),       # De Wit rmse for designated label
+    pa.field('liad_dewit_l1', pa.float64()),         # De Wit l1 for designated label
+    pa.field('wiad_json', pa.string()),         # WIAD histogram as JSON string
+    pa.field('piad_json', pa.string()),         # PIAD histogram as JSON string
     pa.field('lambda_1', pa.float64()),
-    pa.field('LIAD_leaf_bin_2.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_7.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_12.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_17.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_22.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_27.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_32.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_37.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_42.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_47.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_52.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_57.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_62.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_67.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_72.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_77.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_82.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_87.5', pa.float32()),
     pa.field('mean_angle_leaf', pa.float32()), # Mean angle of leaf hits only
     pa.field('mean_angle_all', pa.float32()), # Mean angle of all hits
     pa.field('mean_path_length', pa.float64()),
@@ -166,9 +157,22 @@ voxel_metrics_schema_multireturn = pa.schema([
     pa.field('I_lw', pa.float64()),      # num_hits / num_rays (i.e. leaf and wood)
     pa.field('I_leaf', pa.float64()),  # num_leaf_hits / num_rays (i.e. leaf only)
     pa.field('I_wood', pa.float64()),  # num_wood_hits / num_rays (i.e. wood only)
-    pa.field('G_lw', pa.float64()),                    # G function calculated from leaf and wood hits
     pa.field('G_leaf', pa.float64()),               # G function calculated from leaf hits only
     pa.field('G_wood', pa.float64()),               # G function calculated from wood hits only
+    pa.field('G_all', pa.float64()),                # G function calculated from all hits
+    pa.field('angle_bin_centres', pa.string()), # Angle distribution bin centres as a JSON string
+    pa.field('liad_json', pa.string()),         # LIAD histogram as JSON string
+    pa.field('liad_dewit', pa.string()),         # LIAD de Wit classification as string
+    pa.field('liad_dewit_rmse', pa.float64()),       # de Wit classification RMSE for chosen label
+    pa.field('liad_dewit_l1', pa.float64()),         # de Wit l1 for chosen label
+    pa.field('wiad_json', pa.string()),         # WIAD histogram as JSON string
+    pa.field('wiad_dewit', pa.string()),         # WIAD de Wit classification as string
+    pa.field('wiad_dewit_rmse', pa.float64()),       # de Wit classification RMSE for chosen label
+    pa.field('wiad_dewit_l1', pa.float64()),         # de Wit l1 for chosen label
+    pa.field('piad_json', pa.string()),         # PIAD histogram as JSON string
+    pa.field('piad_dewit', pa.string()),         # PIAD de Wit classification as string
+    pa.field('piad_dewit_rmse', pa.float64()),       # De Wit classification RMSE for chosen label
+    pa.field('piad_dewit_l1', pa.float64()),         # De Wit l1 for chosen label
     pa.field('lambda_1', pa.float64()),
     pa.field('P_first', pa.float64()),
     pa.field('P_equal', pa.float64()),
@@ -183,24 +187,6 @@ voxel_metrics_schema_multireturn = pa.schema([
     pa.field('LAD_MLE_lambda1', pa.float64()),
     pa.field('LAD_MLE_bias', pa.float64()),
     pa.field('LAD_MLE_lambda1_bias', pa.float64()), 
-    pa.field('LIAD_leaf_bin_2.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_7.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_12.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_17.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_22.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_27.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_32.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_37.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_42.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_47.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_52.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_57.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_62.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_67.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_72.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_77.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_82.5', pa.float32()),
-    pa.field('LIAD_leaf_bin_87.5', pa.float32()),
     pa.field('mean_angle_leaf', pa.float32()), # Mean angle of leaf hits only
     pa.field('mean_angle_all', pa.float32()), # Mean angle of all hits
     pa.field('mean_path_length', pa.float64()),
@@ -300,6 +286,17 @@ valid_rays_schema = pa.schema([
 
 ### HELPER FUNCTIONS ###
 # Commonly used functions that offer small utilities for components of other scripts.
+
+
+DEWIT_LABELS = np.array([
+    "planophile",    # mostly horizontal
+    "erectophile",   # mostly vertical
+    "plagiophile",   # around 45°
+    "uniform",       # flat
+    "spherical",     # sin(2θ)
+    "extremophile"   # steeper than erectophile
+])
+
 
 DASK_CLIENT = None
 
@@ -432,6 +429,122 @@ def _gen_dataframe(schema):
         fields.append((field.name, dtype))
     df = pd.DataFrame({name: pd.Series(dtype=dtype) for name, dtype in fields})
     return df
+
+
+def _canonical_curves(theta_deg: np.ndarray, categories: list = ["planophile", "erectophile", "plagiophile", "uniform", "spherical", "extremophile"]) -> np.ndarray:
+    """
+    Build discretized, normalized canonical PDFs for the six de Wit categories at
+    the provided bin centers (theta_deg in degrees).
+
+    Inputs:
+    - theta_deg: (n_bins,) array of bin centers in degrees (e.g., 2.5, 7.5, ..., 87.5)
+    - categories: list of category names to generate (default to the classical 6 de Wit classes)
+    """
+    th = np.deg2rad(theta_deg)  # convert to radians
+    # Raw (unnormalized) shapes
+    raw = []
+    for name in categories:
+        if name == "planophile":
+            y = (2.0 / np.pi) * (1.0 + np.cos(2.0 * th))  # ∝ (2/π)(1 + cos(2θ))
+        elif name == "erectophile":
+            y = (2.0 / np.pi) * (1.0 - np.cos(2.0 * th))  # ∝ (2/π)(1 - cos(2θ))
+        elif name == "plagiophile":
+            y = (2.0 / np.pi) * (1.0 - np.cos(4.0 * th))  # ∝ (2/π)(1 - cos(4θ))
+        elif name == "uniform":
+            y = (2.0 / np.pi) * np.ones_like(th)  # constant (uniform distribution)
+        elif name == "spherical":
+            y = np.sin(th)                     # ∝ sin(θ)
+        elif name == "extremophile":
+            y = (2.0 / np.pi) * (1.0 + np.cos(4.0 * th))  # ∝ (2/π)(1 + cos(4θ))
+        else:
+            raise ValueError(f"Unknown category: {name}")
+        # clamp negatives (e.g., sin(2θ) can be tiny negative due to float noise near 0/90)
+        y = np.maximum(y, 0.0)
+        raw.append(y)
+
+    raw = np.vstack(raw)  # (n_cat, n_bins)
+
+    # Discrete normalization across bins so each shape sums to 1
+    raw_sum = raw.sum(axis=1, keepdims=True)
+    # If any shape sums ~0 (shouldn't happen), make it uniform as fallback
+    raw_norm = np.divide(raw, np.maximum(raw_sum, 1e-12))
+    return raw_norm  # (n_cat, n_bins)
+
+
+def classify_liad_to_dewit(
+    liad: np.ndarray,
+    bin_centres_deg: np.ndarray = None,
+    return_scores: bool = False
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Classify each voxel's LIAD histogram to the closest de Wit category
+    by RMSE to canonical curves evaluated at the provided bin centers.
+
+    Parameters
+    ----------
+    liad : (n_voxels, n_bins) array
+        Each row is a LIAD histogram over 0–90° (not necessarily normalized).
+    bin_centres_deg : (n_bins,) array, optional
+        Bin centers in degrees. If None, equal-width centers over [0,90] are assumed.
+    return_scores : bool
+        If True, also return the RMSE scores per voxel for the chosen label
+
+    Returns
+    -------
+    labels : (n_voxels,) array of str
+        Best-fit de Wit class for each voxel.
+    scores : (n_voxels, ) array
+        RMSE per voxel for best category (only if return_scores=True).
+    NOTE: If only one voxel, just return floats
+    """
+    liad = np.atleast_2d(np.asarray(liad, dtype=float))
+    if liad.ndim != 2:
+        raise ValueError("liad must be a 1D or 2D array")
+    if liad.shape[0] == 0 or liad.shape[1] == 0:
+        raise ValueError("liad array cannot be empty")
+
+    n_vox, n_bins = liad.shape
+    if bin_centres_deg is None:
+        edges = np.linspace(0, 90, n_bins + 1)
+        bin_centres_deg = 0.5 * (edges[:-1] + edges[1:])
+    else:
+        bin_centres_deg = np.asarray(bin_centres_deg, dtype=float)
+        if bin_centres_deg.shape != (n_bins,):
+            raise ValueError("bin_centres_deg must have shape (n_bins,)")
+
+    # Normalize LIAD rows (so comparisons are shape-only)
+    # liad_norm = liad / (np.linalg.norm(liad, axis=1, keepdims=True) + 1e-10)  # (n_vox, n_bins)
+
+    # Build canonical curves
+    canon = _canonical_curves(bin_centres_deg)  # (6, n_bins)
+    # print(f"canon row sums:", canon.sum(axis=1))
+    # print(f"canon distinct rows:", np.linalg.matrix_rank(canon))
+
+    row_sum = liad.sum(axis=1, keepdims=True)
+    liad_norm = liad / np.maximum(row_sum, 1e-12)
+
+    # Compute RMSE between each voxel and each canonical category
+    # Expand dims for broadcasting: (n_vox, 1, n_bins) vs (1, n_cat, n_bins)
+    diff = np.abs(liad_norm[:, None, :] - canon[None, :, :])
+    rmse = np.sqrt(np.mean(diff ** 2, axis=2))  # (n_vox, n_cat)
+    l1 = diff.sum(axis=2)
+
+    # Best category = argmin RMSE
+    best_idx = np.argmin(abs(l1), axis=1)          # (n_vox,)
+    best_idx_r = np.argmin(abs(rmse), axis=1)
+    rmse_best = rmse[np.arange(n_vox), best_idx]  # (n_vox,)
+    l1_best = l1[np.arange(n_vox), best_idx]
+    labels = DEWIT_LABELS[best_idx]
+
+    if return_scores:
+        if labels.size == 1 and rmse_best.size == 1:
+            labels = labels[0]
+            rmse_best = rmse_best[0]
+            l1_best = l1_best[0]
+        return labels, rmse_best, l1_best
+    return labels, None, None
+
+
 
 # ---- normals_weights.py (can live alongside your metrics code) ----
 import numpy as np
@@ -5530,24 +5643,24 @@ def get_voxel_metrics_oldcode(intersections_files, lambda_1, is_leaf_true=True, 
             'I_leaf': I_leaf,
             'G_lw': np.nan,
             'G_leaf': G_leaf,
-            'LIAD_leaf_bin_2.5': LIAD_leaf_values[0],
-            'LIAD_leaf_bin_7.5': LIAD_leaf_values[1],
-            'LIAD_leaf_bin_12.5': LIAD_leaf_values[2],
-            'LIAD_leaf_bin_17.5': LIAD_leaf_values[3],
-            'LIAD_leaf_bin_22.5': LIAD_leaf_values[4],
-            'LIAD_leaf_bin_27.5': LIAD_leaf_values[5],
-            'LIAD_leaf_bin_32.5': LIAD_leaf_values[6],
-            'LIAD_leaf_bin_37.5': LIAD_leaf_values[7],
-            'LIAD_leaf_bin_42.5': LIAD_leaf_values[8],
-            'LIAD_leaf_bin_47.5': LIAD_leaf_values[9],
-            'LIAD_leaf_bin_52.5': LIAD_leaf_values[10],
-            'LIAD_leaf_bin_57.5': LIAD_leaf_values[11],
-            'LIAD_leaf_bin_62.5': LIAD_leaf_values[12],
-            'LIAD_leaf_bin_67.5': LIAD_leaf_values[13],
-            'LIAD_leaf_bin_72.5': LIAD_leaf_values[14],
-            'LIAD_leaf_bin_77.5': LIAD_leaf_values[15],
-            'LIAD_leaf_bin_82.5': LIAD_leaf_values[16],
-            'LIAD_leaf_bin_87.5': LIAD_leaf_values[17],
+            # 'LIAD_leaf_bin_2.5': LIAD_leaf_values[0],
+            # 'LIAD_leaf_bin_7.5': LIAD_leaf_values[1],
+            # 'LIAD_leaf_bin_12.5': LIAD_leaf_values[2],
+            # 'LIAD_leaf_bin_17.5': LIAD_leaf_values[3],
+            # 'LIAD_leaf_bin_22.5': LIAD_leaf_values[4],
+            # 'LIAD_leaf_bin_27.5': LIAD_leaf_values[5],
+            # 'LIAD_leaf_bin_32.5': LIAD_leaf_values[6],
+            # 'LIAD_leaf_bin_37.5': LIAD_leaf_values[7],
+            # 'LIAD_leaf_bin_42.5': LIAD_leaf_values[8],
+            # 'LIAD_leaf_bin_47.5': LIAD_leaf_values[9],
+            # 'LIAD_leaf_bin_52.5': LIAD_leaf_values[10],
+            # 'LIAD_leaf_bin_57.5': LIAD_leaf_values[11],
+            # 'LIAD_leaf_bin_62.5': LIAD_leaf_values[12],
+            # 'LIAD_leaf_bin_67.5': LIAD_leaf_values[13],
+            # 'LIAD_leaf_bin_72.5': LIAD_leaf_values[14],
+            # 'LIAD_leaf_bin_77.5': LIAD_leaf_values[15],
+            # 'LIAD_leaf_bin_82.5': LIAD_leaf_values[16],
+            # 'LIAD_leaf_bin_87.5': LIAD_leaf_values[17],
             # 'LIAD_lw_bin_2.5': LIAD_lw_values[0],
             # 'LIAD_lw_bin_7.5': LIAD_lw_values[1],
             # 'LIAD_lw_bin_12.5': LIAD_lw_values[2],
@@ -5583,6 +5696,8 @@ def get_voxel_metrics_oldcode(intersections_files, lambda_1, is_leaf_true=True, 
             'sum_eff_free_path_length_hit': sum_eff_free_path_lengths_hit,
             'sum_eff_free_path_length_hit_leaf': sum_eff_free_path_lengths_hit_leaf
         }
+        data["liad_json"] = json.dumps({LIAD_leaf_values})
+        data["liad_bins"] = json.dumps({bin_centres})
         voxel_metrics = pd.DataFrame(data, index=[0], columns=voxel_metrics_schema_oldcode.names)
 
         return voxel_metrics
@@ -6778,6 +6893,7 @@ def get_voxel_metrics(
 
         leaf_mask = voxel_df['is_leaf'].values if is_leaf_true else ~voxel_df['is_leaf'].values
         current_leaf_mask = current_hit & leaf_mask
+        current_wood_mask = current_hit & ~leaf_mask
         num_lw_hits = current_hit.sum()
         num_leaf_hits = current_leaf_mask.sum()
         num_before_hits = previous_hit.sum()
@@ -6901,7 +7017,7 @@ def get_voxel_metrics(
         sum_eff_free_path_length_hit_leaf = np.nansum(eff_free_path_lengths[current_leaf_mask])
 
 
-        # ------ LIAD & G(.) -------- #
+        # ------ LIAD & G_leaf -------- #
         leaf_normals = voxel_df[['normal_x', 'normal_y', 'normal_z']].values[current_leaf_mask]
         leaf_weights = voxel_df['point_weight'].values[current_leaf_mask]
         bins, liad_vals, _ = calculate_inclination_angle_distribution(
@@ -6909,7 +7025,6 @@ def get_voxel_metrics(
             weights=leaf_weights
         )
 
-        view_angles_lw = voxel_df['viewing_angle'].values[current_hit]
         view_angles_leaf = voxel_df['viewing_angle'].values[current_leaf_mask]
         G_leaf = calculate_G(
             viewing_angles=view_angles_leaf, 
@@ -6919,15 +7034,61 @@ def get_voxel_metrics(
         G_leaf = G_leaf.mean() if isinstance(G_leaf, np.ndarray) else G_leaf
         if not np.isfinite(G_leaf):
             G_leaf = np.nan
-        
-        G_lw = calculate_G(
-            viewing_angles=view_angles_lw,
-            bin_centres=bins,
-            LIAD_values=liad_vals
+
+        # Convert leaf liad to dewit for easier communication
+        liad_dewit, liad_dewit_rmse, liad_dewit_l1 = classify_liad_to_dewit(
+            liad = liad_vals,
+            bin_centres_deg = bins,
+            return_scores = True
         )
-        G_lw = G_lw.mean() if isinstance(G_lw, np.ndarray) else G_lw
-        if not np.isfinite(G_lw):
-            G_lw = np.nan
+        
+        # ------ WIAD & G_wood -------- #
+        wood_normals = voxel_df[['normal_x', 'normal_y', 'normal_z']].values[current_wood_mask]
+        wood_weights = voxel_df['point_weight'].values[current_wood_mask]
+        bins, wiad_vals, _ = calculate_inclination_angle_distribution(
+            normals=wood_normals,
+            weights=wood_weights
+        )
+        view_angles_wood = voxel_df['viewing_angle'].values[current_wood_mask]
+        G_wood = calculate_G(
+            viewing_angles=view_angles_wood,
+            bin_centres=bins,
+            LIAD_values=wiad_vals
+        )
+        G_wood = G_wood.mean() if isinstance(G_wood, np.ndarray) else G_wood
+        if not np.isfinite(G_wood):
+            G_wood = np.nan
+
+        # Convert wiad to dewit for easier communication
+        wiad_dewit, wiad_dewit_rmse, wiad_dewit_l1 = classify_liad_to_dewit(
+            liad = wiad_vals,
+            bin_centres_deg = bins,
+            return_scores = True
+        )
+
+        # ------ PIAD & G_all -------- #
+        all_normals = voxel_df[['normal_x', 'normal_y', 'normal_z']].values[current_hit]
+        all_weights = voxel_df['point_weight'].values[current_hit]
+        bins, piad_vals, _ = calculate_inclination_angle_distribution(
+            normals=all_normals,
+            weights=all_weights
+        )
+        view_angles_all = voxel_df['viewing_angle'].values[current_hit]
+        G_all = calculate_G(
+            viewing_angles=view_angles_all,
+            bin_centres=bins,  
+            LIAD_values=piad_vals
+        )
+        G_all = G_all.mean() if isinstance(G_all, np.ndarray) else G_all
+        if not np.isfinite(G_all):
+            G_all = np.nan
+
+        # Convert piad to dewit for easier communication
+        piad_dewit, piad_dewit_rmse, piad_dewit_l1 = classify_liad_to_dewit(
+            liad = piad_vals,
+            bin_centres_deg = bins,
+            return_scores = True
+        )
 
         # If Multi-return, calculate probabilities and use appropriate LAD/PAD calcs
         if is_multireturn:
@@ -7220,27 +7381,23 @@ def get_voxel_metrics(
         data_df.loc[0, 'pgap_leaf'] = pgap_leaf
         data_df.loc[0, 'I_lw'] = I_lw
         data_df.loc[0, 'I_leaf'] = I_leaf
-        data_df.loc[0, 'G_lw'] = G_lw
         data_df.loc[0, 'G_leaf'] = G_leaf
+        data_df.loc[0, 'G_wood'] = G_wood
+        data_df.loc[0, 'G_all'] = G_all
+        data_df.loc[0, "angle_bin_centres"] = json.dumps(bins.tolist())
+        data_df.loc[0, "liad_json"] = json.dumps(liad_vals.tolist())
+        data_df.loc[0, "liad_dewit"] = liad_dewit
+        data_df.loc[0, "liad_dewit_rmse"] = liad_dewit_rmse
+        data_df.loc[0, "liad_dewit_l1"] = liad_dewit_l1
+        data_df.loc[0, "wiad_json"] = json.dumps(wiad_vals.tolist())
+        data_df.loc[0, "wiad_dewit"] = wiad_dewit
+        data_df.loc[0, "wiad_dewit_rmse"] = wiad_dewit_rmse
+        data_df.loc[0, "wiad_dewit_l1"] = wiad_dewit_l1
+        data_df.loc[0, "piad_json"] = json.dumps(piad_vals.tolist())
+        data_df.loc[0, "piad_dewit"] = piad_dewit
+        data_df.loc[0, "piad_dewit_rmse"] = piad_dewit_rmse
+        data_df.loc[0, "piad_dewit_l1"] = piad_dewit_l1
         data_df.loc[0, 'lambda_1'] = lambda_1
-        data_df.loc[0, 'LIAD_leaf_bin_2.5'] = np.float32(liad_vals[0]) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_7.5'] = np.float32(liad_vals[1]) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_12.5'] = np.float32(liad_vals[2]) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_17.5'] = np.float32(liad_vals[3]) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_22.5'] = np.float32(liad_vals[4]) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_27.5'] = np.float32(liad_vals[5]) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_32.5'] = np.float32(liad_vals[6]) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_37.5'] = np.float32(liad_vals[7]) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_42.5'] = np.float32(liad_vals[8]) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_47.5'] = np.float32(liad_vals[9]) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_52.5'] = np.float32(liad_vals[10]) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_57.5'] = np.float32(liad_vals[11]) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_62.5'] = np.float32(liad_vals[12]) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_67.5'] = np.float32(liad_vals[13]) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_72.5'] = np.float32(liad_vals[14]) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_77.5'] = np.float32(liad_vals[15]) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_82.5'] = np.float32(liad_vals[16]) if liad_vals.size > 0 else np.nan
-        data_df.loc[0, 'LIAD_leaf_bin_87.5'] = np.float32(liad_vals[17]) if liad_vals.size > 0 else np.nan
         data_df.loc[0, 'mean_angle_leaf'] = np.float32(mean_angle_leaf)
         data_df.loc[0, 'mean_angle_all'] = np.float32(mean_angle_all)
         data_df.loc[0, 'mean_path_length'] = np.float64(mean_path_length)
@@ -7257,6 +7414,7 @@ def get_voxel_metrics(
         data_df.loc[0, 'sum_eff_free_path_length'] = np.float64(sum_eff_free_path_length)
         data_df.loc[0, 'sum_eff_free_path_length_hit'] = np.float64(sum_eff_free_path_length_hit)
         data_df.loc[0, 'sum_eff_free_path_length_hit_leaf'] = np.float64(sum_eff_free_path_length_hit_leaf)
+        
 
         return data_df
 
