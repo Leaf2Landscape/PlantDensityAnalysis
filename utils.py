@@ -298,6 +298,75 @@ DEWIT_LABELS = np.array([
 ])
 
 
+def _query_nvidia_gpus():
+    """
+    Returns list of dicts: [{'index': int, 'uuid': str, 'name': str}, ...]
+    """
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,uuid,name", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5
+        )
+        if r.returncode != 0:
+            return []
+        gpus = []
+        for line in r.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 3:
+                gpus.append({"index": int(parts[0]), "uuid": parts[1], "name": parts[2]})
+        return gpus
+    except Exception:
+        return []
+
+def resolve_cuda_index(preferred_uuid: Optional[str] = None):
+    """
+    Map preferred UUID to Open3D CUDA logical index.
+    If CUDA_VISIBLE_DEVICES is set, Open3D sees remapped logical indices [0..N-1].
+    """
+    gpus = _query_nvidia_gpus()
+    if not gpus:
+        return None, None
+
+    cvd = os.getenv("CUDA_VISIBLE_DEVICES", "").strip()
+    cvd_tokens = [t.strip() for t in cvd.split(",") if t.strip()] if cvd else []
+
+    if preferred_uuid:
+        preferred_uuid = preferred_uuid.strip()
+        # Exact UUID match
+        host_match = next((g for g in gpus if g["uuid"] == preferred_uuid), None)
+        if host_match is None:
+            # Allow prefix match without "GPU-"
+            short = preferred_uuid.replace("GPU-", "")
+            host_match = next((g for g in gpus if g["uuid"].replace("GPU-", "") == short), None)
+
+        if host_match is None:
+            print(f"[WARN] Requested OPEN3D_GPU_UUID not found: {preferred_uuid}")
+            return None, None
+
+        # If CUDA_VISIBLE_DEVICES is UUID list, map to logical index by position
+        if cvd_tokens and cvd_tokens[0].startswith("GPU-"):
+            if host_match["uuid"] in cvd_tokens:
+                return cvd_tokens.index(host_match["uuid"]), host_match["uuid"]
+            print(f"[WARN] UUID {host_match['uuid']} is not visible in CUDA_VISIBLE_DEVICES.")
+            return None, None
+
+        # If CUDA_VISIBLE_DEVICES is index list, map host index to logical position
+        if cvd_tokens and re.fullmatch(r"[0-9, ]+", cvd):
+            visible = [int(x) for x in cvd_tokens]
+            if host_match["index"] in visible:
+                return visible.index(host_match["index"]), host_match["uuid"]
+            print(f"[WARN] GPU index {host_match['index']} (UUID {host_match['uuid']}) not visible.")
+            return None, None
+
+        # No CVD mask: host index == logical index
+        return host_match["index"], host_match["uuid"]
+
+    # No preferred UUID: first visible GPU is logical 0 if CVD is set, else first host index
+    if cvd_tokens:
+        return 0, None
+    return gpus[0]["index"], gpus[0]["uuid"]
+
 DASK_CLIENT = None
 
 def _start_dask_client(memory_limit='4GB',
@@ -6315,17 +6384,32 @@ def _metrics_for_voxel_block(
     # PIAD - all hits
     normals = block[["normal_x","normal_y","normal_z"]].to_numpy()
     weights = block["point_weight"].to_numpy()
-    bins, piad_vals, _extra = calculate_inclination_angle_distribution(normals=normals, weights=weights)
+    bins, piad_vals, _ = calculate_inclination_angle_distribution(normals=normals, weights=weights)
+    piad_dewit, piad_dewit_rmse, piad_dewit_l1 = classify_liad_to_dewit(
+        liad=piad_vals,
+        bin_centres=bins,
+        return_scores=True
+    )
 
     # LIAD - only leaf hits contribute to LIAD
     leaf_normals = block.loc[current_leaf_mask, ["normal_x","normal_y","normal_z"]].to_numpy()
     leaf_weights = block.loc[current_leaf_mask, "point_weight"].to_numpy()
     bins, liad_vals, _extra = calculate_inclination_angle_distribution(normals=leaf_normals, weights=leaf_weights)
+    liad_dewit, liad_dewit_rmse, liad_dewit_l1 = classify_liad_to_dewit(
+        liad=liad_vals,
+        bin_centres=bins,
+        return_scores=True
+    )
 
     # WIAD - only wood hits contribute to WIAD
     wood_normals = block.loc[current_hit & ~leaf_mask, ["normal_x","normal_y","normal_z"]].to_numpy()
     wood_weights = block.loc[current_hit & ~leaf_mask, "point_weight"].to_numpy()
     bins, wiad_vals, _extra = calculate_inclination_angle_distribution(normals=wood_normals, weights=wood_weights)
+    wiad_dewit, wiad_dewit_rmse, wiad_dewit_l1 = classify_liad_to_dewit(
+        liad=wiad_vals,
+        bin_centres=bins,
+        return_scores=True
+    )
 
     # Calculate all G values
     va_lw   = va[current_hit]
@@ -6774,7 +6858,7 @@ def get_voxel_metrics_nodask(
     n_files = 0
     for vs, g in voxel_metrics_df.groupby("voxel_size", sort=False):
         out_csv = os.path.join(output_dir, f"voxel_metrics_{round(vs,1)}m_{ts}.csv")
-        header_comment = f"# Scan IDs: {', '.join(map(str, included_scan_ids))}\n"
+        header_comment = f"# Scan IDs:, {', '.join(map(str, included_scan_ids))}\n"
         with open(out_csv, "w") as f:
             f.write(header_comment)
         g.to_csv(out_csv, mode="a", index=False)
@@ -8930,7 +9014,8 @@ def leg_from_filename(path: str) -> int:
 def compile_voxel_refs(references_dir: str) -> pd.DataFrame:
     import glob
     dfs = []
-    for csvf in sorted(glob.glob(os.path.join(references_dir, "*.csv"))):
+    csvs = sorted(glob.glob(os.path.join(references_dir, "*.csv")))
+    for csvf in csvs:
         df = pd.read_csv(csvf)
         if "voxel_id" not in df.columns:
             # create_voxel_id(voxel_size, x, y, z) existed in your code base; keep stable

@@ -5,6 +5,7 @@ channels:
   - rios
   - defaults
 dependencies:
+  - python=3.12
   - numpy
   - pandas
   - pyarrow
@@ -19,7 +20,10 @@ dependencies:
   - ipykernel
   - dask
   - distributed
-  - open3d
   - pip
+  - joblib
+  - loky
   - pip:
       - fnvhash==0.1.0
+      - open3d
+      - warp-lang

@@ -1,5 +1,4 @@
 import os
-import csv
 import argparse
 import json
 import math
@@ -9,8 +8,6 @@ import traceback
 import open3d as o3d
 import open3d.core as o3c
 o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
-
-from math import comb, factorial
 
 import datetime as dt
 from typing import Optional
@@ -28,11 +25,178 @@ import pyvista as pv
 from typing import List, Tuple, Union, Optional
 from pathlib import Path
 
-from utils import classify_liad_to_dewit
+from utils import classify_liad_to_dewit, calculate_G, resolve_cuda_index
     
 from numba import njit, prange
 
-global _CUDA_DEVICE_ID
+# --- Warp setup (add near top of your module) ---
+import warp as wp
+wp.init()  # JIT/runtime init; safe to call once
+
+import threading
+_gpu_lock = threading.Lock()
+
+# choose device; you can parameterize this too
+_WARP_DEVICE = "cuda:0"  # fall back to "cpu" for debug
+
+# ---------- Warp helpers & kernel ----------
+
+@wp.func
+def _ray_box_intersect(orig: wp.vec3, dir: wp.vec3, bmin: wp.vec3, bmax: wp.vec3) -> wp.bool:
+    # Standard slab test
+    eps = 1.0e-12
+    dx = dir[0]; dy = dir[1]; dz = dir[2]
+    tx1 = (bmin[0] - orig[0]) / (dx if wp.abs(dx) > eps else (eps if dx >= 0.0 else -eps))
+    tx2 = (bmax[0] - orig[0]) / (dx if wp.abs(dx) > eps else (eps if dx >= 0.0 else -eps))
+    ty1 = (bmin[1] - orig[1]) / (dy if wp.abs(dy) > eps else (eps if dy >= 0.0 else -eps))
+    ty2 = (bmax[1] - orig[1]) / (dy if wp.abs(dy) > eps else (eps if dy >= 0.0 else -eps))
+    tz1 = (bmin[2] - orig[2]) / (dz if wp.abs(dz) > eps else (eps if dz >= 0.0 else -eps))
+    tz2 = (bmax[2] - orig[2]) / (dz if wp.abs(dz) > eps else (eps if dz >= 0.0 else -eps))
+
+    tmin = wp.max(wp.min(tx1, tx2), wp.max(wp.min(ty1, ty2), wp.min(tz1, tz2)))
+    tmax = wp.min(wp.max(tx1, tx2), wp.min(wp.max(ty1, ty2), wp.max(tz1, tz2)))
+
+    valid = (tmax >= 0.0) and (tmin <= tmax)
+    return valid
+
+@wp.kernel
+def _raycast_voxel_kernel(
+    leaf_id: wp.uint64, 
+    wood_id: wp.uint64,
+    has_leaf: int, 
+    has_wood: int,
+    origins: wp.array(dtype=wp.vec3),
+    dirs: wp.array(dtype=wp.vec3),
+    bmin: wp.vec3,
+    bmax: wp.vec3,
+    max_hits: int,
+    eps_advance: float,
+    first_any: wp.array(dtype=wp.float32),
+    first_leaf: wp.array(dtype=wp.float32),
+    first_wood: wp.array(dtype=wp.float32),
+    count_all: wp.array(dtype=wp.int32),
+    count_leaf: wp.array(dtype=wp.int32),
+    count_wood: wp.array(dtype=wp.int32)
+):
+    i = wp.tid()
+    o = origins[i]
+    d = dirs[i]
+
+    # Compute ray-box intersection manually (inline version of _ray_box_intersect)
+    eps = 1.0e-12
+    dx = d[0]
+    dy = d[1]
+    dz = d[2]
+    
+    # Safe division avoiding division by zero
+    tx1 = (bmin[0] - o[0]) / wp.where(wp.abs(dx) > eps, dx, wp.where(dx >= 0.0, eps, -eps))
+    tx2 = (bmax[0] - o[0]) / wp.where(wp.abs(dx) > eps, dx, wp.where(dx >= 0.0, eps, -eps))
+    ty1 = (bmin[1] - o[1]) / wp.where(wp.abs(dy) > eps, dy, wp.where(dy >= 0.0, eps, -eps))
+    ty2 = (bmax[1] - o[1]) / wp.where(wp.abs(dy) > eps, dy, wp.where(dy >= 0.0, eps, -eps))
+    tz1 = (bmin[2] - o[2]) / wp.where(wp.abs(dz) > eps, dz, wp.where(dz >= 0.0, eps, -eps))
+    tz2 = (bmax[2] - o[2]) / wp.where(wp.abs(dz) > eps, dz, wp.where(dz >= 0.0, eps, -eps))
+
+    tnear = wp.max(wp.min(tx1, tx2), wp.max(wp.min(ty1, ty2), wp.min(tz1, tz2)))
+    tfar = wp.min(wp.max(tx1, tx2), wp.min(wp.max(ty1, ty2), wp.max(tz1, tz2)))
+
+    ok = (tfar >= 0.0) and (tnear <= tfar)
+    if not ok:
+        first_any[i]  = wp.float32(1e32)
+        first_leaf[i] = wp.float32(1e32)
+        first_wood[i] = wp.float32(1e32)
+        return
+
+    # Clip segment to slab
+    start = o + d * tnear
+    remain = tfar - tnear
+
+    # Init outputs
+    first_any[i]  = wp.float32(1e32)
+    first_leaf[i] = wp.float32(1e32)
+    first_wood[i] = wp.float32(1e32)
+
+    ca = int(0)
+    cl = int(0)
+    cw = int(0)
+
+    t_accum = float(0.0)
+    h = int(0)
+    while h < max_hits and remain > 1.0e-6:
+        leaf_found = False
+        wood_found = False
+        t_leaf = wp.float32(1e32)
+        t_wood = wp.float32(1e32)
+
+        if has_leaf == 1:
+            ql = wp.mesh_query_ray(leaf_id, start, d, remain, -1)
+            if ql.result:
+                leaf_found = True
+                t_leaf = ql.t
+
+        if has_wood == 1:
+            qw = wp.mesh_query_ray(wood_id, start, d, remain, -1)
+            if qw.result:
+                wood_found = True
+                t_wood = qw.t
+
+        if (not leaf_found) and (not wood_found):
+            break
+
+        hit_is_leaf = False
+        hit_is_wood = False
+
+        if leaf_found and wood_found:
+            if t_leaf < t_wood:
+                hit_is_leaf = True
+                t_first = t_leaf
+            else:
+                hit_is_wood = True
+                t_first = t_wood
+        elif leaf_found:
+            hit_is_leaf = True
+            t_first = t_leaf
+        elif wood_found:
+            hit_is_wood = True
+            t_first = t_wood
+        else:
+            break   # no hits, should not happen due to earlier check
+
+        ca += 1
+        if hit_is_leaf:
+            cl += 1
+        if hit_is_wood:
+            cw += 1
+
+        if not wp.isfinite(first_any[i]):
+            first_any[i] = t_accum + t_first
+        if leaf_found and not wp.isfinite(first_leaf[i]):
+            first_leaf[i] = t_accum + t_leaf
+        if wood_found and not wp.isfinite(first_wood[i]):
+            first_wood[i] = t_accum + t_wood
+
+        t_step = t_first + eps_advance
+        start = start + d * t_step
+        remain = remain - t_step
+        t_accum = float(t_accum + t_step)
+        h = int(h + 1)
+
+    count_all[i] = ca
+    count_leaf[i] = cl
+    count_wood[i] = cw
+    
+
+global _DEVICE
+
+
+# Initialise cached variables for PMF and lambda_1 calculations
+global _LAM_GRID
+_LAM_GRID = np.linspace(1e-3, 3.0, 60)
+global _OMEGA_GRID
+_OMEGA_GRID = np.linspace(1e-3, 0.999, 60)
+global _PMF_CACHE
+_PMF_CACHE = None
+global _PMF_N_MAX
+_PMF_N_MAX = 0
 
 temp_dir = os.getenv('TMPDIR', 'tmp')
 # temp_dir = "/scratch/project/veg3d/uqjrivor/Raja_Tumba_Test/tmp"
@@ -54,7 +218,7 @@ def get_memory_usage():
         used_memory = psutil.virtual_memory().used / (1024 ** 2)  # Convert to MB
         print(f"Not Slurm... Used memory: {used_memory:.2f} MB")
 
-def calculate_wood_volume(wood_mesh: trimesh.Trimesh, voxel_size: float=0.01, threshold: int=4, cache_size=50000) -> np.ndarray:
+def calculate_wood_volume(wood_mesh: trimesh.Trimesh, voxel_size: float=0.01, threshold: int=4) -> np.ndarray:
     """
     Calculate the wood volume of a mesh by voxelizing it.
     Vectorized approach: batch all points per x-slice and cast rays in one operation.
@@ -158,7 +322,7 @@ def calculate_wood_volume(wood_mesh: trimesh.Trimesh, voxel_size: float=0.01, th
     
     return inside_points
 
-def process_wood_volume_file(scene_file: str, wood_mesh: str, wood_voxel_size: float=0.01, threshold: int=4) -> Optional[np.ndarray]:
+def process_wood_volume_file(wood_mesh: str, wood_voxel_size: float=0.01, threshold: int=4) -> Optional[np.ndarray]:
     wood_inside_points = calculate_wood_volume(wood_mesh, voxel_size=wood_voxel_size, threshold=threshold)
     if wood_inside_points is not None:
         try:
@@ -172,7 +336,7 @@ def process_wood_volume_file(scene_file: str, wood_mesh: str, wood_voxel_size: f
     return None
 
 @memory.cache
-def load_wood_volume_file(wood_volume_file: str, wood_voxel_size: float=0.01, threshold: int=4) -> Optional[np.ndarray]:
+def load_wood_volume_file(wood_volume_file: str) -> Optional[np.ndarray]:
     """
     Load the wood volume file if it exists.
     The file is expected to be in the same directory as the scene file.
@@ -180,8 +344,8 @@ def load_wood_volume_file(wood_volume_file: str, wood_voxel_size: float=0.01, th
     if os.path.exists(wood_volume_file):
         try:
             return np.loadtxt(wood_volume_file)
-        except Exception as e:
-            print(f"Error loading wood volume file {wood_volume_file}: {e}")
+        except Exception as err:
+            print(f"Error loading wood volume file {wood_volume_file}: {err}")
             return None
     else:
         return None
@@ -259,8 +423,8 @@ def load_mesh_trimesh(file_path: str) -> Optional[trimesh.Trimesh]:
         else:
             print(f"Invalid or empty mesh found in {file_path}.")
             return None
-    except Exception as e:
-        print(f"Error loading mesh from {file_path}: {e}")
+    except Exception as err:
+        print(f"Error loading mesh from {file_path}: {err}")
         return None
     
 # Global leaf and wood mesh cache
@@ -330,7 +494,7 @@ def _clip_one_mesh_with_aabb(mesh, tri_min, tri_max, voxel_center, voxel_size):
         clipped = p_sub.clip_box(cube, invert=False)
 
     if isinstance(clipped, pv.UnstructuredGrid):
-        clipped = clipped.extract_geometry()
+        clipped = clipped.extract_surface(algorithm=None)
     if not clipped.is_all_triangles:
         clipped = clipped.triangulate()
 
@@ -339,15 +503,6 @@ def _clip_one_mesh_with_aabb(mesh, tri_min, tri_max, voxel_center, voxel_size):
     return (vertices, faces)
 
     
-def _faces_to_poly(vertices, faces):
-    """Convert trimesh faces to a format compatible with PyVista.
-    """
-    if not faces:
-        return None
-    faces_arr = np.asarray(faces, dtype=np.int64)
-    n_per_face = np.full((faces_arr.shape[0], 1), faces_arr.shape[1], np.int64)
-    faces_flat = np.hstack([n_per_face, faces_arr])
-    return pv.PolyData(vertices, faces_flat)
 
 def get_clipped_meshes(
         leaf_mesh,
@@ -462,22 +617,21 @@ def get_clipped_meshes(
 def build_voxel_scene(o3d_leaf, o3d_wood):
     """Return (scene, leaf_id, wood_id)  either id may be None."""
 
-    _load_leaf = True if o3d_leaf is not None and len(o3d_leaf.triangles) > 0 and LEAF_OFF is False else False
+    _load_leaf = True if o3d_leaf is not None and len(o3d_leaf.triangles) > 0 else False
     _load_wood = True if o3d_wood is not None and len(o3d_wood.triangles) > 0 else False
     leaf_id = wood_id = None
     
     try:
-        dev = o3d.core.Device(f"SYCL:{_CUDA_DEVICE_ID}" if _CUDA_DEVICE_ID is not None else "SYCL:0")
-        scene = o3d.t.geometry.RaycastingScene(device=dev)
+        scene = o3d.t.geometry.RaycastingScene(device=_DEV)
 
         if _load_leaf:
             leaves = o3d.t.geometry.TriangleMesh.from_legacy(o3d_leaf)
-            leaves = leaves.to(dev)
+            leaves = leaves.to(_DEV)
             leaf_id = scene.add_triangles(leaves)
         
         if _load_wood:
             wood = o3d.t.geometry.TriangleMesh.from_legacy(o3d_wood)
-            wood = wood.to(dev)
+            wood = wood.to(_DEV)
             wood_id = scene.add_triangles(wood)
 
         # print("[INFO] Using CUDA for raycasting.")
@@ -535,7 +689,7 @@ def compute_LIAD_from_mesh(o3d_mesh, num_bins=18):
     cross_prod = np.cross(v0, v1)
     areas = 0.5 * np.linalg.norm(cross_prod, axis=1)
     norms = np.linalg.norm(cross_prod, axis=1, keepdims=True)
-    normals = np.divide(cross_prod, norms, where=(norms != 0))
+    normals = np.divide(cross_prod, norms, where=(norms != 0), out=np.zeros_like(cross_prod))
 
     angle_facets = np.degrees(np.arccos(np.clip(normals[:, 2], -1, 1)))
     angle_facets = np.where(angle_facets > 90, 180 - angle_facets, angle_facets)
@@ -569,7 +723,9 @@ def compute_efpl_array(d_arr, lambda_1):
     if lambda_1 == 0:
         out[mask] = d_arr[mask]
     else:
-        out[mask] = -np.log(1.0 - lambda_1 * d_arr[mask]) / lambda_1
+        # Ensure argument to log is positive: 1.0 - lambda_1 * d_arr[mask] > 0
+        valid_mask = mask & (1.0 - lambda_1 * d_arr > 0)
+        out[valid_mask] = -np.log(1.0 - lambda_1 * d_arr[valid_mask]) / lambda_1
     return out
 
 
@@ -652,555 +808,7 @@ def rotate_rays(orig, dirs, angle_deg, vc, axis="x"):
     d = dirs @ R.T
     return o, d
 
-def simulate_voxel_grouped_with_multi(scene, leaf_gids, wood_gids,
-                                      voxel_center, voxel_size,
-                                      rays_FAR6,  # shape (F,A,R,6), float32
-                                      lambda_1,
-                                      include_all_points=False):
-    """
-    Vectorized per-(face, angle) aggregation that matches your stats dictionaries.
-    
-    Inputs:
-        - scene: Open3D RaycastingScene with leaf and wood meshes added
-        - leaf_gids, wood_gids: geometry IDs for leaf and wood in the scene
-        - voxel_center, voxel_size: defines the voxel for ray-box intersection
-        - rays_FAR6: pre-generated rays for all faces and angles, shape (F,A,R,6)
-        - lambda_1: parameter for EFPL calculation
-        - include_all_points: whether to include all points regardless of their classification. 
-                            This will include non-specified classes (i.e. understorey non-leaf/wood or ground etc) in the combined results
 
-    Returns:
-        stats_lw[F][A], stats_leaf[F][A], stats_wood[F][A] (dicts)
-    """
-
-    import numpy as np
-    import gc
-
-    F, A, R, _ = rays_FAR6.shape
-    vc = np.asarray(voxel_center, dtype=np.float32)
-    bmin = vc - 0.5 * voxel_size
-    bmax = vc + 0.5 * voxel_size
-
-    O = rays_FAR6[..., 0:3]  # (F,A,R,3)
-    D = rays_FAR6[..., 3:6]  # (F,A,R,3)
-
-    # Compute t_near, t_far for ray-box intersection
-    t_near, t_far = ray_box_intersection_vectorized(
-        O.reshape(-1, 3), D.reshape(-1, 3), bmin, bmax
-    )
-    t_near = t_near.reshape(F, A, R)
-    t_far = t_far.reshape(F, A, R)
-    valid_rays_mask = (t_near <= t_far) & (t_far >= 0.0)  # (F,A,R)
-
-    # --- Run multi-return list_intersections raytracing
-    # Use the first_hit_any, first_hit_leaf, and first_hit_wood arrays to calculate pgap for the BL approach to CI
-    # Use all returns to use the VoxLAD approach to CI
-    counts_leaf_multi = None
-    counts_wood_multi = None
-
-    first_hit_any = np.full((F, A, R), np.inf, dtype=np.float32)
-    first_hit_leaf = np.full((F, A, R), np.inf, dtype=np.float32)
-    first_hit_wood = np.full((F, A, R), np.inf, dtype=np.float32)
-
-    try:
-        ans_list = scene.list_intersections(o3c.Tensor(rays_FAR6, dtype=o3c.float32))
-
-        counts_leaf_multi = np.zeros((F, A, R), dtype=np.int32) if leaf_gids is not None else None
-        counts_wood_multi = np.zeros((F, A, R), dtype=np.int32) if wood_gids is not None else None
-        counts_all_multi = np.zeros((F, A, R), dtype=np.int32) 
-
-        # -------------------------
-        # Pattern 1: ragged dict
-        # -------------------------
-        if isinstance(ans_list, dict) and ("geometry_ids" in ans_list):
-            geom_ids = ans_list["geometry_ids"].numpy().astype(np.uint32)  # (K,)
-            ray_idx  = ans_list.get("ray_ids", None)
-            t_hits   = ans_list.get("t_hit", None)
-
-            if ray_idx is not None:
-                ray_idx = ray_idx.numpy().astype(np.int64)  # (K,)
-
-                # Map flat ray index -> (f,a,r)
-                Ar = A * R
-                f_idx = (ray_idx // Ar).astype(np.int64)
-                a_idx = ((ray_idx % Ar) // R).astype(np.int64)
-                r_idx = (ray_idx % R).astype(np.int64)
-
-                # First-hit extraction and multi-hit count
-                if t_hits is not None:
-                    t_hits = t_hits.numpy().astype(np.float32)  # (K,)
-
-                    if leaf_gids is not None:
-                        m_leaf = np.isin(geom_ids, np.asarray(leaf_gids, dtype=np.uint32))
-                        leaf_count = m_leaf.sum()
-                        if leaf_count > 0:
-                            # single
-                            np.minimum.at(first_hit_leaf, (f_idx[m_leaf], a_idx[m_leaf], r_idx[m_leaf]), t_hits[m_leaf])
-                            # multi
-                            counts = np.bincount(ray_idx[m_leaf], minlength=F*A*R).astype(np.int32)
-                            counts_leaf_multi[...] = counts.reshape(F, A, R)
-
-                    if wood_gids is not None:
-                        m_wood = np.isin(geom_ids, np.asarray(wood_gids, dtype=np.uint32))
-                        wood_count = m_wood.sum()
-                        if wood_count > 0:
-                            np.minimum.at(first_hit_wood, (f_idx[m_wood], a_idx[m_wood], r_idx[m_wood]), t_hits[m_wood])
-                            counts = np.bincount(ray_idx[m_wood], minlength=F*A*R).astype(np.int32)
-                            counts_wood_multi[...] = counts.reshape(F, A, R)
-
-                    # Combined first hit of either class:
-                    if (leaf_gids is None and wood_gids is None) or include_all_points:
-                        # No specified classification, use ALL hits for first_hit_any:
-                        np.minimum.at(first_hit_any, (f_idx, a_idx, r_idx), t_hits)
-                        counts = np.bincount(ray_idx, minlength=F*A*R).astype(np.int32)
-                        counts_all_multi[...] = counts.reshape(F, A, R)
-                    else:
-                        any_gids = []
-                        if leaf_gids is not None:
-                            any_gids.extend(np.atleast_1d(np.asarray(leaf_gids, dtype=np.uint32)))
-                        if wood_gids is not None:
-                            any_gids.extend(np.atleast_1d(np.asarray(wood_gids, dtype=np.uint32)))
-                        if any_gids:
-                            m_any = np.isin(geom_ids, np.asarray(any_gids, dtype=np.uint32))
-                            if m_any.sum() > 0:
-                                np.minimum.at(first_hit_any, (f_idx[m_any], a_idx[m_any], r_idx[m_any]), t_hits[m_any])
-                                counts = np.bincount(ray_idx[m_any], minlength=F*A*R).astype(np.int32)
-                                counts_all_multi[...] = counts.reshape(F, A, R)
-
-                # DEBUG
-                if DEBUG_MODE:
-                    ray_splits = ans_list.get("ray_splits", None)
-                    if ray_splits is not None:
-                        rs = ray_splits.numpy().astype(np.int64)
-                        gt_all = np.diff(rs).reshape(F, A, R)
-
-                        mism = (counts_all_multi != gt_all)
-                        if mism.any():
-                            bad = np.argwhere(mism)
-                            for f, a, r in bad[:5]:
-                                print(f"[DEBUG] mismatch @ (f={f}, a={a}, r-{r}: bincount={counts_all_multi[f,a,r]}, splits={gt_all[f,a,r]})")
-                        else:
-                            print(f"[DEBUG] bincount matches ray_splits across {gt_all.size} rays.")
-                # cleanup
-                del f_idx, a_idx, r_idx
-                gc.collect()
-
-        # -------------------------
-        # Pattern 2: list/tuple per-ray
-        # -------------------------
-        elif isinstance(ans_list, (list, tuple)) and (len(ans_list) == F * A * R):
-            idx = 0
-            for f in range(F):
-                for a in range(A):
-                    for r in range(R):
-                        item = ans_list[idx]
-                        idx += 1
-
-                        # Accept a few shapes
-                        # Gather arrays (if missing, skip gracefully)
-                        if isinstance(item, dict):
-                            geom_ids = np.asarray(item.get("geometry_ids", []), dtype=np.uint32)
-                            t_arr    = np.asarray(item.get("t_hits", []), dtype=np.float32)
-                        else:
-                            geom_ids = np.asarray(getattr(item, "geometry_ids", []), dtype=np.uint32)
-                            t_arr    = np.asarray(getattr(item, "t_hits", []), dtype=np.float32)
-                        
-                        # First-hit extraction for this ray
-                        if t_arr.size > 0:
-                            if leaf_gids is not None:
-                                m_leaf = np.isin(geom_ids, np.asarray(leaf_gids, dtype=np.uint32))
-                                leaf_count = m_leaf.sum()
-                                if leaf_count > 0:
-                                    first_hit_leaf[f, a, r] = min(first_hit_leaf[f, a, r], t_arr[m_leaf].min())
-                                    counts_leaf_multi[f, a, r] = int(leaf_count)
-                                    print(f"single: {first_hit_leaf[f, a, r]}, multi: {leaf_count}")
-                            if wood_gids is not None:
-                                m_wood = np.isin(geom_ids, np.asarray(wood_gids, dtype=np.uint32))
-                                wood_count = m_wood.sum()
-                                if wood_count > 0:
-                                    first_hit_wood[f, a, r] = min(first_hit_wood[f, a, r], t_arr[m_wood].min())
-                                    counts_wood_multi[f, a, r] = int(wood_count)
-                                    print(f"single: {first_hit_wood[f, a, r]}, multi: {wood_count}")
-                            
-                            # Combined first hit of either class:
-                            if (leaf_gids is None and wood_gids is None) or include_all_points:
-                                # No specified classification, use ALL hits for first_hit_any:
-                                first_hit_any[f, a, r] = min(first_hit_any[f, a, r], t_arr.min())
-                                counts_all_multi[f, a, r] = int(t_arr.count())
-                            else:
-                                m_any = np.isin(geom_ids, np.concatenate([
-                                    np.asarray(leaf_gids, dtype=np.uint32) if leaf_gids is not None else np.array([], dtype=np.uint32),
-                                    np.asarray(wood_gids, dtype=np.uint32) if wood_gids is not None else np.array([], dtype=np.uint32)
-                                ]))
-                                if m_any.sum() > 0:
-                                    first_hit_any[f, a, r] = min(first_hit_any[f, a, r], t_arr[m_any].min())
-                                    counts_all_multi[f, a, r] = int(m_any.sum())
-
-                        # Multi-hit class counts for this ray (count ALL hits, not just first)
-                        if counts_leaf_multi is not None and leaf_gids is not None and geom_ids.size:
-                            counts_leaf_multi[f, a, r] = int(np.isin(geom_ids, leaf_gids).sum())
-                        if counts_wood_multi is not None and wood_gids is not None and geom_ids.size:
-                            counts_wood_multi[f, a, r] = int(np.isin(geom_ids, wood_gids).sum())
-
-        else:
-            # Unknown structure; keep defaults (no per-class counts; first_hits remain inf)
-            pass
-
-    except Exception as e:
-        print(f"[warn] raycasting failed: -- {e}")
-        raise e
-
-    ## --- Shared statistics --- ##
-    # Number of rays is the same for first hit and multi hit calculations
-    N = valid_rays_mask.sum(axis=2).astype(np.int32)  # (F,A)
-
-    ## --- First Hit Statistics --- ##
-    # Valid hits (~np.inf) inside voxel slab (as before)
-    valid_leaf_hits_mask = np.isfinite(first_hit_leaf) & valid_rays_mask
-    valid_wood_hits_mask = np.isfinite(first_hit_wood) & valid_rays_mask
-    valid_all_hits_mask = np.isfinite(first_hit_any) & valid_rays_mask
-
-    # Count hits for each class (for BL approach to CI)
-    n_hits_all = valid_all_hits_mask.sum(axis=2)  # (F,A)
-    n_hits_leaf = valid_leaf_hits_mask.sum(axis=2)  # (F,A)
-    n_hits_wood = valid_wood_hits_mask.sum(axis=2)  # (F,A)
-
-    # Potential path length, free path length, and effective path length
-    def mean_var_ddof1(x, N):
-        mx = x.sum(axis=2)
-        mean = np.divide(mx, N, out=np.zeros_like(mx), where=(N > 0))
-        mx2 = (x**2).sum(axis=2)
-        numer = mx2 - (mx * mx) / np.maximum(N, 1)
-        denom = np.maximum(N - 1, 1)
-        var = numer / denom
-        var[(N <= 1)] = 0.0
-        return mean, var
-
-    # potential path lengths don't change for any first_hit condition
-    path_lengths = np.zeros_like(t_far, dtype=np.float32)
-    path_lengths[valid_rays_mask] = (t_far[valid_rays_mask] - t_near[valid_rays_mask])
-
-    # free path length is path_length for no hit, otherwise it's the distance to the first hit and is done for each class separately
-    free_path_length_all = path_lengths.copy()
-    free_path_length_all[valid_all_hits_mask] = first_hit_any[valid_all_hits_mask] - t_near[valid_all_hits_mask]
-    free_path_length_leaf = path_lengths.copy()
-    free_path_length_leaf[valid_leaf_hits_mask] = first_hit_leaf[valid_leaf_hits_mask] - t_near[valid_leaf_hits_mask]
-    free_path_length_wood = path_lengths.copy()
-    free_path_length_wood[valid_wood_hits_mask] = first_hit_wood[valid_wood_hits_mask] - t_near[valid_wood_hits_mask]
-
-    # effective free path length is the free path length corrected using lambda_1 (a function of average leaf size and voxel size)
-    eff_free_path_length_all = np.zeros_like(free_path_length_all, dtype=np.float32)
-    eff_free_path_length_all[valid_rays_mask] = compute_efpl_array(
-        free_path_length_all[valid_rays_mask], lambda_1
-    ).astype(np.float32)
-    eff_free_path_length_leaf = np.zeros_like(free_path_length_leaf, dtype=np.float32)
-    eff_free_path_length_leaf[valid_rays_mask] = compute_efpl_array(
-        free_path_length_leaf[valid_rays_mask], lambda_1
-    ).astype(np.float32)
-    eff_free_path_length_wood = np.zeros_like(free_path_length_wood, dtype=np.float32)
-    eff_free_path_length_wood[valid_rays_mask] = compute_efpl_array(
-        free_path_length_wood[valid_rays_mask], lambda_1
-    ).astype(np.float32)
-
-    # Aggregate useful statistics for each path length approach
-    sum_path_length = path_lengths.sum(axis=2)
-    mean_path_length = np.divide(sum_path_length, N, out=np.zeros_like(sum_path_length), where=(N > 0))
-
-    sum_free_path_length_all = free_path_length_all.sum(axis=2)
-    mean_free_path_length_all = np.divide(sum_free_path_length_all, N, out=np.zeros_like(sum_free_path_length_all), where=(N > 0))
-    sum_free_path_length_leaf = free_path_length_leaf.sum(axis=2)
-    mean_free_path_length_leaf = np.divide(sum_free_path_length_leaf, N, out=np.zeros_like(sum_free_path_length_leaf), where=(N > 0))
-    sum_free_path_length_wood = free_path_length_wood.sum(axis=2)
-    mean_free_path_length_wood = np.divide(sum_free_path_length_wood, N, out=np.zeros_like(sum_free_path_length_wood), where=(N > 0))
-
-    sum_eff_free_path_length_all = eff_free_path_length_all.sum(axis=2)
-    mean_eff_free_path_length_all = np.divide(sum_eff_free_path_length_all, N, out=np.zeros_like(sum_eff_free_path_length_all), where=(N > 0))
-    var_eff_free_path_length_all = np.zeros_like(mean_eff_free_path_length_all)
-    _, var_eff_free_path_length_all = mean_var_ddof1(eff_free_path_length_all, N)
-    sum_eff_free_path_length_leaf = eff_free_path_length_leaf.sum(axis=2)
-    mean_eff_free_path_length_leaf = np.divide(sum_eff_free_path_length_leaf, N, out=np.zeros_like(sum_eff_free_path_length_leaf), where=(N > 0))
-    var_eff_free_path_length_leaf = np.zeros_like(mean_eff_free_path_length_leaf)
-    _, var_eff_free_path_length_leaf = mean_var_ddof1(eff_free_path_length_leaf, N)
-    sum_eff_free_path_length_wood = eff_free_path_length_wood.sum(axis=2)
-    mean_eff_free_path_length_wood = np.divide(sum_eff_free_path_length_wood, N, out=np.zeros_like(sum_eff_free_path_length_wood), where=(N > 0))
-    var_eff_free_path_length_wood = np.zeros_like(mean_eff_free_path_length_wood)
-    _, var_eff_free_path_length_wood = mean_var_ddof1(eff_free_path_length_wood, N)
-    sum_hits_eff_free_path_length_all = (eff_free_path_length_all * valid_all_hits_mask).sum(axis=2)
-    sum_hits_eff_free_path_length_leaf = (eff_free_path_length_leaf * valid_leaf_hits_mask).sum(axis=2)
-    sum_hits_eff_free_path_length_wood = (eff_free_path_length_wood * valid_wood_hits_mask).sum(axis=2)
-
-    ## --- Build initial dictionary results for return --- ##
-    # We will add multi-hit statistics to these dictionaries if counts_leaf_multi and counts_wood_multi are available; otherwise, we return only first-hit-based statistics.
-    # ------------------------------------------------------------
-    # Create dictionaries for combined multi-hit stats (if counts_all is available)
-    # ------------------------------------------------------------
-    # combined
-    stats_comb = [[None for _ in range(A)] for _ in range(F)]
-    for f in range(F):
-        for a in range(A):
-            stats_comb[f][a] = dict(
-                N=int(N[f, a]),
-                n_hits=int(n_hits_all[f, a]),
-                I=(float(n_hits_all[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
-                mean_path_length=float(mean_path_length[f, a]),
-                sum_path_length=float(sum_path_length[f, a]),
-                sum_free_path_length=float(sum_free_path_length_all[f, a]),
-                mean_free_path_length=float(mean_free_path_length_all[f, a]),
-                mean_eff_free_path_length=float(mean_eff_free_path_length_all[f, a]),
-                var_eff_free_path_length=float(var_eff_free_path_length_all[f, a]),
-                sum_eff_free_path_length=float(np.sum(eff_free_path_length_all[f, a, :])),
-                sum_hits_eff_free_path_length=float(sum_hits_eff_free_path_length_all[f, a]),
-            )
-
-    stats_leaf = [[None for _ in range(A)] for _ in range(F)]
-    for f in range(F):
-        for a in range(A):
-            leaf_dict = dict(
-                N=int(N[f, a]),
-                n_hits=int(n_hits_leaf[f, a]),
-                I=(float(n_hits_leaf[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
-                mean_path_length=float(mean_path_length[f, a]),
-                sum_path_length=float(sum_path_length[f, a]),
-                sum_free_path_length=float(sum_free_path_length_leaf[f, a]),
-                mean_free_path_length=float(mean_free_path_length_leaf[f, a]),
-                mean_eff_free_path_length=float(mean_eff_free_path_length_leaf[f, a]),
-                var_eff_free_path_length=float(var_eff_free_path_length_leaf[f, a]),
-                sum_eff_free_path_length=float(sum_eff_free_path_length_leaf[f, a]),
-                sum_hits_eff_free_path_length=float(sum_hits_eff_free_path_length_leaf[f, a]),
-            )
-            stats_leaf[f][a] = leaf_dict
-
-
-    stats_wood = [[None for _ in range(A)] for _ in range(F)]
-    for f in range(F):
-        for a in range(A):
-            wood_dict = dict(
-                N=int(N[f, a]),
-                n_hits=int(n_hits_wood[f, a]),
-                I=(float(n_hits_wood[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
-                mean_path_length=float(mean_path_length[f, a]),
-                sum_path_length=float(sum_path_length[f, a]),
-                sum_free_path_length=float(sum_free_path_length_wood[f, a]),
-                mean_free_path_length=float(mean_free_path_length_wood[f, a]),
-                mean_eff_free_path_length=float(mean_eff_free_path_length_wood[f, a]),
-                var_eff_free_path_length=float(var_eff_free_path_length_wood[f, a]),
-                sum_eff_free_path_length=float(np.sum(eff_free_path_length_wood[f, a, :])),
-                sum_hits_eff_free_path_length=float(sum_hits_eff_free_path_length_wood[f, a]),
-                mean_eff_free_path_length_free=float(mean_eff_free_path_length_wood[f, a]),
-                var_eff_free_path_length_free=float(var_eff_free_path_length_wood[f, a])
-            )
-            stats_wood[f][a] = wood_dict
-
-    # ------------------------------------------------------------
-    # MULTI-HIT (Option A/B) per (face, angle) — unchanged wiring
-    # (Now uses counts_all_multi / counts_leaf_multi / counts_wood_multi if present)
-    # ------------------------------------------------------------
-    
-    ## --- Helper Functions --- ##
-    # Combinatorial bases (no factorials in hot loops)
-    def _build_pascal_table(n_max: int) -> np.ndarray:
-        C = np.zeros((n_max + 1, n_max + 1), dtype=np.float64)
-        C[0, 0] = 1.0
-        for n in range(1, n_max + 1):
-            C[n, 0] = 1.0
-            for k in range(1, n + 1):
-                C[n, k] = C[n - 1, k - 1] + (C[n - 1, k] if k <= n - 1 else 0.0)
-        return C
-
-    # Precompute B[j, n, k] = C(n, k) * (1-ω_j)^(n-k) for all ω_j in the grid and n,k up to n_max.
-    def _precompute_B_omegas(omega_grid: np.ndarray, n_max: int, C: np.ndarray) -> np.ndarray:
-        O = omega_grid.size
-        B = np.zeros((O, n_max + 1, n_max + 1), dtype=np.float64)
-        for j, om in enumerate(omega_grid):
-            one_minus = 1.0 - om
-            powers = one_minus ** np.arange(0, n_max + 1)  # 0..n_max
-            for n in range(1, n_max + 1):
-                k_idx = np.arange(1, n + 1)
-                B[j, n, k_idx] = C[n - 1, k_idx - 1] * powers[n - k_idx]
-        return B
-
-    # Precompute T[k] = ( (ωλ)^k / k! ) for k=0..n_max for given ol=ωλ; T[0]=0.
-    def _compute_T_vec(ol: float, n_max: int) -> np.ndarray:
-        """T[k] = ( (ωλ)^k / k! ), k>=1; T[0]=0."""
-        T = np.zeros(n_max + 1, dtype=np.float64)
-        if n_max >= 1:
-            T[1] = ol
-            for k in range(2, n_max + 1):
-                T[k] = T[k - 1] * ol / k
-        return T
-
-    # PMF table (log-space)
-    class LogPMFCache:
-        """
-        Cache of log P(n | λ_i, ω_j) for n=0..n_max and the entire (λ,ω) grid.
-        Reuse this across combined / leaf / wood to avoid recomputation.
-        """
-        def __init__(self, lam_grid: np.ndarray, omega_grid: np.ndarray, n_max: int):
-            self.lam_grid = lam_grid.astype(np.float64)
-            self.omega_grid = omega_grid.astype(np.float64)
-            self.n_max = int(n_max)
-            self.logP_all = None  # shape (n_max+1, G) where G = L*O
-
-            self._build()
-
-        def _build(self):
-            L = self.lam_grid.size
-            O = self.omega_grid.size
-            G = L * O
-            C = _build_pascal_table(self.n_max)
-            B = _precompute_B_omegas(self.omega_grid, self.n_max, C)
-
-            logP_all = np.empty((self.n_max + 1, G), dtype=np.float64)
-            eps = 1e-300
-            idx = 0
-            for i in range(L):
-                lam = float(self.lam_grid[i])
-                e_neg = np.exp(-lam)
-                for j in range(O):
-                    om = float(self.omega_grid[j])
-                    ol = om * lam
-                    T = _compute_T_vec(ol, self.n_max)
-                    ssum = B[j] @ T  # length (n_max+1); ssum[0] = 0
-                    p = np.empty(self.n_max + 1, dtype=np.float64)
-                    p[0] = e_neg
-                    if self.n_max >= 1:
-                        p[1:] = e_neg * ssum[1:]
-                    logP_all[:, idx] = np.log(np.maximum(p, eps))
-                    idx += 1
-            self.logP_all = logP_all
-
-    # Histogram builder
-    def build_histograms(counts_FAR: np.ndarray,
-                        valid_mask_FAR: np.ndarray,
-                        n_max: int) -> np.ndarray:
-        F, A, R = counts_FAR.shape
-        M = F * A
-        counts = counts_FAR.reshape(M, R)
-        mask = valid_mask_FAR.reshape(M, R)
-        H = np.zeros((M, n_max + 1), dtype=np.int64)
-        for m in range(M):
-            if mask[m].any():
-                vals = counts[m, mask[m]]
-                H[m] = np.bincount(vals, minlength=n_max + 1)
-        return H
-
-    # Batched MLE (one matmul + argmax)
-    def mle_clustered_batched_np(counts_FAR: np.ndarray,
-                                valid_mask_FAR: np.ndarray,
-                                lam_grid: np.ndarray,
-                                omega_grid: np.ndarray,
-                                precomputed: LogPMFCache | None = None):
-        # max observed count across valid rays
-        n_max = int(np.max(np.where(valid_mask_FAR, counts_FAR, 0)))
-        n_max = max(n_max, 0)
-
-        cache = precomputed
-        if (cache is None or
-            cache.n_max != n_max or
-            cache.lam_grid.shape != lam_grid.shape or
-            cache.omega_grid.shape != omega_grid.shape or
-            np.any(cache.lam_grid != lam_grid) or
-            np.any(cache.omega_grid != omega_grid)):
-            cache = LogPMFCache(lam_grid, omega_grid, n_max)
-
-        H = build_histograms(counts_FAR.astype(np.int32), valid_mask_FAR, n_max)     # (M, n_max+1)
-        LL_all = H.astype(np.float64).dot(cache.logP_all)                            # (M, G)
-
-        best_idx = np.argmax(LL_all, axis=1)
-        L = lam_grid.size
-        O = omega_grid.size
-        lam_idx = best_idx // O
-        omg_idx = best_idx % O
-
-        best_lambda = lam_grid[lam_idx]
-        best_omega  = omega_grid[omg_idx]
-        best_ll     = LL_all[np.arange(LL_all.shape[0]), best_idx]
-
-        return best_lambda, best_omega, best_ll, cache
-    
-    # Main function for multi-hit stats computation per (F,A) using the above helpers
-    def _compute_multihit_stats(counts_FAR, valid_rays_mask_FA, F, A,
-                                lam_grid=None, omega_grid=None, pmf_cache=None):
-        if lam_grid is None:
-            lam_grid = np.linspace(1e-3, 3.0, 60)
-        if omega_grid is None:
-            omega_grid = np.linspace(1e-3, 0.999, 60)
-
-        # Basic per-(F,A) stats (vectorized)
-        n_rays_multihit = valid_rays_mask_FA.sum(axis=2).astype(np.int32)
-        safeN = np.maximum(n_rays_multihit, 1)
-        masked = np.where(valid_rays_mask_FA, counts_FAR, 0)
-
-        sum_x  = masked.sum(axis=2).astype(np.float64)
-        sum_x2 = (masked**2).sum(axis=2).astype(np.float64)
-
-        mean_count = sum_x / safeN
-        var_count = np.zeros_like(mean_count, dtype=np.float64)
-        has2 = n_rays_multihit > 1
-        var_count[has2] = (sum_x2[has2] - (sum_x[has2]**2) / n_rays_multihit[has2]) / (n_rays_multihit[has2] - 1)
-
-        pgap_count = np.zeros_like(mean_count, dtype=np.float64)
-        nz = n_rays_multihit > 0
-        pgap_count[nz] = (np.where(valid_rays_mask_FA[nz], counts_FAR[nz] == 0, False).sum(axis=1)) / n_rays_multihit[nz]
-
-        lambda_eff = mean_count.copy()
-
-        # ---- Batched MLE for all directions (no loops) ----
-        lam_hat_flat, omg_hat_flat, ll_hat_flat, pmf_cache = mle_clustered_batched_np(
-            counts_FAR, valid_rays_mask_FA, lam_grid, omega_grid, precomputed=pmf_cache
-        )
-        lambda_B = lam_hat_flat.reshape(F, A)
-        omega_B  = omg_hat_flat.reshape(F, A)
-        loglik_B = ll_hat_flat.reshape(F, A)
-
-        # Assemble result in your existing dict shape
-        stats_result = [[None for _ in range(A)] for _ in range(F)]
-        for f in range(F):
-            for a in range(A):
-                stats_result[f][a] = dict(
-                    n_rays_multihit=int(n_rays_multihit[f, a]) if n_rays_multihit[f, a] > 0 else 0,
-                    pgap_count=float(pgap_count[f, a]) if n_rays_multihit[f, a] > 0 else np.nan,
-                    mean_count=float(mean_count[f, a]) if n_rays_multihit[f, a] > 0 else np.nan,
-                    var_count=float(var_count[f, a])  if n_rays_multihit[f, a] > 0 else np.nan,
-                    lambda_eff_hat_poisson=float(lambda_eff[f, a]) if n_rays_multihit[f, a] > 0 else np.nan,
-                    lambda_hat_clustered=float(lambda_B[f, a]) if n_rays_multihit[f, a] > 0 else np.nan,
-                    Omega_B_clustered=float(omega_B[f, a]) if n_rays_multihit[f, a] > 0 else np.nan,
-                    loglik_B=float(loglik_B[f, a]) if n_rays_multihit[f, a] > 0 else np.nan,
-                )
-
-        return stats_result, pmf_cache
-
-    ## --- Initialise grids --- ##
-    lam_grid = np.linspace(1e-3, 3.0, 60)
-    omega_grid = np.linspace(1e-3, 0.999, 60)
-    pmf_cache = None  # shared across combined/leaf/wood
-
-    if counts_all_multi is not None:
-        multihit_stats_all, pmf_cache = _compute_multihit_stats(
-            counts_all_multi, valid_rays_mask, F, A, lam_grid, omega_grid, pmf_cache
-        )
-        for f in range(F):
-            for a in range(A):
-                stats_comb[f][a].update(multihit_stats_all[f][a])
-
-    if counts_leaf_multi is not None:
-        multihit_stats_leaf, pmf_cache = _compute_multihit_stats(
-            counts_leaf_multi, valid_rays_mask, F, A, lam_grid, omega_grid, pmf_cache
-        )
-        for f in range(F):
-            for a in range(A):
-                stats_leaf[f][a].update(multihit_stats_leaf[f][a])
-
-    if counts_wood_multi is not None:
-        multihit_stats_wood, pmf_cache = _compute_multihit_stats(
-            counts_wood_multi, valid_rays_mask, F, A, lam_grid, omega_grid, pmf_cache
-        )
-        for f in range(F):
-            for a in range(A):
-                stats_wood[f][a].update(multihit_stats_wood[f][a])
-
-
-    return stats_comb, stats_leaf, stats_wood
 
 def compute_G_function_binwise(viewing_angles, leaf_bin_centers, LIAD_values):
     """
@@ -1488,8 +1096,6 @@ global ANGLE_ORDER
 rot_axis = {"xplus":"y","xminus":"y","bottom":"x","top":"x","yplus":"x","yminus":"x"}
 
 def build_ray_tensor_for_voxel(voxel_center, voxel_size, angles):
-    rays_list = []
-    labels = []  # (face_idx, angle_idx) per ray
     face_order = FACE_ORDER
     angles_sorted = sorted(angles)
 
@@ -1534,12 +1140,150 @@ def group_counts(label_ids, t_hit, n_faces, n_angles):
             hits_n[f_idx, a_idx] += 1
     return counts, hits_n
     
+### --- Function for simulation and metrics calculation --- ###
+def simulate_voxel_grouped_warp(
+    voxel_center: np.ndarray,
+    voxel_size: float,
+    rays_FAR6: np.ndarray,     # shape (F, A, R, 6) == [ox,oy,oz, dx,dy,dz]
+    leaf_mesh: dict | None,    # {"vertices": (n,3) float64/32, "faces": (m,3) int64/32} or {}
+    wood_mesh: dict | None,    # same as above or {}
+    device: str = _WARP_DEVICE,
+    max_hits: int = 8,
+    eps_advance: float = 1e-5,
+    max_rays_per_batch: int = 1000000  # Limit rays per batch to avoid OOM
+):
+    """
+    Returns a dict of numpy arrays with shape (F, A, ...) matching your downstream metrics.
+    Processes rays in batches to avoid GPU memory exhaustion.
+    """
+
+    # --------- 1) Build Warp meshes (BVH) for this voxel's clipped meshes ----------
+    has_leaf = int(bool(leaf_mesh and len(leaf_mesh.get("faces", [])) > 0))
+    has_wood = int(bool(wood_mesh and len(wood_mesh.get("faces", [])) > 0))
+
+    def _make_wp_mesh(md: dict | None):
+        if not md or len(md.get("faces", [])) == 0:
+            return None
+        v = np.asarray(md["vertices"], dtype=np.float32, order="C")
+        f = np.asarray(md["faces"],    dtype=np.int32,   order="C").ravel()
+        if len(v) == 0 or len(f) == 0:
+            return None
+        v_d = wp.array(v, dtype=wp.vec3,  device=device)
+        f_d = wp.array(f, dtype=wp.int32, device=device)
+        return wp.Mesh(points=v_d, indices=f_d)
+
+    with _gpu_lock:
+        leaf_wp = _make_wp_mesh(leaf_mesh)
+        wood_wp = _make_wp_mesh(wood_mesh)
+
+        leaf_id = leaf_wp.id if leaf_wp is not None else None
+        wood_id = wood_wp.id if wood_wp is not None else None
+
+        # --------- 2) Prepare rays ----------
+        F, A, R, _ = rays_FAR6.shape
+        n_rays = F * A * R
+        O = rays_FAR6[..., 0:3].reshape(n_rays, 3).astype(np.float32, order="C")
+        D = rays_FAR6[..., 3:6].reshape(n_rays, 3).astype(np.float32, order="C")
+
+        # Voxel slab bounds
+        vc   = np.asarray(voxel_center, dtype=np.float32)
+        half = float(voxel_size) * 0.5
+        bmin = wp.vec3(vc[0]-half, vc[1]-half, vc[2]-half)
+        bmax = wp.vec3(vc[0]+half, vc[1]+half, vc[2]+half)
+
+        # --------- 3) Allocate outputs ----------
+        first_any = np.full(n_rays, np.inf, dtype=np.float32)
+        first_leaf = np.full(n_rays, np.inf, dtype=np.float32)
+        first_wood = np.full(n_rays, np.inf, dtype=np.float32)
+        cnt_all = np.zeros(n_rays, dtype=np.int32)
+        cnt_leaf = np.zeros(n_rays, dtype=np.int32)
+        cnt_wood = np.zeros(n_rays, dtype=np.int32)
+
+        # --------- 4) Process rays in batches ----------
+        num_batches = (n_rays + max_rays_per_batch - 1) // max_rays_per_batch
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * max_rays_per_batch
+            end_idx = min(start_idx + max_rays_per_batch, n_rays)
+            batch_size = end_idx - start_idx
+
+            O_batch = O[start_idx:end_idx]
+            D_batch = D[start_idx:end_idx]
+
+            # Upload batch to GPU
+            origins_d = wp.array(O_batch, dtype=wp.vec3, device=device)
+            dirs_d    = wp.array(D_batch, dtype=wp.vec3, device=device)
+
+            # Allocate output arrays for this batch
+            first_any_d  = wp.zeros(batch_size, dtype=float,     device=device)
+            first_leaf_d = wp.zeros(batch_size, dtype=float,     device=device)
+            first_wood_d = wp.zeros(batch_size, dtype=float,     device=device)
+            count_all_d  = wp.zeros(batch_size, dtype=wp.int32,  device=device)
+            count_leaf_d = wp.zeros(batch_size, dtype=wp.int32,  device=device)
+            count_wood_d = wp.zeros(batch_size, dtype=wp.int32,  device=device)
+
+            # Launch kernel on this batch
+            # Only pass valid mesh IDs to the kernel
+            leaf_id_arg = leaf_id if leaf_id is not None else wp.uint64(0)
+            wood_id_arg = wood_id if wood_id is not None else wp.uint64(0)
+            
+            wp.launch(
+                kernel=_raycast_voxel_kernel,
+                dim=batch_size,
+                inputs=[
+                    leaf_id_arg, wood_id_arg,
+                    has_leaf, has_wood,
+                    origins_d, dirs_d,
+                    bmin, bmax,
+                    int(max_hits), float(eps_advance),
+                    first_any_d, first_leaf_d, first_wood_d,
+                    count_all_d, count_leaf_d, count_wood_d
+                ],
+                device=device
+            )
+
+            # Copy results back and store in output arrays
+            first_any[start_idx:end_idx] = first_any_d.numpy()
+            first_leaf[start_idx:end_idx] = first_leaf_d.numpy()
+            first_wood[start_idx:end_idx] = first_wood_d.numpy()
+            cnt_all[start_idx:end_idx] = count_all_d.numpy()
+            cnt_leaf[start_idx:end_idx] = count_leaf_d.numpy()
+            cnt_wood[start_idx:end_idx] = count_wood_d.numpy()
+
+        # Clean up batch arrays
+        del origins_d, dirs_d
+        del first_any_d, first_leaf_d, first_wood_d
+        del count_all_d, count_leaf_d, count_wood_d
+        gc.collect()
+
+    # --------- 5) Reshape to (F, A, R) ----------
+    first_any  = first_any.reshape(F, A, R)
+    first_leaf = first_leaf.reshape(F, A, R)
+    first_wood = first_wood.reshape(F, A, R)
+    cnt_all    = cnt_all.reshape(F, A, R)
+    cnt_leaf   = cnt_leaf.reshape(F, A, R)
+    cnt_wood   = cnt_wood.reshape(F, A, R)
+
+    # --------- 6) Package results for your downstream code ----------
+    out = {
+        "first_hit_any":  first_any,
+        "first_hit_leaf": first_leaf,
+        "first_hit_wood": first_wood,
+        "counts_all":     cnt_all,
+        "counts_leaf":    cnt_leaf,
+        "counts_wood":    cnt_wood,
+        # Convenience for valid-ray mask (anything finite after slab clip)
+        "valid_any":      np.isfinite(first_any),
+        "valid_leaf":     np.isfinite(first_leaf),
+        "valid_wood":     np.isfinite(first_wood),
+        "F": F, "A": A, "R": R
+    }
+    return out
+
 def process_voxel(
     voxel_center, 
     voxel_size, 
-    o3d_leaf,
-    o3d_wood, 
-    scenes,
+    leaf_mesh,
+    wood_mesh, 
     angles, 
     wood_volume_points, 
     lambda_1
@@ -1547,17 +1291,20 @@ def process_voxel(
     """
     Process a single voxel center with the given parameters.
     This function should contain the logic to process the voxel.
-    """
-    MIN_HITS = 10
+    """    
+    # Build meshes
+    if leaf_mesh is not {}:
+        o3d_leaf = o3d.geometry.TriangleMesh()
+        o3d_leaf.vertices = o3d.utility.Vector3dVector(leaf_vertices)
+        o3d_leaf.triangles = o3d.utility.Vector3iVector(leaf_faces)
+    else:
+        o3d_leaf = None
 
-    if o3d_leaf is None and "leaf" in scenes:
-        print(f"[DEBUG] {voxel_center}: No leaf mesh after clipping for leaf-only scene. Skipping.")
-        return [], []
-    
-    if o3d_wood is None and "wood" in scenes:
-        print(f"[DEBUG] {voxel_center}: No wood mesh after clipping for wood-only scene. Skipping.")
-        return [], []
-    
+    if wood_mesh is not {}:
+        o3d_wood = o3d.geometry.TriangleMesh()
+        o3d_wood.vertices = o3d.utility.Vector3dVector(leaf_vertices)
+        o3d_wood.triangles = o3d.utility.Vector3iVector(leaf_faces)
+
     # Extract surface areas from meshes
     try:
         leaf_area = o3d_leaf.get_surface_area() if o3d_leaf else 0.0
@@ -1573,6 +1320,7 @@ def process_voxel(
         LAI = leaf_area / (voxel_size ** 2)
         WAI = wood_area / (voxel_size ** 2)
         PAI = comb_area / (voxel_size ** 2)
+        leaf_fraction_ref = LAI / PAI if PAI > 0 else 0.0
     except Exception as e:
         raise RuntimeError(
             f"Error computing LAI, WAI, or PAI for voxel at {voxel_center}: {e}"
@@ -1604,33 +1352,54 @@ def process_voxel(
     try:
         bin_leaf, liad, _ = compute_LIAD_from_mesh(o3d_leaf) if o3d_leaf else (np.array([]), np.array([]), None)
         bin_wood, wiad, _ = compute_LIAD_from_mesh(o3d_wood) if o3d_wood else (np.array([]), np.array([]), None)
-        bin_comb, piad, _ = compute_LIAD_from_mesh(o3d_leaf + o3d_wood) if (o3d_leaf and o3d_wood) else (np.array([]), np.array([]), None)
-
+        # Calculate PIAD from aggregated liad and wiad and renormalising
+        if liad.size > 0 and wiad.size > 0:
+            piad = (liad * LAD + wiad * WAD) / (LAD + WAD) if (LAD + WAD) > 0 else np.array([])
+            bin_all = bin_leaf  # Assuming same bins for combined; adjust if needed
+        elif liad.size > 0 and not wiad.size > 0:
+            piad = liad
+            bin_all = bin_leaf
+        elif wiad.size > 0 and not liad.size > 0:
+            piad = wiad
+            bin_all = bin_wood
+        else:
+            piad = np.array([])
+            bin_all = np.array([])
+        
         if liad.size > 0 and bin_leaf.size > 0:
-            liad_dewit, liad_dewit_rmse, liad_dewit_l1 = classify_liad_to_dewit(
+            liad_dewit, liad_rmse, liad_l1 = classify_liad_to_dewit(
                 liad=liad,
                 bin_centres_deg=bin_leaf,
                 return_scores=True
             )
-            liad_dewit_rmse = np.nan if liad_dewit_rmse is None else liad_dewit_rmse
-            liad_dewit_l1 = np.nan if liad_dewit_l1 is None else liad_dewit_l1
+            liad_rmse = np.nan if liad_rmse is None else liad_rmse
+            liad_l1 = np.nan if liad_l1 is None else liad_l1
         else:
             liad_dewit = "NA"
-            liad_dewit_rmse = np.nan
-            liad_dewit_l1 = np.nan
+            liad_rmse = np.nan
+            liad_l1 = np.nan
 
-        if piad.size > 0 and bin_comb.size> 0:
-            piad_dewit, piad_dewit_rmse, piad_dewit_l1 = classify_liad_to_dewit(
-                liad=piad,
-                bin_centres_deg=bin_comb,
+        if wiad.size > 0 and bin_wood.size > 0:
+            wiad_dewit, wiad_rmse, wiad_l1 = classify_liad_to_dewit(
+                liad=wiad,
+                bin_centres_deg=bin_wood,
                 return_scores=True
             )
-            piad_dewit_rmse = np.nan if piad_dewit_rmse is None else piad_dewit_rmse
-            piad_dewit_l1 = np.nan if piad_dewit_l1 is None else piad_dewit_l1
+            wiad_rmse = np.nan if wiad_rmse is None else wiad_rmse
+            wiad_l1 = np.nan if wiad_l1 is None else wiad_l1
+
+        if piad.size > 0 and bin_all.size> 0:
+            piad_dewit, piad_rmse, piad_l1 = classify_liad_to_dewit(
+                liad=piad,
+                bin_centres_deg=bin_all,
+                return_scores=True
+            )
+            piad_rmse = np.nan if piad_rmse is None else piad_rmse
+            piad_l1 = np.nan if piad_l1 is None else piad_l1
         else:
             piad_dewit = "NA"
-            piad_dewit_rmse = np.nan
-            piad_dewit_l1 = np.nan
+            piad_rmse = np.nan
+            piad_l1 = np.nan
         
     except Exception as e:
         raise RuntimeError(
@@ -1638,215 +1407,908 @@ def process_voxel(
         ) from e
 
     # Build ray tensor for all rays in voxel
-    rays_FAR6, face_order, angles_sorted = build_ray_tensor_for_voxel(
+    rays_FAR6, _, _ = build_ray_tensor_for_voxel(
     voxel_center=voxel_center, 
     voxel_size=voxel_size, 
     angles=angles)
+
+    ### WARP TEST ###
+    rc = simulate_voxel_grouped_warp(
+        voxel_center=voxel_center,
+        voxel_size=voxel_size,
+        rays_FAR6=rays_FAR6,
+        leaf_mesh=leaf_mesh if leaf_mesh else None,
+        wood_mesh=wood_mesh if wood_mesh else None,
+        device=_WARP_DEVICE,
+        max_hits=10,
+    )
+    F, A, R = rc["F"], rc["A"], rc["R"]
+
+    
+    ## 3) Recompute path-length stats over the slab (CPU vectorized) ----------
+    # (reuse your existing vectorized slab lengths, identical to before)
+    O = rays_FAR6[..., 0:3].reshape(-1, 3)
+    D = rays_FAR6[..., 3:6].reshape(-1, 3)
+    vc = np.asarray(voxel_center, dtype=np.float32)
+    half = voxel_size / 2.0
+    bmin = vc - half
+    bmax = vc + half
+    t_near, t_far = ray_box_intersection_vectorized(O, D, bmin, bmax)
+    t_near = t_near.reshape(F, A, R)
+    t_far  = t_far.reshape(F, A, R)
+    valid_mask = (t_near <= t_far) & (t_far >= 0.0)
+
+    # Potential path lengths (inside slab)
+    path_lengths = np.zeros_like(t_far, dtype=np.float32)
+    path_lengths[valid_mask] = (t_far[valid_mask] - t_near[valid_mask]).astype(np.float32)
+
+    # First-hit free path lengths (any/leaf/wood)
+    f_any  = rc["first_hit_any"]
+    f_leaf = rc["first_hit_leaf"]
+    f_wood = rc["first_hit_wood"]
+
+    valid_any  = np.isfinite(f_any)  & valid_mask
+    valid_leaf = np.isfinite(f_leaf) & valid_mask
+    valid_wood = np.isfinite(f_wood) & valid_mask
+
+    # Free path length = distance from slab entry to first hit; else full slab length
+    free_any  = path_lengths.copy()
+    free_leaf = path_lengths.copy()
+    free_wood = path_lengths.copy()
+    free_any [valid_any ] = (f_any [valid_any ]).astype(np.float32)
+    free_leaf[valid_leaf] = (f_leaf[valid_leaf]).astype(np.float32)
+    free_wood[valid_wood] = (f_wood[valid_wood]).astype(np.float32)
+
+    # Effective free path length (apply your lambda_1 transform)
+    eff_any  = np.zeros_like(free_any,  dtype=np.float32)
+    eff_leaf = np.zeros_like(free_leaf, dtype=np.float32)
+    eff_wood = np.zeros_like(free_wood, dtype=np.float32)
+    mask_all = valid_mask
+
+    eff_any [mask_all] = compute_efpl_array(free_any [mask_all],  lambda_1).astype(np.float32)
+    eff_leaf[mask_all] = compute_efpl_array(free_leaf[mask_all], lambda_1).astype(np.float32)
+    eff_wood[mask_all] = compute_efpl_array(free_wood[mask_all], lambda_1).astype(np.float32)
+
+    # ---------- 4) Aggregate per-(F,A) ----------
+    N = valid_mask.sum(axis=2).astype(np.int32)
+
+    n_hits_all  = valid_any .sum(axis=2).astype(np.int32)
+    n_hits_leaf = valid_leaf.sum(axis=2).astype(np.int32)
+    n_hits_wood = valid_wood.sum(axis=2).astype(np.int32)
+
+    sum_ppl = path_lengths.sum(axis=2)                           # potential
+    mean_ppl = np.divide(sum_ppl, N, out=np.zeros_like(sum_ppl), where=(N>0))
+
+    sum_fpl_all  = free_any .sum(axis=2)
+    sum_fpl_leaf = free_leaf.sum(axis=2)
+    sum_fpl_wood = free_wood.sum(axis=2)
+
+    mean_fpl_all  = np.divide(sum_fpl_all,  N, out=np.zeros_like(sum_fpl_all ), where=(N>0))
+    mean_fpl_leaf = np.divide(sum_fpl_leaf, N, out=np.zeros_like(sum_fpl_leaf), where=(N>0))
+    mean_fpl_wood = np.divide(sum_fpl_wood, N, out=np.zeros_like(sum_fpl_wood), where=(N>0))
+
+    sum_efpl_all   = eff_any .sum(axis=2)
+    sum_efpl_leaf  = eff_leaf.sum(axis=2)
+    sum_efpl_wood  = eff_wood.sum(axis=2)
+    sum_efpl_hits_all  = (eff_any  * valid_any ).sum(axis=2)
+    sum_efpl_hits_leaf = (eff_leaf * valid_leaf).sum(axis=2)
+    sum_efpl_hits_wood = (eff_wood * valid_wood).sum(axis=2)
+
+    # Multi-hit statistics from kernel (mean/var over rays)
+    counts_all  = rc["counts_all"]
+    counts_leaf = rc["counts_leaf"]
+    counts_wood = rc["counts_wood"]
+
+    safeN = np.maximum(N, 1)
+    masked_all = np.where(valid_mask, counts_all, 0)
+
+    sum_x_all = masked_all.sum(axis=2).astype(np.float64)
+    sum_x2_all = (masked_all **2).sum(axis=2).astype(np.float64)
+    mean_count_all = sum_x_all / safeN
+    var_count_all  = np.zeros_like(mean_count_all, dtype=np.float64)
+    has2 = (N > 1)
+    var_count_all[has2] = (sum_x2_all[has2] - (sum_x_all[has2]**2)/N[has2]) / (N[has2]-1)
+
+    # Repeat for leaf/wood if you need them; omitted here for brevity
+    # mean_count_leaf, var_count_leaf, mean_count_wood, var_count_wood ...
+
+    # pgap (first-hit based)
+    pgap_all  = 1.0 - (n_hits_all  / np.maximum(N, 1))
+    pgap_leaf = 1.0 - (n_hits_leaf / np.maximum(N, 1))
+    pgap_wood = 1.0 - (n_hits_wood / np.maximum(N, 1))
+
+    # ---------- 5) G-function on view zenith (as you had) ----------
+    # Use the first ray's direction per (F,A) to define zenith; same as your code
+    dirs0 = rays_FAR6[:, :, 0, 3:6]  # (F,A,3)
+    norms = np.linalg.norm(dirs0, axis=2, keepdims=True)
+    dnorm = dirs0 / np.maximum(norms, 1e-12)
+    dz = dnorm[:, :, 2]
+    viewing_angles = np.degrees(np.arccos(np.clip(np.abs(dz), 0.0, 1.0))).astype(np.float32)
+
+    G_all = np.zeros_like(viewing_angles, dtype=np.float32)
+    G_leaf = np.zeros_like(viewing_angles, dtype=np.float32)
+    G_wood = np.zeros_like(viewing_angles, dtype=np.float32)
+    if piad.size > 0 and bin_all.size > 0:
+        G_all = calculate_G(viewing_angles.ravel(), bin_all, piad).reshape(viewing_angles.shape).astype(np.float32)
+    if liad.size > 0 and bin_leaf.size > 0:
+        G_leaf = calculate_G(viewing_angles.ravel(), bin_leaf, liad).reshape(viewing_angles.shape).astype(np.float32)
+    if wiad.size > 0 and bin_wood.size > 0:
+        G_wood = calculate_G(viewing_angles.ravel(), bin_wood, wiad).reshape(viewing_angles.shape).astype(np.float32)
+
+    # ---------- 6) Compute CI (unchanged formulas) ----------
+    CI_all  = np.full((F, A), np.nan, dtype=np.float32)
+    CI_leaf = np.full((F, A), np.nan, dtype=np.float32)
+    CI_wood = np.full((F, A), np.nan, dtype=np.float32)
+
+    if PAD > 0:
+        valid_ci = (pgap_all > 0) & (pgap_all < 1) & (G_all > 0) & (mean_ppl > 0)
+        CI_all[valid_ci] = (-np.log(pgap_all[valid_ci]) / (G_all[valid_ci] * PAD * mean_ppl[valid_ci])).astype(np.float32)
+    if LAD > 0:
+        valid_ci = (pgap_leaf > 0) & (pgap_leaf < 1) & (G_leaf > 0) & (mean_ppl > 0)
+        CI_leaf[valid_ci] = (-np.log(pgap_leaf[valid_ci]) / (G_leaf[valid_ci] * LAD * mean_ppl[valid_ci])).astype(np.float32)
+    if WAD > 0:
+        valid_ci = (pgap_wood > 0) & (pgap_wood < 1) & (G_wood > 0) & (mean_ppl > 0)
+        CI_wood[valid_ci] = (-np.log(pgap_wood[valid_ci]) / (G_wood[valid_ci] * WAD * mean_ppl[valid_ci])).astype(np.float32)
+
+    # ---------- 7) Assemble metadata + stats (same shape & keys) ----------
+    metadata = {
+        "voxel_cx": np.float32(voxel_center[0]),
+        "voxel_cy": np.float32(voxel_center[1]),
+        "voxel_cz": np.float32(voxel_center[2]),
+        "voxel_size": voxel_size,
+        "alpha": alpha if alpha is not None else np.nan,
+        "LAI_ref": LAI if LAI is not None else np.nan,
+        "WAI_ref": WAI if WAI is not None else np.nan,
+        "PAI_ref": PAI if PAI is not None else np.nan,
+        "LAD_ref": LAD if LAD is not None else np.nan,
+        "WAD_ref": WAD if WAD is not None else np.nan,
+        "PAD_ref": PAD if PAD is not None else np.nan,
+        "leaf_fraction": leaf_fraction_ref if leaf_fraction_ref is not None else np.nan,
+        "liad_json": json.dumps(liad.tolist()) if liad is not None else "NA",
+        "liad_dewit": liad_dewit if liad_dewit is not None else "NA",
+        "liad_rmse": liad_rmse if liad_rmse is not None else np.nan,
+        "liad_l1":   liad_l1   if liad_l1   is not None else np.nan,
+        "wiad_json": json.dumps(wiad.tolist()) if wiad is not None else "NA",
+        "wiad_dewit": wiad_dewit if wiad_dewit is not None else "NA",
+        "wiad_rmse": wiad_rmse if wiad_rmse is not None else np.nan,
+        "wiad_l1":   wiad_l1   if wiad_l1   is not None else np.nan,
+        "piad_json": json.dumps(piad.tolist()) if piad is not None else "NA",
+        "piad_dewit": piad_dewit if piad_dewit is not None else "NA",
+        "piad_rmse": piad_rmse if piad_rmse is not None else np.nan,
+        "piad_l1":   piad_l1   if piad_l1   is not None else np.nan
+    }
+
+    stats = {
+        "dx": dnorm[:, :, 0].astype(np.float32),
+        "dy": dnorm[:, :, 1].astype(np.float32),
+        "dz": dnorm[:, :, 2].astype(np.float32),
+        "zenith_angle": viewing_angles.astype(np.float32),
+
+        "num_rays": N.astype(np.int32),
+        "sum_ppl":  sum_ppl.astype(np.float32),
+        "mean_ppl": mean_ppl.astype(np.float32),
+
+        "num_hits_all":  n_hits_all.astype(np.int32),
+        "num_hits_leaf": n_hits_leaf.astype(np.int32),
+        "num_hits_wood": n_hits_wood.astype(np.int32),
+
+        "pgap_all":  pgap_all.astype(np.float32),
+        "pgap_leaf": pgap_leaf.astype(np.float32),
+        "pgap_wood": pgap_wood.astype(np.float32),
+
+        "G_all":  G_all.astype(np.float32),
+        "G_leaf": G_leaf.astype(np.float32),
+        "G_wood": G_wood.astype(np.float32),
+
+        "sum_fpl_all":  sum_fpl_all.astype(np.float32),
+        "mean_fpl_all": mean_fpl_all.astype(np.float32),
+        "sum_fpl_leaf": sum_fpl_leaf.astype(np.float32),
+        "mean_fpl_leaf": mean_fpl_leaf.astype(np.float32),
+        "sum_fpl_wood": sum_fpl_wood.astype(np.float32),
+        "mean_fpl_wood": mean_fpl_wood.astype(np.float32),
+
+        "sum_efpl_all":  sum_efpl_all.astype(np.float32),
+        "sum_efpl_hits_all":  sum_efpl_hits_all.astype(np.float32),
+        "sum_efpl_leaf": sum_efpl_leaf.astype(np.float32),
+        "sum_efpl_hits_leaf": sum_efpl_hits_leaf.astype(np.float32),
+        "sum_efpl_wood": sum_efpl_wood.astype(np.float32),
+        "sum_efpl_hits_wood": sum_efpl_hits_wood.astype(np.float32),
+
+        # Multi-hit (ANY); add leaf/wood if desired
+        "mean_count_all": mean_count_all.astype(np.float32),
+        "var_count_all":  var_count_all.astype(np.float32),
+    }
+
+    return metadata, stats
+
     
     ### For each scene in scenes, create a scene and raycast for outputs
     all_results = []
 
-    try:
-        for scene in scenes:
-            if scene == "leaf":
-                if o3d_leaf is None:
-                    print(f"[DEBUG] {voxel_center}: No leaf mesh after clipping for leaf-only scene. Skipping.")
-                    all_results.append({})
-                    continue
+    def simulate_voxel_grouped_with_multi(scene, leaf_gids, wood_gids,
+                                        include_all_points=False):
+        """
+        Vectorized per-(face, angle) aggregation that matches your stats dictionaries.
+        
+        Inputs:
+            - scene: Open3D RaycastingScene with leaf and wood meshes added
+            - leaf_gids, wood_gids: geometry IDs for leaf and wood in the scene
+            - voxel_center, voxel_size: defines the voxel for ray-box intersection
+            - rays_FAR6: pre-generated rays for all faces and angles, shape (F,A,R,6)
+            - lambda_1: parameter for EFPL calculation
+            - include_all_points: whether to include all points regardless of their classification. 
+                                This will include non-specified classes (i.e. understorey non-leaf/wood or ground etc) in the combined results
 
-                voxel_scene, leaf_gid, wood_gid = build_voxel_scene(o3d_leaf, None)
-                # print(f"leaf --> {leaf_gid}, {wood_gid}")
-                
-                
-                
+        Returns:
+            out: dict with numpy-only arrays for all the stats, including multi-hit counts and first hit distances for leaf, wood, and any hit.
+        """
 
-            elif scene == "wood":
-                if o3d_wood is None:
-                    print(f"[DEBUG] {voxel_center}: No wood mesh after clipping for wood-only scene. Skipping.")
-                    all_results.append({})
-                    continue
+        import numpy as np
+        import gc
 
-                voxel_scene, leaf_gid, wood_gid = build_voxel_scene(None, o3d_wood)
-                # print(f"wood --> {leaf_gid}, {wood_gid}")
-                
+        F, A, R, _ = rays_FAR6.shape
+        vc = np.asarray(voxel_center, dtype=np.float32)
+        bmin = vc - 0.5 * voxel_size
+        bmax = vc + 0.5 * voxel_size
 
-            elif scene == "combined":
-                if o3d_leaf is None and o3d_wood is None:
-                    print(f"[DEBUG] {voxel_center}: No meshes after clipping for combined scene. Skipping.")
-                    all_results.append({})
-                    continue
+        O = rays_FAR6[..., 0:3]  # (F,A,R,3)
+        D = rays_FAR6[..., 3:6]  # (F,A,R,3)
 
-                voxel_scene, leaf_gid, wood_gid = build_voxel_scene(o3d_leaf, o3d_wood)
+        # Compute t_near, t_far for ray-box intersection
+        t_near, t_far = ray_box_intersection_vectorized(
+            O.reshape(-1, 3), D.reshape(-1, 3), bmin, bmax
+        )
+        t_near = t_near.reshape(F, A, R)
+        t_far = t_far.reshape(F, A, R)
+        valid_rays_mask = (t_near <= t_far) & (t_far >= 0.0)  # (F,A,R)
+
+        # --- Run multi-return list_intersections raytracing
+        # Use the first_hit_any, first_hit_leaf, and first_hit_wood arrays to calculate pgap for the BL approach to CI
+        # Use all returns to use the VoxLAD approach to CI
+        counts_leaf_multi = None
+        counts_wood_multi = None
+
+        first_hit_any = np.full((F, A, R), np.inf, dtype=np.float32)
+        first_hit_leaf = np.full((F, A, R), np.inf, dtype=np.float32)
+        first_hit_wood = np.full((F, A, R), np.inf, dtype=np.float32)
+
+        try:
+            ans_list = scene.list_intersections(o3c.Tensor(rays_FAR6, dtype=o3c.float32))
+
+            counts_leaf_multi = np.zeros((F, A, R), dtype=np.int32) if leaf_gids is not None else None
+            counts_wood_multi = np.zeros((F, A, R), dtype=np.int32) if wood_gids is not None else None
+            counts_all_multi = np.zeros((F, A, R), dtype=np.int32) 
+
+            # -------------------------
+            # Pattern 1: ragged dict
+            # -------------------------
+            if isinstance(ans_list, dict) and ("geometry_ids" in ans_list):
+                geom_ids = ans_list["geometry_ids"].numpy().astype(np.uint32)  # (K,)
+                ray_idx  = ans_list.get("ray_ids", None)
+                t_hits   = ans_list.get("t_hit", None)
+
+                if ray_idx is not None:
+                    ray_idx = ray_idx.numpy().astype(np.int64)  # (K,)
+
+                    # Map flat ray index -> (f,a,r)
+                    Ar = A * R
+                    f_idx = (ray_idx // Ar).astype(np.int64)
+                    a_idx = ((ray_idx % Ar) // R).astype(np.int64)
+                    r_idx = (ray_idx % R).astype(np.int64)
+
+                    # First-hit extraction and multi-hit count
+                    if t_hits is not None:
+                        t_hits = t_hits.numpy().astype(np.float32)  # (K,)
+
+                        if leaf_gids is not None:
+                            m_leaf = np.isin(geom_ids, np.asarray(leaf_gids, dtype=np.uint32))
+                            leaf_count = m_leaf.sum()
+                            if leaf_count > 0:
+                                # single
+                                np.minimum.at(first_hit_leaf, (f_idx[m_leaf], a_idx[m_leaf], r_idx[m_leaf]), t_hits[m_leaf])
+                                # multi
+                                counts = np.bincount(ray_idx[m_leaf], minlength=F*A*R).astype(np.int32)
+                                counts_leaf_multi[...] = counts.reshape(F, A, R)
+
+                        if wood_gids is not None:
+                            m_wood = np.isin(geom_ids, np.asarray(wood_gids, dtype=np.uint32))
+                            wood_count = m_wood.sum()
+                            if wood_count > 0:
+                                np.minimum.at(first_hit_wood, (f_idx[m_wood], a_idx[m_wood], r_idx[m_wood]), t_hits[m_wood])
+                                counts = np.bincount(ray_idx[m_wood], minlength=F*A*R).astype(np.int32)
+                                counts_wood_multi[...] = counts.reshape(F, A, R)
+
+                        # Combined first hit of either class:
+                        if (leaf_gids is None and wood_gids is None) or include_all_points:
+                            # No specified classification, use ALL hits for first_hit_any:
+                            np.minimum.at(first_hit_any, (f_idx, a_idx, r_idx), t_hits)
+                            counts = np.bincount(ray_idx, minlength=F*A*R).astype(np.int32)
+                            counts_all_multi[...] = counts.reshape(F, A, R)
+                        else:
+                            any_gids = []
+                            if leaf_gids is not None:
+                                any_gids.extend(np.atleast_1d(np.asarray(leaf_gids, dtype=np.uint32)))
+                            if wood_gids is not None:
+                                any_gids.extend(np.atleast_1d(np.asarray(wood_gids, dtype=np.uint32)))
+                            if any_gids:
+                                m_any = np.isin(geom_ids, np.asarray(any_gids, dtype=np.uint32))
+                                if m_any.sum() > 0:
+                                    np.minimum.at(first_hit_any, (f_idx[m_any], a_idx[m_any], r_idx[m_any]), t_hits[m_any])
+                                    counts = np.bincount(ray_idx[m_any], minlength=F*A*R).astype(np.int32)
+                                    counts_all_multi[...] = counts.reshape(F, A, R)
+
+                    # DEBUG
+                    if DEBUG_MODE:
+                        ray_splits = ans_list.get("ray_splits", None)
+                        if ray_splits is not None:
+                            rs = ray_splits.numpy().astype(np.int64)
+                            gt_all = np.diff(rs).reshape(F, A, R)
+
+                            mism = (counts_all_multi != gt_all)
+                            if mism.any():
+                                bad = np.argwhere(mism)
+                                for f, a, r in bad[:5]:
+                                    print(f"[DEBUG] mismatch @ (f={f}, a={a}, r-{r}: bincount={counts_all_multi[f,a,r]}, splits={gt_all[f,a,r]})")
+                            else:
+                                print(f"[DEBUG] bincount matches ray_splits across {gt_all.size} rays.")
+                    # cleanup
+                    del f_idx, a_idx, r_idx
+                    gc.collect()
+
+            # -------------------------
+            # Pattern 2: list/tuple per-ray
+            # -------------------------
+            elif isinstance(ans_list, (list, tuple)) and (len(ans_list) == F * A * R):
+                idx = 0
+                for f in range(F):
+                    for a in range(A):
+                        for r in range(R):
+                            item = ans_list[idx]
+                            idx += 1
+
+                            # Accept a few shapes
+                            # Gather arrays (if missing, skip gracefully)
+                            if isinstance(item, dict):
+                                geom_ids = np.asarray(item.get("geometry_ids", []), dtype=np.uint32)
+                                t_arr    = np.asarray(item.get("t_hits", []), dtype=np.float32)
+                            else:
+                                geom_ids = np.asarray(getattr(item, "geometry_ids", []), dtype=np.uint32)
+                                t_arr    = np.asarray(getattr(item, "t_hits", []), dtype=np.float32)
+                            
+                            # First-hit extraction for this ray
+                            if t_arr.size > 0:
+                                if leaf_gids is not None:
+                                    m_leaf = np.isin(geom_ids, np.asarray(leaf_gids, dtype=np.uint32))
+                                    leaf_count = m_leaf.sum()
+                                    if leaf_count > 0:
+                                        first_hit_leaf[f, a, r] = min(first_hit_leaf[f, a, r], t_arr[m_leaf].min())
+                                        counts_leaf_multi[f, a, r] = int(leaf_count)
+                                        print(f"single: {first_hit_leaf[f, a, r]}, multi: {leaf_count}")
+                                if wood_gids is not None:
+                                    m_wood = np.isin(geom_ids, np.asarray(wood_gids, dtype=np.uint32))
+                                    wood_count = m_wood.sum()
+                                    if wood_count > 0:
+                                        first_hit_wood[f, a, r] = min(first_hit_wood[f, a, r], t_arr[m_wood].min())
+                                        counts_wood_multi[f, a, r] = int(wood_count)
+                                        print(f"single: {first_hit_wood[f, a, r]}, multi: {wood_count}")
+                                
+                                # Combined first hit of either class:
+                                if (leaf_gids is None and wood_gids is None) or include_all_points:
+                                    # No specified classification, use ALL hits for first_hit_any:
+                                    first_hit_any[f, a, r] = min(first_hit_any[f, a, r], t_arr.min())
+                                    counts_all_multi[f, a, r] = int(t_arr.count())
+                                else:
+                                    m_any = np.isin(geom_ids, np.concatenate([
+                                        np.asarray(leaf_gids, dtype=np.uint32) if leaf_gids is not None else np.array([], dtype=np.uint32),
+                                        np.asarray(wood_gids, dtype=np.uint32) if wood_gids is not None else np.array([], dtype=np.uint32)
+                                    ]))
+                                    if m_any.sum() > 0:
+                                        first_hit_any[f, a, r] = min(first_hit_any[f, a, r], t_arr[m_any].min())
+                                        counts_all_multi[f, a, r] = int(m_any.sum())
+
+                            # Multi-hit class counts for this ray (count ALL hits, not just first)
+                            if counts_leaf_multi is not None and leaf_gids is not None and geom_ids.size:
+                                counts_leaf_multi[f, a, r] = int(np.isin(geom_ids, leaf_gids).sum())
+                            if counts_wood_multi is not None and wood_gids is not None and geom_ids.size:
+                                counts_wood_multi[f, a, r] = int(np.isin(geom_ids, wood_gids).sum())
 
             else:
-                raise ValueError(f"Unknown scene type: {scene}")
+                # Unknown structure; keep defaults (no per-class counts; first_hits remain inf)
+                pass
+
+        except Exception as e:
+            print(f"[warn] raycasting failed: -- {e}")
+            raise e
+
+        ## --- Shared statistics --- ##
+        # Number of rays is the same for first hit and multi hit calculations
+        N = valid_rays_mask.sum(axis=2).astype(np.int32)  # (F,A)
+
+        ## --- First Hit Statistics --- ##
+        # Valid hits (~np.inf) inside voxel slab (as before)
+        valid_leaf_hits_mask = np.isfinite(first_hit_leaf) & valid_rays_mask
+        valid_wood_hits_mask = np.isfinite(first_hit_wood) & valid_rays_mask
+        valid_all_hits_mask = np.isfinite(first_hit_any) & valid_rays_mask
+
+        # Count hits for each class (for BL approach to CI)
+        n_hits_all = valid_all_hits_mask.sum(axis=2)  # (F,A)
+        n_hits_leaf = valid_leaf_hits_mask.sum(axis=2)  # (F,A)
+        n_hits_wood = valid_wood_hits_mask.sum(axis=2)  # (F,A)
+
+        # Potential path length, free path length, and effective path length
+        def mean_var_ddof1(x, N):
+            mx = x.sum(axis=2)
+            mean = np.divide(mx, N, out=np.zeros_like(mx), where=(N > 0))
+            mx2 = (x**2).sum(axis=2)
+            numer = mx2 - (mx * mx) / np.maximum(N, 1)
+            denom = np.maximum(N - 1, 1)
+            var = numer / denom
+            var[(N <= 1)] = 0.0
+            return mean, var
+
+        # potential path lengths don't change for any first_hit condition
+        path_lengths = np.zeros_like(t_far, dtype=np.float32)
+        path_lengths[valid_rays_mask] = (t_far[valid_rays_mask] - t_near[valid_rays_mask])
+
+        # free path length is path_length for no hit, otherwise it's the distance to the first hit and is done for each class separately
+        free_path_length_all = path_lengths.copy()
+        free_path_length_all[valid_all_hits_mask] = first_hit_any[valid_all_hits_mask] - t_near[valid_all_hits_mask]
+        free_path_length_leaf = path_lengths.copy()
+        free_path_length_leaf[valid_leaf_hits_mask] = first_hit_leaf[valid_leaf_hits_mask] - t_near[valid_leaf_hits_mask]
+        free_path_length_wood = path_lengths.copy()
+        free_path_length_wood[valid_wood_hits_mask] = first_hit_wood[valid_wood_hits_mask] - t_near[valid_wood_hits_mask]
+
+        # effective free path length is the free path length corrected using lambda_1 (a function of average leaf size and voxel size)
+        eff_free_path_length_all = np.zeros_like(free_path_length_all, dtype=np.float32)
+        eff_free_path_length_all[valid_rays_mask] = compute_efpl_array(
+            free_path_length_all[valid_rays_mask], lambda_1
+        ).astype(np.float32)
+        eff_free_path_length_leaf = np.zeros_like(free_path_length_leaf, dtype=np.float32)
+        eff_free_path_length_leaf[valid_rays_mask] = compute_efpl_array(
+            free_path_length_leaf[valid_rays_mask], lambda_1
+        ).astype(np.float32)
+        eff_free_path_length_wood = np.zeros_like(free_path_length_wood, dtype=np.float32)
+        eff_free_path_length_wood[valid_rays_mask] = compute_efpl_array(
+            free_path_length_wood[valid_rays_mask], lambda_1
+        ).astype(np.float32)
+
+        # Aggregate useful statistics for each path length approach
+        sum_path_length = path_lengths.sum(axis=2)
+        mean_path_length = np.divide(sum_path_length, N, out=np.zeros_like(sum_path_length), where=(N > 0))
+
+        sum_free_path_length_all = free_path_length_all.sum(axis=2)
+        mean_free_path_length_all = np.divide(sum_free_path_length_all, N, out=np.zeros_like(sum_free_path_length_all), where=(N > 0))
+        sum_free_path_length_leaf = free_path_length_leaf.sum(axis=2)
+        mean_free_path_length_leaf = np.divide(sum_free_path_length_leaf, N, out=np.zeros_like(sum_free_path_length_leaf), where=(N > 0))
+        sum_free_path_length_wood = free_path_length_wood.sum(axis=2)
+        mean_free_path_length_wood = np.divide(sum_free_path_length_wood, N, out=np.zeros_like(sum_free_path_length_wood), where=(N > 0))
+
+        sum_eff_free_path_length_all = eff_free_path_length_all.sum(axis=2)
+        mean_eff_free_path_length_all = np.divide(sum_eff_free_path_length_all, N, out=np.zeros_like(sum_eff_free_path_length_all), where=(N > 0))
+        var_eff_free_path_length_all = np.zeros_like(mean_eff_free_path_length_all)
+        _, var_eff_free_path_length_all = mean_var_ddof1(eff_free_path_length_all, N)
+        sum_eff_free_path_length_leaf = eff_free_path_length_leaf.sum(axis=2)
+        mean_eff_free_path_length_leaf = np.divide(sum_eff_free_path_length_leaf, N, out=np.zeros_like(sum_eff_free_path_length_leaf), where=(N > 0))
+        var_eff_free_path_length_leaf = np.zeros_like(mean_eff_free_path_length_leaf)
+        _, var_eff_free_path_length_leaf = mean_var_ddof1(eff_free_path_length_leaf, N)
+        sum_eff_free_path_length_wood = eff_free_path_length_wood.sum(axis=2)
+        mean_eff_free_path_length_wood = np.divide(sum_eff_free_path_length_wood, N, out=np.zeros_like(sum_eff_free_path_length_wood), where=(N > 0))
+        var_eff_free_path_length_wood = np.zeros_like(mean_eff_free_path_length_wood)
+        _, var_eff_free_path_length_wood = mean_var_ddof1(eff_free_path_length_wood, N)
+        sum_hits_eff_free_path_length_all = (eff_free_path_length_all * valid_all_hits_mask).sum(axis=2)
+        sum_hits_eff_free_path_length_leaf = (eff_free_path_length_leaf * valid_leaf_hits_mask).sum(axis=2)
+        sum_hits_eff_free_path_length_wood = (eff_free_path_length_wood * valid_wood_hits_mask).sum(axis=2)
+
+        # Build dx, dy, dz for each ray (for potential later use in angle-based analyses or debugging)
+        dirs = D[:, :, 0, :] # (F,A,R,3) Use first ray for directions
+        norms = np.linalg.norm(dirs, axis=2, keepdims=True)
+        dirs = dirs / np.maximum(norms, 1e-12)
+        dx = dirs[:, :, 0].astype(np.float32)
+        dy = dirs[:, :, 1].astype(np.float32)
+        dz = dirs[:, :, 2].astype(np.float32)
+        viewing_angles = np.degrees(np.arccos(np.clip(np.abs(dz), 0.0, 1.0))).astype(np.float32)  # Zenith angle in degrees between 0 and 90
+
+        # Calculate G function values for each class if bins and distributions are available; otherwise, set to None
+        if liad is not None and liad.size > 0 and bin_leaf.size > 0:
+            G_leaf = calculate_G(viewing_angles.ravel(), bin_leaf, liad).reshape(viewing_angles.shape).astype(np.float32, copy=False)
+        if wiad is not None and wiad.size > 0:
+            G_wood = calculate_G(viewing_angles.ravel(), bin_wood, wiad).reshape(viewing_angles.shape).astype(np.float32, copy=False)
+        if piad is not None and piad.size > 0:
+            G_all = calculate_G(viewing_angles.ravel(), bin_all, piad).reshape(viewing_angles.shape).astype(np.float32, copy=False)
+
+        # Calculate first hit pgap
+        pgap_all = 1.0 - (n_hits_all / np.maximum(N, 1))
+        pgap_leaf = 1.0 - (n_hits_leaf / np.maximum(N, 1))
+        pgap_wood = 1.0 - (n_hits_wood / np.maximum(N, 1))
+
+        # Vectorized CI calculation for all (F, A) combinations        # We will add multi-hit statistics to these dictionaries if counts_leaf_multi and counts_wood_multi are available; otherwise, we return only first-hit-based statistics.
+        CI_all = np.full((F, A), np.nan, dtype=np.float32)
+        CI_leaf = np.full((F, A), np.nan, dtype=np.float32)
+        CI_wood = np.full((F, A), np.nan, dtype=np.float32)
+
+        # Compute CI where valid
+        if PAD is not None and PAD > 0:
+            valid_ci_all = (pgap_all > 0) & (pgap_all < 1) & (G_all > 0) & (mean_path_length > 0)
+            CI_all[valid_ci_all] = (-np.log(pgap_all[valid_ci_all]) / (G_all[valid_ci_all] * PAD * mean_path_length[valid_ci_all])).astype(np.float32)
+
+        if LAD is not None and LAD > 0:
+            valid_ci_leaf = (pgap_leaf > 0) & (pgap_leaf < 1) & (G_leaf > 0) & (mean_path_length > 0)
+            CI_leaf[valid_ci_leaf] = (-np.log(pgap_leaf[valid_ci_leaf]) / (G_leaf[valid_ci_leaf] * LAD * mean_path_length[valid_ci_leaf])).astype(np.float32)
+
+        if WAD is not None and WAD > 0:
+            valid_ci_wood = (pgap_wood > 0) & (pgap_wood < 1) & (G_wood > 0) & (mean_path_length > 0)
+            CI_wood[valid_ci_wood] = (-np.log(pgap_wood[valid_ci_wood]) / (G_wood[valid_ci_wood] * WAD * mean_path_length[valid_ci_wood])).astype(np.float32)
+        # ------------------------------------------------------------
+        # Create return arrays for stats
+        
+        # insert common metrics for leaf, wood, and all conditions
+        # stats = dict(
+
+        # )
+
+        # stats_comb = [[None for _ in range(A)] for _ in range(F)]
+        # for f in range(F):
+        #     for a in range(A):
+        #         stats_comb[f][a] = dict(
+        #             N=int(N[f, a]),
+        #             n_hits=int(n_hits_all[f, a]),
+        #             I=(float(n_hits_all[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
+        #             mean_path_length=float(mean_path_length[f, a]),
+        #             sum_path_length=float(sum_path_length[f, a]),
+        #             sum_free_path_length=float(sum_free_path_length_all[f, a]),
+        #             mean_free_path_length=float(mean_free_path_length_all[f, a]),
+        #             mean_eff_free_path_length=float(mean_eff_free_path_length_all[f, a]),
+        #             var_eff_free_path_length=float(var_eff_free_path_length_all[f, a]),
+        #             sum_eff_free_path_length=float(np.sum(eff_free_path_length_all[f, a, :])),
+        #             sum_hits_eff_free_path_length=float(sum_hits_eff_free_path_length_all[f, a]),
+        #         )
+
+        # stats_leaf = [[None for _ in range(A)] for _ in range(F)]
+        # for f in range(F):
+        #     for a in range(A):
+        #         leaf_dict = dict(
+        #             N=int(N[f, a]),
+        #             n_hits=int(n_hits_leaf[f, a]),
+        #             I=(float(n_hits_leaf[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
+        #             mean_path_length=float(mean_path_length[f, a]),
+        #             sum_path_length=float(sum_path_length[f, a]),
+        #             sum_free_path_length=float(sum_free_path_length_leaf[f, a]),
+        #             mean_free_path_length=float(mean_free_path_length_leaf[f, a]),
+        #             mean_eff_free_path_length=float(mean_eff_free_path_length_leaf[f, a]),
+        #             var_eff_free_path_length=float(var_eff_free_path_length_leaf[f, a]),
+        #             sum_eff_free_path_length=float(sum_eff_free_path_length_leaf[f, a]),
+        #             sum_hits_eff_free_path_length=float(sum_hits_eff_free_path_length_leaf[f, a]),
+        #         )
+        #         stats_leaf[f][a] = leaf_dict
+
+
+        # stats_wood = [[None for _ in range(A)] for _ in range(F)]
+        # for f in range(F):
+        #     for a in range(A):
+        #         wood_dict = dict(
+        #             N=int(N[f, a]),
+        #             n_hits=int(n_hits_wood[f, a]),
+        #             I=(float(n_hits_wood[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
+        #             mean_path_length=float(mean_path_length[f, a]),
+        #             sum_path_length=float(sum_path_length[f, a]),
+        #             sum_free_path_length=float(sum_free_path_length_wood[f, a]),
+        #             mean_free_path_length=float(mean_free_path_length_wood[f, a]),
+        #             mean_eff_free_path_length=float(mean_eff_free_path_length_wood[f, a]),
+        #             var_eff_free_path_length=float(var_eff_free_path_length_wood[f, a]),
+        #             sum_eff_free_path_length=float(np.sum(eff_free_path_length_wood[f, a, :])),
+        #             sum_hits_eff_free_path_length=float(sum_hits_eff_free_path_length_wood[f, a]),
+        #             mean_eff_free_path_length_free=float(mean_eff_free_path_length_wood[f, a]),
+        #             var_eff_free_path_length_free=float(var_eff_free_path_length_wood[f, a])
+        #         )
+        #         stats_wood[f][a] = wood_dict
+
+        # ------------------------------------------------------------
+        # MULTI-HIT (Option A/B) per (face, angle) — unchanged wiring
+        # (Now uses counts_all_multi / counts_leaf_multi / counts_wood_multi if present)
+        # ------------------------------------------------------------
+        
+        ## --- Helper Functions --- ##
+        # Combinatorial bases (no factorials in hot loops)
+        def _build_pascal_table(n_max: int) -> np.ndarray:
+            C = np.zeros((n_max + 1, n_max + 1), dtype=np.float64)
+            C[0, 0] = 1.0
+            for n in range(1, n_max + 1):
+                C[n, 0] = 1.0
+                for k in range(1, n + 1):
+                    C[n, k] = C[n - 1, k - 1] + (C[n - 1, k] if k <= n - 1 else 0.0)
+            return C
+
+        # Precompute B[j, n, k] = C(n, k) * (1-ω_j)^(n-k) for all ω_j in the grid and n,k up to n_max.
+        def _precompute_B_omegas(omega_grid: np.ndarray, n_max: int, C: np.ndarray) -> np.ndarray:
+            O = omega_grid.size
+            B = np.zeros((O, n_max + 1, n_max + 1), dtype=np.float64)
+            for j, om in enumerate(omega_grid):
+                one_minus = 1.0 - om
+                powers = one_minus ** np.arange(0, n_max + 1)  # 0..n_max
+                for n in range(1, n_max + 1):
+                    k_idx = np.arange(1, n + 1)
+                    B[j, n, k_idx] = C[n - 1, k_idx - 1] * powers[n - k_idx]
+            return B
+
+        # Precompute T[k] = ( (ωλ)^k / k! ) for k=0..n_max for given ol=ωλ; T[0]=0.
+        def _compute_T_vec(ol: float, n_max: int) -> np.ndarray:
+            """T[k] = ( (ωλ)^k / k! ), k>=1; T[0]=0."""
+            T = np.zeros(n_max + 1, dtype=np.float64)
+            if n_max >= 1:
+                T[1] = ol
+                for k in range(2, n_max + 1):
+                    T[k] = T[k - 1] * ol / k
+            return T
+
+        # PMF table (log-space)
+        class LogPMFCache:
+            """
+            Cache of log P(n | λ_i, ω_j) for n=0..n_max and the entire (λ,ω) grid.
+            Reuse this across combined / leaf / wood to avoid recomputation.
+            """
+            def __init__(self, lam_grid: np.ndarray, omega_grid: np.ndarray, n_max: int):
+                self.lam_grid = lam_grid.astype(np.float64)
+                self.omega_grid = omega_grid.astype(np.float64)
+                self.n_max = int(n_max)
+                self.logP_all = None  # shape (n_max+1, G) where G = L*O
+
+                self._build()
+
+            def _build(self):
+                L = self.lam_grid.size
+                O = self.omega_grid.size
+                G = L * O
+                C = _build_pascal_table(self.n_max)
+                B = _precompute_B_omegas(self.omega_grid, self.n_max, C)
+
+                logP_all = np.empty((self.n_max + 1, G), dtype=np.float64)
+                eps = 1e-300
+                idx = 0
+                for i in range(L):
+                    lam = float(self.lam_grid[i])
+                    e_neg = np.exp(-lam)
+                    for j in range(O):
+                        om = float(self.omega_grid[j])
+                        ol = om * lam
+                        T = _compute_T_vec(ol, self.n_max)
+                        ssum = B[j] @ T  # length (n_max+1); ssum[0] = 0
+                        p = np.empty(self.n_max + 1, dtype=np.float64)
+                        p[0] = e_neg
+                        if self.n_max >= 1:
+                            p[1:] = e_neg * ssum[1:]
+                        logP_all[:, idx] = np.log(np.maximum(p, eps))
+                        idx += 1
+                self.logP_all = logP_all
+
+        # Histogram builder
+        def build_histograms(counts_FAR: np.ndarray,
+                            valid_mask_FAR: np.ndarray,
+                            n_max: int) -> np.ndarray:
+            F, A, R = counts_FAR.shape
+            M = F * A
+            counts = counts_FAR.reshape(M, R)
+            mask = valid_mask_FAR.reshape(M, R)
+            H = np.zeros((M, n_max + 1), dtype=np.int64)
+            flat_indices = np.arange(M)[:, None] * (n_max + 1) + counts
+            flat_indices = flat_indices[mask]
+            flat_counts = np.bincount(flat_indices, minlength=M * (n_max + 1))
+            H = flat_counts.reshape(M, n_max + 1)
+            return H
+
+        # Batched MLE (one matmul + argmax)
+        def mle_clustered_batched_np(counts_FAR: np.ndarray,
+                                    valid_mask_FAR: np.ndarray,
+                                    lam_grid: np.ndarray,
+                                    omega_grid: np.ndarray,
+                                    precomputed: LogPMFCache | None = None):
+            # max observed count across valid rays
+            n_max = int(np.max(np.where(valid_mask_FAR, counts_FAR, 0)))
+            n_max = max(n_max, 0)
+
+            cache = precomputed
+            if (cache is None or
+                cache.n_max != n_max or
+                cache.lam_grid.shape != lam_grid.shape or
+                cache.omega_grid.shape != omega_grid.shape or
+                np.any(cache.lam_grid != lam_grid) or
+                np.any(cache.omega_grid != omega_grid)):
+                cache = LogPMFCache(lam_grid, omega_grid, n_max)
+
+            H = build_histograms(counts_FAR.astype(np.int32), valid_mask_FAR, n_max)     # (M, n_max+1)
+            LL_all = H.astype(np.float64).dot(cache.logP_all)                            # (M, G)
+
+            best_idx = np.argmax(LL_all, axis=1)
+            L = lam_grid.size
+            O = omega_grid.size
+            lam_idx = best_idx // O
+            omg_idx = best_idx % O
+
+            best_lambda = lam_grid[lam_idx]
+            best_omega  = omega_grid[omg_idx]
+            best_ll     = LL_all[np.arange(LL_all.shape[0]), best_idx]
+
+            return best_lambda, best_omega, best_ll, cache
+        
+        # Main function for multi-hit stats computation per (F,A) using the above helpers
+        def _compute_multihit_stats(counts_FAR, valid_rays_mask_FA, F, A,
+                                    lam_grid=None, omega_grid=None):
+            global _PMF_CACHE, _PMF_N_MAX
+
+            if lam_grid is None:
+                lam_grid = np.linspace(1e-3, 3.0, 60)
+            if omega_grid is None:
+                omega_grid = np.linspace(1e-3, 0.999, 60)
+
+            # Basic per-(F,A) stats (vectorized)
+            n_rays_multihit = valid_rays_mask_FA.sum(axis=2).astype(np.int32)
+            safeN = np.maximum(n_rays_multihit, 1)
+            masked = np.where(valid_rays_mask_FA, counts_FAR, 0)
+
+            sum_x  = masked.sum(axis=2).astype(np.float64)
+            sum_x2 = (masked**2).sum(axis=2).astype(np.float64)
+
+            mean_count = sum_x / safeN
+            var_count = np.zeros_like(mean_count, dtype=np.float64)
+            has2 = n_rays_multihit > 1
+            var_count[has2] = (sum_x2[has2] - (sum_x[has2]**2) / n_rays_multihit[has2]) / (n_rays_multihit[has2] - 1)
+
+            pgap_multi = np.zeros_like(mean_count, dtype=np.float64)
+            nz = n_rays_multihit > 0
+            pgap_multi[nz] = (np.where(valid_rays_mask_FA[nz], counts_FAR[nz] == 0, False).sum(axis=1)) / n_rays_multihit[nz]
+
+            lambda_eff = mean_count.copy()
+
+            # ---- Batched MLE for all directions (no loops) ----
+            lam_hat_flat, omg_hat_flat, ll_hat_flat, cache = mle_clustered_batched_np(
+                counts_FAR, valid_rays_mask_FA, lam_grid, omega_grid, precomputed=_PMF_CACHE
+            )
+            _PMF_CACHE = cache
+            _PMF_N_MAX = max(_PMF_N_MAX, cache.n_max)
+            lambda_B = lam_hat_flat.reshape(F, A)
+            omega_B  = omg_hat_flat.reshape(F, A)
+            loglik_B = ll_hat_flat.reshape(F, A)
+
+            # Assemble result in your existing dict shape
+            multi_stats = {
+                "pgap_multi": pgap_multi,
+                "mean_count": mean_count,
+                "var_count": var_count,
+                "lambda_eff": lambda_eff,
+                "lambda_B": lambda_B,
+                "omega_B": omega_B,
+                "loglik_B": loglik_B
+            }
+
+            return multi_stats
+
+        ## --- Initialise grids --- ##
+        lam_grid = _LAM_GRID
+        omega_grid = _OMEGA_GRID
+
+        if counts_all_multi is not None:
+            multihit_stats_all = _compute_multihit_stats(
+                counts_all_multi, valid_rays_mask, F, A, lam_grid, omega_grid
+            )
+
+        if counts_leaf_multi is not None:
+            multihit_stats_leaf = _compute_multihit_stats(
+                counts_leaf_multi, valid_rays_mask, F, A, lam_grid, omega_grid
+            )
+
+        if counts_wood_multi is not None:
+            multihit_stats_wood = _compute_multihit_stats(
+                counts_wood_multi, valid_rays_mask, F, A, lam_grid, omega_grid
+            )
+
+        # Build and return numpy-only dict of results
+        def _as32(a, dtype):
+            x = np.asarray(a, dtype=dtype)
+            return np.ascontiguousarray(x)
+
+        FA = F * A
+
+        out = {
+            "dx": _as32(dx, np.float32), "dy": _as32(dy, np.float32), "dz": _as32(dz, np.float32),
+            "zenith_angle": _as32(viewing_angles, np.float32),
+            "num_rays": _as32(N, np.int32),
+            "mean_ppl": _as32(mean_path_length, np.float32),
+            "sum_ppl": _as32(sum_path_length, np.float32),
+
+            # First-hit stats
+            "num_hits_all": _as32(n_hits_all, np.int32),
+            "num_hits_leaf": _as32(n_hits_leaf, np.int32),
+            "num_hits_wood": _as32(n_hits_wood, np.int32),
+
+            # pgap/G and other gap related metrics
+            "pgap_all": _as32(pgap_all, np.float32),
+            "pgap_leaf": _as32(pgap_leaf, np.float32),
+            "pgap_wood": _as32(pgap_wood, np.float32),      
+            "G_all": _as32(G_all, np.float32),
+            "G_leaf": _as32(G_leaf, np.float32),
+            "G_wood": _as32(G_wood, np.float32),
+
+            # path length related metrics
+            "sum_fpl_all": _as32(sum_free_path_length_all, np.float32),
+            "mean_fpl_all": _as32(mean_free_path_length_all, np.float32),
+            "sum_fpl_leaf": _as32(sum_free_path_length_leaf, np.float32),
+            "mean_fpl_leaf": _as32(mean_free_path_length_leaf, np.float32),
+            "sum_fpl_wood": _as32(sum_free_path_length_wood, np.float32),
+            "mean_fpl_wood": _as32(mean_free_path_length_wood, np.float32),
+
+            "sum_efpl_all": _as32(sum_eff_free_path_length_all, np.float32),
+            "sum_efpl_hits_all": _as32(sum_hits_eff_free_path_length_all, np.float32),
+            "mean_efpl_all": _as32(mean_eff_free_path_length_all, np.float32),
+            "var_efpl_all": _as32(var_eff_free_path_length_all, np.float32),
+            "sum_efpl_leaf": _as32(sum_eff_free_path_length_leaf, np.float32),
+            "sum_efpl_hits_leaf": _as32(sum_hits_eff_free_path_length_leaf, np.float32),
+            "mean_efpl_leaf": _as32(mean_eff_free_path_length_leaf, np.float32),
+            "var_efpl_leaf": _as32(var_eff_free_path_length_leaf, np.float32),
+            "sum_efpl_wood": _as32(sum_eff_free_path_length_wood, np.float32),
+            "sum_efpl_hits_wood": _as32(sum_hits_eff_free_path_length_wood, np.float32),
+            "mean_efpl_wood": _as32(mean_eff_free_path_length_wood, np.float32),
+            "var_efpl_wood": _as32(var_eff_free_path_length_wood, np.float32)
+        }
+
+        def _attach_multihit(suffix, stats_dict):
+            if stats_dict is None:
+                return
+            
+            out[f"pgap_multi_{suffix}"] = _as32(stats_dict["pgap_multi"], np.float32)
+            out[f"mean_count_{suffix}"] = _as32(stats_dict["mean_count"], np.float32),
+            out[f"var_count_{suffix}"] = _as32(stats_dict["var_count"], np.float32),
+            out[f"lambda_eff_{suffix}"] = _as32(stats_dict["lambda_eff"], np.float32),
+            out[f"lambda_B_{suffix}"] = _as32(stats_dict["lambda_B"], np.float32),
+            out[f"Omega_B_{suffix}"] = _as32(stats_dict["Omega_B"], np.float32),
+            out[f"loglik_B_{suffix}"] = _as32(stats_dict["loglik_B"], np.float32)
+
+        _attach_multihit("all", multihit_stats_all if 'multi_stats_all' in locals() else None)
+        _attach_multihit("leaf", multihit_stats_leaf if 'multi_stats_leaf' in locals() else None)
+        _attach_multihit("wood", multihit_stats_wood if 'multi_stats_wood' in locals() else None)
+
+        return out
+
+    try:
+
+        voxel_scene, leaf_gid, wood_gid = build_voxel_scene(o3d_leaf, o3d_wood)
     
-            # Use simulate_voxel_grouped for vectorized stats computation
-            stats_comb_grouped, stats_leaf_grouped, stats_wood_grouped = simulate_voxel_grouped_with_multi(
-            voxel_scene, leaf_gid, wood_gid,
-            voxel_center, voxel_size,
-            rays_FAR6, lambda_1)
+        # Use simulate_voxel_grouped for vectorized stats computation
+        stats = simulate_voxel_grouped_with_multi(
+        voxel_scene, leaf_gid, wood_gid)
 
-            try:
-                for f_idx, face_lbl in enumerate(face_order):
-                    for a_idx, angle in enumerate(angles_sorted):
-                        dx = rays_FAR6[f_idx, a_idx, 0, 3]
-                        dy = rays_FAR6[f_idx, a_idx, 0, 4]
-                        dz = rays_FAR6[f_idx, a_idx, 0, 5]
-
-                        comb_data = stats_comb_grouped[f_idx][a_idx]
-                        leaf_data = stats_leaf_grouped[f_idx][a_idx]
-                        wood_data = stats_wood_grouped[f_idx][a_idx]
-
-                        if comb_data["N"] == 0:
-                            comb_data = {k: np.nan for k in comb_data}
-                        if leaf_data["N"] == 0:
-                            leaf_data = {k: np.nan for k in leaf_data}
-                        if wood_data["N"] == 0:
-                            wood_data = {k: np.nan for k in wood_data}
-
-                        ### G ###
-                        # Convert dz to zenith angle in degrees
-                        # Normalize direction vector and extract zenith angle
-                        dir_norm = math.sqrt(dx**2 + dy**2 + dz**2)
-                        zenith_angle = math.degrees(math.acos(abs(dz) / dir_norm)) if dir_norm > 0 else 0.0
-
-                        G_leaf_est = np.nan
-                        if bin_leaf.size > 0:
-                            G_leaf_est = compute_G_function_binwise([zenith_angle], bin_leaf, liad)[0]
-
-                        G_wood_est = np.nan
-                        if bin_wood.size > 0:
-                            G_wood_est = compute_G_function_binwise([zenith_angle], bin_wood, wiad)[0]
-
-                        G_comb_est = np.nan
-                        if bin_comb.size > 0:
-                            G_comb_est = compute_G_function_binwise([zenith_angle], bin_comb, piad)[0]
-
-                        ### pgap ###
-                        pgap_leaf = 1.0 - leaf_data["I"]
-                        pgap_wood = 1.0 - wood_data["I"]
-                        pgap_comb = 1.0 - comb_data["I"]
-
-                        ### CI from G ###
-                        CI_leaf = (-math.log(pgap_leaf) / (G_leaf_est * LAD * leaf_data["mean_path_length"])
-                            if (LAD is not None and LAD > 0 and G_leaf_est > 0 and
-                                0 < pgap_leaf < 1 and leaf_data["mean_path_length"] is not None and leaf_data["mean_path_length"] > 0) else np.nan)
-                        CI_wood = (-math.log(pgap_wood) / (G_wood_est * WAD * wood_data["mean_path_length"])
-                            if (WAD is not None and WAD > 0 and G_wood_est > 0 and
-                                0 < pgap_wood < 1 and wood_data["mean_path_length"] is not None and wood_data["mean_path_length"] > 0) else np.nan)
-                        CI_comb = (-math.log(pgap_comb) / (G_comb_est * PAD * comb_data["mean_path_length"])
-                            if (PAD is not None and PAD > 0 and G_comb_est > 0 and
-                                0 < pgap_comb < 1 and comb_data["mean_path_length"] is not None and comb_data["mean_path_length"] > 0) else np.nan)
-                        
-                        ### data prep ###
-                        leaf_fraction = (leaf_data["n_hits"] / comb_data["n_hits"]
-                                if comb_data["n_hits"] else np.nan)
-                        wood_fraction = (wood_data["n_hits"] / comb_data["n_hits"]
-                                if comb_data["n_hits"] else np.nan)
-                        
-                        row = {
-                            "voxel_cx": float(voxel_center[0]), "voxel_cy": float(voxel_center[1]), "voxel_cz": float(voxel_center[2]),
-                            "face": face_lbl, "zenith_angle": zenith_angle,
-                            "dx": dx, "dy": dy, "dz": dz,
-                            # reference densities
-                            "LAI_ref": float(LAI) if LAI is not None else np.nan, 
-                            "WAI_ref": float(WAI) if WAI is not None else np.nan,
-                            "PAI_ref": float(PAI) if PAI is not None else np.nan,
-                            "LAD_ref": float(LAD) if LAD is not None else np.nan,
-                            "WAD_ref": float(WAD) if WAD is not None else np.nan,
-                            "PAD_ref": float(PAD) if PAD is not None else np.nan,
-                            # ray and hit values
-                            "total_num_rays": int(comb_data["N"]) if comb_data["N"] is not None else np.nan,
-                            "total_num_hits": int(comb_data["n_hits"]) if comb_data["n_hits"] is not None else np.nan,
-                            "total_missed_rays": int(comb_data["N"] - comb_data["n_hits"]) if comb_data["N"] is not None and comb_data["n_hits"] is not None else np.nan,
-                            # hits per component
-                            "n_hits_leaf": int(leaf_data["n_hits"]) if (leaf_data["n_hits"] is not None and not np.isnan(leaf_data["n_hits"])) else np.nan,
-                            "n_hits_wood": int(wood_data["n_hits"]) if (wood_data["n_hits"] is not None and not np.isnan(wood_data["n_hits"])) else np.nan,
-                            "n_hits_comb": int(comb_data["n_hits"]) if (comb_data["n_hits"] is not None and not np.isnan(comb_data["n_hits"])) else np.nan,
-                            # observed I
-                            "I_leaf": float(leaf_data["I"]) if leaf_data["I"] is not None else np.nan,
-                            "I_wood": float(wood_data["I"]) if wood_data["I"] is not None else np.nan,
-                            "I_comb": float(comb_data["I"]) if comb_data["I"] is not None else np.nan,
-                            # observed pgap
-                            "pgap_leaf": float(pgap_leaf) if not np.isnan(pgap_leaf) else np.nan,
-                            "pgap_wood": float(pgap_wood) if not np.isnan(pgap_wood) else np.nan,
-                            "pgap_comb": float(pgap_comb) if not np.isnan(pgap_comb) else np.nan,
-                            # path length
-                            "mean_path_length_leaf": float(leaf_data["mean_path_length"]) if leaf_data["mean_path_length"] is not None else np.nan,
-                            "mean_path_length_wood": float(wood_data["mean_path_length"]) if wood_data["mean_path_length"] is not None else np.nan,
-                            "mean_path_length_comb": float(comb_data["mean_path_length"]) if comb_data["mean_path_length"] is not None else np.nan,
-                            # free path length
-                            "mean_free_path_length_leaf": float(leaf_data["mean_free_path_length"]) if leaf_data["mean_free_path_length"] is not None else np.nan,
-                            "mean_free_path_length_wood": float(wood_data["mean_free_path_length"]) if wood_data["mean_free_path_length"] is not None else np.nan,
-                            "mean_free_path_length_comb": float(comb_data["mean_free_path_length"]) if comb_data["mean_free_path_length"] is not None else np.nan,
-                            # effective free path length
-                            "mean_eff_free_path_length_leaf": float(leaf_data["mean_eff_free_path_length"]) if leaf_data["mean_eff_free_path_length"] is not None else np.nan,
-                            "mean_eff_free_path_length_wood": float(wood_data["mean_eff_free_path_length"]) if wood_data["mean_eff_free_path_length"] is not None else np.nan,
-                            "mean_eff_free_path_length_comb": float(comb_data["mean_eff_free_path_length"]) if comb_data["mean_eff_free_path_length"] is not None else np.nan,
-                            # per-angle G
-                            "G_leaf_computed": float(G_leaf_est) if not np.isnan(G_leaf_est) else np.nan,
-                            "G_wood_computed":  float(G_wood_est) if not np.isnan(G_wood_est) else np.nan,
-                            "G_comb_computed":  float(G_comb_est) if not np.isnan(G_comb_est) else np.nan,
-                            # CI from true G(θ) 
-                            "CI_Leaf": float(CI_leaf) if not np.isnan(CI_leaf) else np.nan,
-                            "CI_Wood": float(CI_wood) if not np.isnan(CI_wood) else np.nan,
-                            "CI_Comb": float(CI_comb) if not np.isnan(CI_comb) else np.nan,
-                            "liad_json": json.dumps(liad.tolist()) if liad is not None else np.nan,
-                            "liad_dewit": liad_dewit,
-                            "liad_dewit_rmse": liad_dewit_rmse,
-                            "liad_dewit_l1": liad_dewit_l1,
-                            "wiad_json": json.dumps(wiad.tolist()) if wiad is not None else np.nan,
-                            "piad_json": json.dumps(piad.tolist()) if piad is not None else np.nan,
-                            "piad_dewit": piad_dewit,
-                            "piad_dewit_rmse": piad_dewit_rmse,
-                            "piad_dewit_l1": piad_dewit_l1,
-                            "alpha":   float(alpha) if alpha is not None else np.nan,
-                            "leaf_fraction": float(leaf_fraction) if not np.isnan(leaf_fraction) else np.nan,
-                            "wood_fraction": float(wood_fraction) if not np.isnan(wood_fraction) else np.nan,
-                            # multi-hit stats
-                            "n_rays_multihit_leaf": int(leaf_data.get("n_rays_multihit", np.nan)) if ("n_rays_multihit" in leaf_data and not np.isnan(leaf_data.get("n_rays_multihit", np.nan))) else np.nan,
-                            "pgap_count_leaf": float(leaf_data.get("pgap_count", np.nan)) if "pgap_count" in leaf_data else np.nan,
-                            "mean_count_leaf": float(leaf_data.get("mean_count", np.nan)) if "mean_count" in leaf_data else np.nan,
-                            "var_count_leaf": float(leaf_data.get("var_count", np.nan)) if "var_count" in leaf_data else np.nan,
-                            "lambda_eff_hat_poisson_leaf": float(leaf_data.get("lambda_eff_hat_poisson", np.nan)) if "lambda_eff_hat_poisson" in leaf_data else np.nan,
-                            "lambda_hat_clustered_leaf": float(leaf_data.get("lambda_hat_clustered", np.nan)) if "lambda_hat_clustered" in leaf_data else np.nan,
-                            "Omega_B_clustered_leaf": float(leaf_data.get("Omega_B_clustered", np.nan)) if "Omega_B_clustered" in leaf_data else np.nan,
-                            "loglik_B_leaf": float(leaf_data.get("loglik_B", np.nan)) if "loglik_B" in leaf_data else np.nan,
-                            "n_rays_multihit_wood": int(wood_data.get("n_rays_multihit", np.nan)) if ("n_rays_multihit" in wood_data and not np.isnan(wood_data.get("n_rays_multihit", np.nan))) else np.nan,
-                            "pgap_count_wood": float(wood_data.get("pgap_count", np.nan)) if "pgap_count" in wood_data else np.nan,
-                            "mean_count_wood": float(wood_data.get("mean_count", np.nan)) if "mean_count" in wood_data else np.nan,
-                            "var_count_wood": float(wood_data.get("var_count", np.nan)) if "var_count" in wood_data else np.nan,
-                            "lambda_eff_hat_poisson_wood": float(wood_data.get("lambda_eff_hat_poisson", np.nan)) if "lambda_eff_hat_poisson" in wood_data else np.nan,
-                            "lambda_hat_clustered_wood": float(wood_data.get("lambda_hat_clustered", np.nan)) if "lambda_hat_clustered" in wood_data else np.nan,
-                            "Omega_B_clustered_wood": float(wood_data.get("Omega_B_clustered", np.nan)) if "Omega_B_clustered" in wood_data else np.nan,
-                            "loglik_B_wood": float(wood_data.get("loglik_B", np.nan)) if "loglik_B" in wood_data else np.nan,
-                            "n_rays_multihit_comb": int(comb_data.get("n_rays_multihit", np.nan)) if ("n_rays_multihit" in comb_data and not np.isnan(comb_data.get("n_rays_multihit", np.nan))) else np.nan,
-                            "pgap_count_comb": float(comb_data.get("pgap_count", np.nan)) if "pgap_count" in comb_data else np.nan,
-                            "mean_count_comb": float(comb_data.get("mean_count", np.nan)) if "mean_count" in comb_data else np.nan,
-                            "var_count_comb": float(comb_data.get("var_count", np.nan)) if "var_count" in comb_data else np.nan,
-                            "lambda_eff_hat_poisson_comb": float(comb_data.get("lambda_eff_hat_poisson", np.nan)) if "lambda_eff_hat_poisson" in comb_data else np.nan,
-                            "lambda_hat_clustered_comb": float(comb_data.get("lambda_hat_clustered", np.nan)) if "lambda_hat_clustered" in comb_data else np.nan,
-                            "Omega_B_clustered_comb": float(comb_data.get("Omega_B_clustered", np.nan)) if "Omega_B_clustered" in comb_data else np.nan,
-                            "loglik_B_comb": float(comb_data.get("loglik_B", np.nan)) if "loglik_B" in comb_data else np.nan,
-                            
-                        }
-                        row['scene'] = scene
-
-                        all_results.append(row)
-
-            except Exception as e:
-                raise RuntimeError(
-                    f"Error processing grouped stats for voxel at {voxel_center}: {e}"
-                ) from e
+        # Generate metadata
+        metadata = {
+            "voxel_cx": voxel_center[0].astype(np.float32),
+            "voxel_cy": voxel_center[1].astype(np.float32),
+            "voxel_cz": voxel_center[2].astype(np.float32),
+            "voxel_size": voxel_size,
+            "alpha": alpha if alpha is not None else np.nan,
+            "LAI_ref": LAI if LAI is not None else np.nan,
+            "WAI_ref": WAI if WAI is not None else np.nan,
+            "PAI_ref": PAI if PAI is not None else np.nan,
+            "LAD_ref": LAD if LAD is not None else np.nan,
+            "WAD_ref": WAD if WAD is not None else np.nan,
+            "PAD_ref": PAD if PAD is not None else np.nan,
+            "leaf_fraction": leaf_fraction_ref if leaf_fraction_ref is not None else np.nan,
+            "liad_json": json.dumps(liad.tolist()) if liad is not None else "NA",
+            "liad_dewit": liad_dewit if liad_dewit is not None else "NA",
+            "liad_rmse": liad_rmse if liad_rmse is not None else np.nan,
+            "liad_l1": liad_l1 if liad_l1 is not None else np.nan,
+            "wiad_json": json.dumps(wiad.tolist()) if wiad is not None else "NA",
+            "wiad_dewit": wiad_dewit if wiad_dewit is not None else "NA",
+            "wiad_rmse": wiad_rmse if wiad_rmse is not None else np.nan,
+            "wiad_l1": wiad_l1 if wiad_l1 is not None else np.nan,
+            "piad_json": json.dumps(piad.tolist()) if piad is not None else "NA",
+            "piad_dewit": piad_dewit if piad_dewit is not None else "NA",
+            "piad_rmse": piad_rmse if piad_rmse is not None else np.nan,
+            "piad_l1": piad_l1 if piad_l1 is not None else np.nan
+        }
     
     except Exception as e:
         raise RuntimeError(
             f"Error processing voxel at {voxel_center} with size {voxel_size}: {e}"
         ) from e
 
-    # print(f"[DEBUG] Processed voxel at {voxel_center} with size {voxel_size}, generated {len(voxel_rows)} rows.")
-    return all_results
+    return metadata, stats
 
 # NEW Clipping parallel logic
 
@@ -1906,26 +2368,22 @@ def clip_one_thread(voxel_center, voxel_size):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process voxel batch.")
     parser.add_argument("scene_file", type=str, help="Path to the single .obj scene file. This will automatically extract leaf and wood meshes.")
-    parser.add_argument("--scene_formats", type=str, nargs='+', default=["combined"], help="Scene formats to process (default: ['combined']), use 'leaf' for leaf-only and 'wood' for wood-only.")
     parser.add_argument("--voxel_sizes", type=float, nargs='+', default=[0.2, 0.5, 1.0, 2.0], help="Voxel sizes for processing (default: [0.2, 0.5, 1.0, 2.0]).")
     parser.add_argument("--num_angle_bins", type=int, default=18, help="Number of angle bins for ray tracing (default: 18).")
     parser.add_argument("--ray_spacing", type=float, default=0.005, help="Ray spacing for ray tracing (default: 0.005).")
     parser.add_argument("--wood_volume_voxel_size", type=float, default=0.01, help="Voxel size for wood volume calculation (default: 0.01).")
     parser.add_argument("--wood_volume_threshold", type=int, default=4, help="Threshold for wood volume calculation (default: 4).")
-    parser.add_argument("--leaf_off", action='store_true', help="If set, leaf mesh will not be included in raytracing.")
     parser.add_argument("--max_workers", type=int, default=32, help="Maximum number of parallel workers (default: 32) will max to num_cpus.")
     parser.add_argument("--debug", action='store_true', help="If set, debug outputs will be saved.")
     args = parser.parse_args()
 
     # Print a nice statement outlining chosen inputs
     print(f"Processing scene file: {args.scene_file}")
-    print(f"Scene formats: {args.scene_formats}")
     print(f"Voxel sizes: {args.voxel_sizes}")
     print(f"Number of Angle Bins: {args.num_angle_bins}")
     print(f"Ray spacing: {args.ray_spacing}")
     print(f"Wood volume voxel size: {args.wood_volume_voxel_size}")
     print(f"Wood volume threshold: {args.wood_volume_threshold}")
-    print(f"Leaf off: {args.leaf_off}")
     print(f"Max workers: {args.max_workers}")
     print(f"Debug mode: {args.debug}")
 
@@ -1950,28 +2408,21 @@ if __name__ == "__main__":
 
 
     # Check for CUDA device availability with Open3D
-    _CUDA_DEVICE_ID = None
+    cuda_id = None
+    preferred_uuid = os.getenv("OPEN3D_GPU_UUID", None)
+    cuda_id, selected_uuid = resolve_cuda_index(preferred_uuid)
+
+    if cuda_id is not None:
+        print(f"Using CUDA logical device {cuda_id}" + (f" (UUID: {selected_uuid})" if selected_uuid else ""))
+    else:
+        print("No usable CUDA device found; will try SYCL/CPU")
+
     try:
-        # Try to detect NVIDIA GPU using nvidia-smi
-        try:
-            result = subprocess.run(['nvidia-smi', '-L'], capture_output=True, text=True, timeout=5)
-            if result.returncode == 0:
-                gpu_lines = result.stdout.strip().split('\n')
-                print(f"Detected NVIDIA GPUs:")
-                for line in gpu_lines:
-                    print(f"  {line}")
-                _CUDA_DEVICE_ID = 0  # Use first GPU
-            else:
-                print("nvidia-smi not found or no NVIDIA GPU detected. Will try CUDA devices.")
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            print("nvidia-smi command failed. Attempting to initialize CUDA devices directly.")
-        
+        _DEV = o3d.core.Device(f"CUDA:{cuda_id}")
     except Exception as e:
-        print(f"Error checking CUDA availability: {e}")
-        print("Code will use CPU for ray tracing.")
+        _DEV = o3d.core.Device("CPU:0")
 
     # Store a global setting for leaf-off
-    LEAF_OFF = args.leaf_off
     global DEBUG_MODE
     global DEBUG_PATH
     DEBUG_MODE = args.debug
@@ -2089,16 +2540,16 @@ if __name__ == "__main__":
 
 
 
-        def process_voxel_wrapper(voxel_center, leaf_mesh, wood_mesh, scenes, voxel_size, angles, wood_volume_points, lambda_1):
+        def process_voxel_wrapper(voxel_center, leaf_mesh, wood_mesh, voxel_size, angles, wood_volume_points, lambda_1):
             try:
-                args = (voxel_center, voxel_size, leaf_mesh, wood_mesh, scenes, angles, wood_volume_points, lambda_1)
-                result = process_voxel(*args)
+                args = (voxel_center, voxel_size, leaf_mesh, wood_mesh, angles, wood_volume_points, lambda_1)
+                metadata, stats = process_voxel(*args)
                 # print(f" Processed voxel {args[0]} successfully.")
-                return result
+                return metadata, stats
             except Exception as e:
                 print(f"Error processing voxel {args[0]}: {e}")
                 traceback.print_exc()
-                return []
+                return {}, {}
             
         def clip_mesh_wrapper(
                 voxel_centers, 
@@ -2132,16 +2583,16 @@ if __name__ == "__main__":
         )
 
 
-        pbar = tqdm(total=len(voxel_centers), desc="Clipping meshes", unit="voxels") 
+        pbar = tqdm(total=len(voxel_centers // 2), desc="Clipping meshes", unit="voxels") 
         with tqdm_joblib(pbar):
-            results = Parallel(n_jobs=n_workers, backend='threading')(
+            results = Parallel(n_jobs=n_workers // 2, backend='threading')(
                     delayed(clip_one_thread)(voxel_center, voxel_size) for voxel_center in voxel_centers
                 )
             pbar.close()
 
         # results = [item for sublist in results for item in sublist]  # Flatten list of lists
         clipped_voxel_centres, clipped_leaf_vertices, clipped_leaf_faces, clipped_wood_vertices, clipped_wood_faces = zip(*results)
-        valid_indices = [i for i, (v, lv, lf, wv, wf) in enumerate(results) if lv.shape[0] != 0 or lf.shape[0] != 0 or wv.shape[0] != 0 or wf.shape[0] != 0]
+        valid_indices = [i for i, (_, lv, lf, wv, wf) in enumerate(results) if lv.shape[0] != 0 or lf.shape[0] != 0 or wv.shape[0] != 0 or wf.shape[0] != 0]
 
         clipped_voxel_centres = [clipped_voxel_centres[i] for i in valid_indices]
         clipped_leaf_vertices = [clipped_leaf_vertices[i] for i in valid_indices]
@@ -2157,37 +2608,48 @@ if __name__ == "__main__":
         clipped_leaf_meshes = []
         clipped_wood_meshes = []
         for vc, leaf_vertices, leaf_faces in zip(clipped_voxel_centres, clipped_leaf_vertices, clipped_leaf_faces):
+            
             if leaf_vertices is not None and leaf_faces is not None:
-                o3d_leaf_mesh = o3d.geometry.TriangleMesh()
-                o3d_leaf_mesh.vertices = o3d.utility.Vector3dVector(leaf_vertices)
-                o3d_leaf_mesh.triangles = o3d.utility.Vector3iVector(leaf_faces)
-                clipped_leaf_meshes.append(o3d_leaf_mesh)
+                clipped_leaf_meshes.append(
+                    {
+                        "vertices": leaf_vertices,
+                        "faces": leaf_faces
+                    }
+                )
+                # o3d_leaf_mesh = o3d.geometry.TriangleMesh()
+                # o3d_leaf_mesh.vertices = o3d.utility.Vector3dVector(leaf_vertices)
+                # o3d_leaf_mesh.triangles = o3d.utility.Vector3iVector(leaf_faces)
+                # clipped_leaf_meshes.append(o3d_leaf_mesh)
 
                 ## DEBUG ##
-                if DEBUG_MODE:
-                    debug_dir = os.path.join(DEBUG_PATH, f"voxel_size={voxel_size}", f"voxel_{vc[0]:.2f}_{vc[1]:.2f}_{vc[2]:.2f}")
-                    os.makedirs(debug_dir, exist_ok=True)
+                # if DEBUG_MODE:
+                #     debug_dir = os.path.join(DEBUG_PATH, f"voxel_size={voxel_size}", f"voxel_{vc[0]:.2f}_{vc[1]:.2f}_{vc[2]:.2f}")
+                #     os.makedirs(debug_dir, exist_ok=True)
 
-                    test_mesh_path = os.path.join(debug_dir, f"leaf_mesh_{vc[0]:.2f}_{vc[1]:.2f}_{vc[2]:.2f}.ply")
-                    o3d.io.write_triangle_mesh(test_mesh_path, o3d_leaf_mesh)
+                #     test_mesh_path = os.path.join(debug_dir, f"leaf_mesh_{vc[0]:.2f}_{vc[1]:.2f}_{vc[2]:.2f}.ply")
+                #     o3d.io.write_triangle_mesh(test_mesh_path, o3d_leaf_mesh)
             else:
-                clipped_leaf_meshes.append(None)
+                clipped_leaf_meshes.append({})
 
         for vc, wood_vertices, wood_faces in zip(clipped_voxel_centres, clipped_wood_vertices, clipped_wood_faces):
             if wood_vertices is not None and wood_faces is not None:
-                o3d_wood_mesh = o3d.geometry.TriangleMesh()
-                o3d_wood_mesh.vertices = o3d.utility.Vector3dVector(wood_vertices)
-                o3d_wood_mesh.triangles = o3d.utility.Vector3iVector(wood_faces)
-                clipped_wood_meshes.append(o3d_wood_mesh)
+                clipped_wood_meshes.append({
+                    "vertices": wood_vertices,
+                    "faces": wood_faces
+                })
+                # o3d_wood_mesh = o3d.geometry.TriangleMesh()
+                # o3d_wood_mesh.vertices = o3d.utility.Vector3dVector(wood_vertices)
+                # o3d_wood_mesh.triangles = o3d.utility.Vector3iVector(wood_faces)
+                # clipped_wood_meshes.append(o3d_wood_mesh)
 
                 ## DEBUG ##
-                if DEBUG_MODE:
-                    debug_dir = os.path.join(DEBUG_PATH, f"voxel_size={voxel_size}", f"voxel_{vc[0]:.2f}_{vc[1]:.2f}_{vc[2]:.2f}")
-                    os.makedirs(debug_dir, exist_ok=True)
-                    test_mesh_path = os.path.join(debug_dir, f"wood_mesh_{vc[0]:.2f}_{vc[1]:.2f}_{vc[2]:.2f}.ply")
-                    o3d.io.write_triangle_mesh(test_mesh_path, o3d_wood_mesh)
+                # if DEBUG_MODE:
+                #     debug_dir = os.path.join(DEBUG_PATH, f"voxel_size={voxel_size}", f"voxel_{vc[0]:.2f}_{vc[1]:.2f}_{vc[2]:.2f}")
+                #     os.makedirs(debug_dir, exist_ok=True)
+                #     test_mesh_path = os.path.join(debug_dir, f"wood_mesh_{vc[0]:.2f}_{vc[1]:.2f}_{vc[2]:.2f}.ply")
+                #     o3d.io.write_triangle_mesh(test_mesh_path, o3d_wood_mesh)
             else:
-                clipped_wood_meshes.append(None)
+                clipped_wood_meshes.append({})
 
         clip_time = dt.datetime.now() - start
 
@@ -2197,7 +2659,6 @@ if __name__ == "__main__":
 
         worker = partial(
             process_voxel_wrapper,
-            scenes=args.scene_formats,
             voxel_size=voxel_size,
             angles=angles,
             wood_volume_points=wood_volume_points,
@@ -2208,26 +2669,78 @@ if __name__ == "__main__":
         start02 = dt.datetime.now()
         print(f"Preprocessing time: {clip_time}")
 
-        voxel_results = []
-        for i, (vc, lm, wm) in enumerate(tqdm(zip(clipped_voxel_centres, clipped_leaf_meshes, clipped_wood_meshes), total=len(clipped_voxel_centres), desc="Processing voxels", unit="voxel")):
-            all_results = worker(vc, lm, wm)
-            voxel_results.extend(all_results)
+        # Run sequentially if the _DEV is CPU, otherwise run in parallel to maximise open3d's raytracing
+        if _DEV.get_type() == o3d.core.Device.DeviceType.CPU:
+            print("Running sequentially on CPU...")
+            pbar = tqdm(total=len(clipped_voxel_centres), desc="Processing voxels", unit="voxel")
+            voxel_results = []
+            for vc, lm, wm in zip(clipped_voxel_centres, clipped_leaf_meshes, clipped_wood_meshes):
+                metadata, stats = worker(vc, lm, wm)
+                voxel_results.append((metadata, stats))
+                pbar.update(1)
+            pbar.close()
+        else:
+            print(f"Running in parallel with {n_workers} workers on {_DEV}...")
+            pbar = tqdm(total=len(clipped_voxel_centres), desc="Processing voxels", unit="voxel")
+            with tqdm_joblib(pbar):
+                voxel_results = Parallel(n_jobs=n_workers, backend='threading')(
+                    delayed(worker)(vc, lm, wm) for vc, lm, wm in zip(clipped_voxel_centres, clipped_leaf_meshes, clipped_wood_meshes)
+                )
+            pbar.close()
 
-        # Create a dataframe of voxel_results and subsequently filter by scene column
-        df = pd.DataFrame(voxel_results)
-        assert "scene" in df.columns, "No 'scene' column found in voxel results."
+        # Efficiently concatenate all metadata + stats into a single DataFrame
+        # Each voxel_result is (metadata_dict, stats_dict)
+        # metadata: single values per voxel
+        # stats: arrays of shape (F, A) per voxel
+        
+        rows = []
+        for metadata, stats in voxel_results:
+            if not metadata or not stats:
+                continue
 
-        scenes_present = df["scene"].dropna().unique().tolist()
+            # Infer from first (F, A) shaped array
+            for v in stats.values():
+                if isinstance(v, np.ndarray) and v.ndim == 2:
+                    F, A = v.shape
+                    break
+            
+            if F is None or A is None:
+                continue  # Skip if we can't determine shape
+            
+            # Flatten all stats arrays from (F, A) -> (F*A,)
+            FA = F * A
+            flat_stats = {}
+            for key, val in stats.items():
+                if isinstance(val, np.ndarray):
+                    flat_stats[key] = val.reshape(FA)
+                else:
+                    flat_stats[key] = val
+            
+            # Build a single row per voxel with metadata
+            base_row = metadata.copy()
 
+            # Broadcast metadata across all F*A rows
+            for i in range(FA):
+                row = base_row.copy()
+                for key, val in flat_stats.items():
+                    row[key] = val[i]
+                rows.append(row)
+        
+        df = pd.DataFrame(rows) if rows else pd.DataFrame()
+        
+        # Reorder columns: metadata first, then stats
+        if not df.empty:
+            metadata_cols = list(metadata.keys())
+            stats_cols = [col for col in df.columns if col not in metadata_cols]
+            df = df[metadata_cols + stats_cols]
+        
         total_time = dt.datetime.now() - start
         raytrace_time = dt.datetime.now() - start02
 
-        for scene in scenes_present:
-            df_s = df[df["scene"] == scene].copy()
-            output_basename = os.path.basename(args.scene_file).replace('.obj', f'_{scene}_results_{voxel_size}.csv') if LEAF_OFF is False else os.path.basename(args.scene_file).replace('.obj', f'_{scene}_results_{voxel_size}_leaf_off.csv')
-            output_path = os.path.join(os.path.dirname(args.scene_file), output_basename)
-            df_s.to_csv(output_path, index=False)
-            print(f"Saved {len(df_s)} rows for scene '{scene}' to {output_path}.")
+        output_basename = os.path.basename(args.scene_file).replace('.obj', f'_results_{voxel_size}_{dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.csv')
+        output_path = os.path.join(os.path.dirname(args.scene_file), output_basename)
+        df.to_csv(output_path, index=False)
+        print(f"Saved {len(df)} rows to {output_path}.")
 
         ### DEBUG TOTAL LEAF AREA ###
         # if DEBUG_MODE:
@@ -2263,7 +2776,7 @@ if __name__ == "__main__":
             "raytracing": raytrace_time,
             "total": total_time
         }])
-        perf_output_basename = os.path.basename(args.scene_file).replace('.obj', f'_performance_{voxel_size}.csv') if LEAF_OFF is False else os.path.basename(args.scene_file).replace('.obj', f'_performance_{voxel_size}_leaf_off.csv')
+        perf_output_basename = os.path.basename(args.scene_file).replace('.obj', f'_performance_{voxel_size}.csv')
         perf_output_path = os.path.join(os.path.dirname(args.scene_file), perf_output_basename)
         perf_df.to_csv(perf_output_path, index=False)
 

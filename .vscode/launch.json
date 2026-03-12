@@ -55,7 +55,7 @@
             "console": "integratedTerminal",
             "args": [
                 "/home/capheus/projects/AMAPVox_test/second_test/ACPL_erectophile/ACPL.obj",
-                "--voxel_sizes", "2.0", "--scene_formats", "combined"
+                "--voxel_sizes", "2.0"
             ]
         },
         {
@@ -89,8 +89,7 @@
             "console": "integratedTerminal",
             "args": [
                 "/home/capheus/projects/AMAPVox_test/second_test/ACPL_erectophile",
-                "--average_leaf_area", "0.00925440473872253",
-                "--debug"
+                "--average_leaf_area", "0.00925440473872253"
             ]
         },
         {
