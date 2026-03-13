@@ -6634,6 +6634,28 @@ def _metrics_for_voxel_block(
     return out
 
 
+def compute_wood_volume_in_voxel(wood_volume, voxel_center, voxel_size, small_voxel_size=0.01):
+    """
+    Return estimates the volume of wood points within a voxel.
+    This function assumes wood_volume_file is a numpy array of shape (N, 3).
+    """
+
+    if wood_volume is None or wood_volume.shape[0] == 0:
+        return 0.0
+    
+    # Calculate number of points within the voxel
+    half_size = voxel_size / 2.0
+    min_bound = np.array(voxel_center) - half_size
+    max_bound = np.array(voxel_center) + half_size
+    in_voxel = np.all((wood_volume >= min_bound) & (wood_volume <= max_bound), axis=1)
+    num_points_in_voxel = np.sum(in_voxel)
+
+    wood_volume = small_voxel_size ** 3 * num_points_in_voxel
+    # print(f"Computed wood volume in voxel centered at {voxel_center}: {wood_volume} (with {num_points_in_voxel} points).")
+
+    return wood_volume
+
+
 # ============================================================================
 # Progress-aware public API
 # ============================================================================

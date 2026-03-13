@@ -183,8 +183,10 @@ FACE_ORDER = ["bottom", "top", "xplus", "xminus", "yplus", "yminus"]
 _ROT_AXIS = {"xplus": "y", "xminus": "y", "bottom": "x", "top": "x", "yplus": "x", "yminus": "x"}
 
 
-def _grid(face_extent: float, ray_spacing: float) -> Tuple[np.ndarray, np.ndarray]:
+def _grid(face_extent: float, ray_spacing: float, offset: bool = False) -> Tuple[np.ndarray, np.ndarray]:
     s = np.arange(-face_extent / 2.0, face_extent / 2.0 + ray_spacing, ray_spacing)
+    if offset:
+        s += ray_spacing / 2.0
     return np.meshgrid(s, s, indexing="xy")
 
 
@@ -235,12 +237,15 @@ class RayGrid:
             XX, YY = _grid(face_len, ray_spacing)
             grids = {
                 "bottom": self._face_bottom(vs, XX, YY),
-                "top": self._face_top(vs, XX, YY),
                 "xplus": self._face_xplus(vs, XX, YY),
-                "xminus": self._face_xminus(vs, XX, YY),
-                "yplus": self._face_yplus(vs, XX, YY),
-                "yminus": self._face_yminus(vs, XX, YY),
+                "yplus": self._face_yplus(vs, XX, YY)
             }
+            XX, YY = _grid(face_len, ray_spacing, offset=True)
+            grids.update({
+                "top": self._face_top(vs, XX, YY),
+                "xminus": self._face_xminus(vs, XX, YY),
+                "yminus": self._face_yminus(vs, XX, YY)
+            })
             self.cache[float(vs)] = grids
 
     @staticmethod
@@ -910,7 +915,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("scene_file", type=str, help="Path to the single .obj scene file. This will automatically extract leaf and wood meshes.")
     parser.add_argument("--voxel_sizes", type=float, nargs='+', default=[0.2, 0.5, 1.0, 2.0], help="Voxel sizes for processing (default: [0.2, 0.5, 1.0, 2.0]).")
     parser.add_argument("--num_angle_bins", type=int, default=18, help="Number of angle bins for ray tracing (default: 18).")
-    parser.add_argument("--ray_spacing", type=float, default=0.005, help="Ray spacing for ray tracing (default: 0.005).")
+    parser.add_argument("--ray_spacing", type=float, default=0.01, help="Ray spacing for ray tracing (default: 0.01).")
     parser.add_argument("--wood_volume_voxel_size", type=float, default=0.01, help="Voxel size for wood volume calculation (default: 0.01). (not used in refactor)")
     parser.add_argument("--wood_volume_threshold", type=int, default=4, help="Threshold for wood volume calculation (default: 4). (not used in refactor)")
     parser.add_argument("--max_workers", type=int, default=32, help="Maximum number of parallel workers (default: 32). Will cap to num_cpus.")
@@ -959,7 +964,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if centers.size == 0:
             print(f"[skip] No voxel centers for size {vs}"); continue
         import datetime as dt
-        base = os.path.basename(args.scene_file).replace(".obj", f"_results_{vs}_{dt.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv")
+        base = os.path.basename(args.scene_file).replace(".obj", f"_results_vs_{vs}_{dt.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv")
         out_csv = os.path.join(os.path.dirname(args.scene_file), base)
         writer = CSVWriter(out_csv, metadata_keys_order=[
             "voxel_cx", "voxel_cy", "voxel_cz", "voxel_size", "voxel_id", "face_index", "face_name",
