@@ -977,7 +977,41 @@ def effective_path_length_vec(free_path_lengths, lambda_1):
     
     return eff_path_length_zs
 
-def calculate_inclination_angle_distribution(normals, weights, num_bins=18):
+def _import_open3d():
+    import open3d as o3d
+    import open3d.core as o3c
+    o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
+    return o3d, o3c
+
+def calculate_inclination_angle_distribution_o3dmesh(mesh_legacy, num_bins=18):
+    if mesh_legacy is None:
+        return np.array([]), np.array([]), float('nan')
+    o3d, _ = _import_open3d()
+    if len(mesh_legacy.triangles) == 0:
+        return np.array([]), np.array([]), float('nan')
+    verts = np.asarray(mesh_legacy.vertices)
+    tris  = np.asarray(mesh_legacy.triangles)
+    v0 = verts[tris[:,1]] - verts[tris[:,0]]
+    v1 = verts[tris[:,2]] - verts[tris[:,0]]
+    cp = np.cross(v0, v1)
+    areas = 0.5 * np.linalg.norm(cp, axis=1)
+    norms = np.linalg.norm(cp, axis=1, keepdims=True)
+    normals = np.divide(cp, norms, where=(norms!=0), out=np.zeros_like(cp))
+    ang = np.degrees(np.arccos(np.clip(normals[:,2], -1, 1)))
+    ang = np.where(ang > 90, 180-ang, ang)
+    
+    mean_angle = float(np.nanmean(ang)) if ang.size else float('nan')
+    bin_edges = np.linspace(0, 90, num_bins+1)
+    idx = np.digitize(ang, bin_edges) - 1
+    idx = np.clip(idx, 0, num_bins-1)
+    bin_counts = np.bincount(idx, weights=areas, minlength=num_bins)
+    total_area = areas.sum()
+    liad = bin_counts / total_area if total_area > 0 else np.zeros(num_bins)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    return bin_centers.astype(np.float32), liad.astype(np.float32), mean_angle
+
+
+def calculate_inclination_angle_distribution_weighted_points(normals, weights, num_bins=18):
     """
     Calculate the Leaf Angle Distribution (LAD) for a set of normals and weights.
     
@@ -6634,6 +6668,19 @@ def _metrics_for_voxel_block(
     return out
 
 
+def process_wood_volume_file(wood_mesh: str, wood_voxel_size: float=0.01, threshold: int=4) -> Optional[np.ndarray]:
+    wood_inside_points = calculate_wood_volume(wood_mesh, voxel_size=wood_voxel_size, threshold=threshold)
+    if wood_inside_points is not None:
+        try:
+            np.savetxt(wood_volume_file, wood_inside_points, fmt='%.3f')
+            print(f"Wood volume file saved at {wood_volume_file}.")
+            return np.round(wood_inside_points, 3)
+        except Exception as e:
+            print(f"Error saving wood volume file {wood_volume_file}: {e}")
+            return None
+    print(f"No wood volume file found at {wood_volume_file}.")
+    return None
+
 def compute_wood_volume_in_voxel(wood_volume, voxel_center, voxel_size, small_voxel_size=0.01):
     """
     Return estimates the volume of wood points within a voxel.
@@ -6655,6 +6702,153 @@ def compute_wood_volume_in_voxel(wood_volume, voxel_center, voxel_size, small_vo
 
     return wood_volume
 
+
+def calculate_wood_volume(wood_mesh: trimesh.Trimesh, voxel_size: float=0.01, threshold: int=4) -> np.ndarray:
+    """
+    Calculate the wood volume of a mesh by voxelizing it.
+    Vectorized approach: batch all points per x-slice and cast rays in one operation.
+    """
+    if wood_mesh.is_empty:
+        print("Wood mesh is empty, cannot calculate volume.")
+        return None
+    
+    start_time = dt.datetime.now()
+    
+    # Convert to open3d
+    o3d_wood_mesh = o3d.geometry.TriangleMesh()
+    o3d_wood_mesh.vertices = o3d.utility.Vector3dVector(wood_mesh.vertices)
+    o3d_wood_mesh.triangles = o3d.utility.Vector3iVector(wood_mesh.faces)
+    o3d_wood_mesh.compute_vertex_normals()
+    o3d_wood_mesh.remove_duplicated_vertices()
+    o3d_wood_mesh.remove_duplicated_triangles()
+    o3d_wood_mesh.remove_degenerate_triangles()
+    
+    # Get bounding box of the mesh
+    aabb = o3d_wood_mesh.get_axis_aligned_bounding_box()
+    print(f"Bounding box of wood mesh: {aabb}")
+    offset = voxel_size * 0.01
+
+    # Create grid coordinates
+    x = np.arange(aabb.min_bound[0] - offset, aabb.max_bound[0] + offset, voxel_size)
+    y = np.arange(aabb.min_bound[1] - offset, aabb.max_bound[1] + offset, voxel_size)
+    z = np.arange(aabb.min_bound[2] - offset, aabb.max_bound[2] + offset, voxel_size)
+
+    total_points = len(x) * len(y) * len(z)
+    print(f"Grid dimensions: {len(x)} x {len(y)} x {len(z)} = {total_points} points.")
+
+    # Setup raycasting scene
+    scene = o3d.t.geometry.RaycastingScene()
+    mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(o3d_wood_mesh)
+    scene.add_triangles(mesh_t)
+
+    # Ray directions
+    directions = np.array([
+        [1.0001, 0.0001, 0.0001],
+        [-1.0001, 0.0001, 0.0001],
+        [0.0001, 1.0001, 0.0001],
+        [0.0001, -1.0001, 0.0001],
+        [0.0001, 0.0001, 1.0001],
+        [0.0001, 0.0001, -1.0001]
+    ], dtype=np.float32)
+    
+    inside_points = []
+    n_directions = len(directions)
+
+    for xi, x_val in enumerate(tqdm(x, desc="Processing X-slices")):
+        # Generate all y,z points for this x-slice
+        yy, zz = np.meshgrid(y, z, indexing='ij')
+        xx = np.full_like(yy, x_val, dtype=np.float32)
+        slice_points = np.column_stack([xx.ravel(), yy.ravel(), zz.ravel()]).astype(np.float32)
+        n_points = len(slice_points)
+        
+        # Count intersections across all directions
+        inside_counts = np.zeros(n_points, dtype=np.int32)
+        
+        # Process all directions in one vectorized call
+        # Repeat points for each direction
+        points_repeated = np.repeat(slice_points, n_directions, axis=0)  # (n_points * n_dirs, 3)
+        dirs_tiled = np.tile(directions, (n_points, 1))  # (n_points * n_dirs, 3)
+        
+        # Create rays tensor: concatenate origins and directions
+        rays = np.column_stack([points_repeated, dirs_tiled]).astype(np.float32)
+        rays_tensor = o3d.core.Tensor(rays, dtype=o3d.core.Dtype.Float32)
+        
+        # Get all intersections at once
+        intersections = scene.count_intersections(rays_tensor).numpy()
+        
+        # Reshape back to (n_points, n_directions) and count odd intersections per point
+        intersections = intersections.reshape(n_points, n_directions)
+        inside_counts = (intersections % 2).sum(axis=1).astype(np.int32)
+        
+        # Identify inside points based on threshold
+        mask = inside_counts >= threshold
+        inside_points.append(slice_points[mask])
+        
+        # Progress reporting
+        if (xi + 1) % max(1, len(x) // 10) == 0:
+            elapsed = dt.datetime.now() - start_time
+            percent_complete = (xi + 1) / len(x) * 100
+            if percent_complete > 0:
+                est_total_time = elapsed.total_seconds() / percent_complete * 100
+                remaining = est_total_time - elapsed.total_seconds()
+                print(f"Progress: {percent_complete:.1f}% complete, "
+                      f"ETA: {remaining/60:.1f} minutes, "
+                      f"Found {sum(len(p) for p in inside_points)} inside points so far")
+    
+    # Concatenate all inside points
+    if inside_points:
+        inside_points = np.vstack(inside_points)
+    else:
+        inside_points = np.array([], dtype=np.float32).reshape(0, 3)
+    
+    if len(inside_points) == 0:
+        print(f"No inside points found. Try a different threshold or check mesh.")
+        return None
+    
+    return inside_points
+
+
+def process_leaf_area_file(scene_file: str, leaf_mesh: trimesh.Trimesh) -> None:
+    """
+    Process the leaf area file and save it as a CSV.
+    The leaf area is calculated from the mesh and saved in a CSV file.
+    """
+    if leaf_mesh.is_empty:
+        print("Leaf mesh is empty, cannot calculate area.")
+        return
+    
+    # Find triangle clusters that are connected (i.e. a leaf)
+    leaf_mesh = leaf_mesh.copy()
+
+    # Use trimesh to compute connected components and their areas
+    components = leaf_mesh.split(only_watertight=False)
+    areas = [comp.area for comp in components if comp.faces.shape[0] > 0]
+
+    if not areas:
+        avg_area, min_area, max_area, num_leaves, total_leaf_area = 0.0, 0.0, 0.0, 0, 0.0
+    else:
+        avg_area = float(np.mean(areas))
+        min_area = float(np.min(areas))
+        max_area = float(np.max(areas))
+        num_leaves = len(areas)
+        total_leaf_area = float(np.nansum(areas))
+
+    print(f"Leaf area stats: avg={avg_area:.3f}, min={min_area:.3f}, max={max_area:.3f}, num_leaves={num_leaves}, total_leaf_area={total_leaf_area}")
+
+    output_path = os.path.join(os.path.dirname(scene_file), os.path.basename(scene_file).replace(".obj", "_leaf_area.csv"))
+
+    df = pd.DataFrame({
+        'tree_id': [os.path.basename(scene_file).replace(".obj", "")],
+        'avg_leaf_area': [avg_area],
+        'min_leaf_area': [min_area],
+        'max_leaf_area': [max_area],
+        'num_leaves': [num_leaves],
+        'total_leaf_area': [total_leaf_area]
+    })
+    df.to_csv(output_path, index=False)
+    print(f"Leaf area saved to {output_path}.")
+
+    return avg_area, min_area, max_area, num_leaves, total_leaf_area
 
 # ============================================================================
 # Progress-aware public API

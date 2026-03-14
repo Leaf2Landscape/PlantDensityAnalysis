@@ -5,11 +5,13 @@ Threaded voxel processing (CPU/GPU pipelined) with GPU stability fixes
 - CPU (Open3D/Embree) raycasting: single worker (one voxel at a time) so Embree can parallelize internally.
 - GPU (Warp/CUDA) raycasting: multi-threaded workers feeding the device using per-thread CUDA streams.
 - Fix: hit counts (`num_hits_*`) derived from counts arrays, not `isfinite(first_hit_*)`.
-- Fix: Warp allocations/launches happen inside `wp.ScopedDevice/ScopedStream`, 
-       all device arrays use correct dtypes (wp.float32 / wp.int32 / wp.vec3), and we synchronize stream before host copies.
+- Fix: Warp allocations/launches happen inside `wp.ScopedDevice/ScopedStream`,
+  all device arrays use correct dtypes (wp.float32 / wp.int32 / wp.vec3), and we synchronize stream before host copies.
+
+This refactor updates WarpRaycaster to a GLOBAL-MESH version: scene meshes are uploaded once at construction
+and reused for all voxels. CPU still builds rays_FAR6 for stats, but the GPU raycaster ignores per-voxel meshes.
 """
 from __future__ import annotations
-
 import contextlib
 import os
 import sys
@@ -21,9 +23,10 @@ import argparse
 import traceback
 import threading
 import datetime as dt
-from queue import Queue
+import pandas as pd
+from queue import Queue, Empty
+from collections import deque
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
-
 import numpy as np
 from tqdm.auto import tqdm
 from tqdm_joblib import tqdm_joblib
@@ -31,13 +34,12 @@ from joblib import Parallel, delayed
 from joblib import parallel_backend
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import psutil
-
 from dataclasses import dataclass
 
 @dataclass
 class VoxelClip:
-    vertices: np.ndarray    # float32, C-contiguous
-    faces: np.ndarray       #int32, C-contiguous
+    vertices: np.ndarray  # float32, C-contiguous
+    faces: np.ndarray     # int32, C-contiguous
 
 # Lazy heavy imports
 
@@ -53,7 +55,11 @@ def _import_trimesh_pv():
     return trimesh, pv
 
 # External utilities (unchanged API expected)
-from utils import classify_liad_to_dewit, calculate_G, resolve_cuda_index, create_voxel_id, calculate_lambda_1, process_wood_volume_file, process_leaf_area_file, compute_wood_volume_in_voxel
+from utils import (
+    classify_liad_to_dewit, calculate_G, resolve_cuda_index, create_voxel_id,
+    calculate_lambda_1, process_wood_volume_file, process_leaf_area_file,
+    compute_wood_volume_in_voxel, calculate_inclination_angle_distribution_o3dmesh
+)
 
 # Optional Warp
 _HAS_WARP = False
@@ -112,8 +118,7 @@ class CSVWriter:
                 f"New columns appeared after header was written: {sorted(new_cols)}. "
                 "Ensure the first batch contains all columns."
             )
-        for r in rows:
-            self._writer.writerow(r)
+        self._writer.writerows(rows)
         self._file.flush()
 
     def close(self):
@@ -124,7 +129,6 @@ class CSVWriter:
                 self._file.close()
             self._file = None
 
-
 def _to_py_scalar(v: Any) -> Any:
     if isinstance(v, (np.floating, np.integer, np.bool_)):
         return v.item()
@@ -134,7 +138,6 @@ def _to_py_scalar(v: Any) -> Any:
         except Exception:
             return v.tolist()
     return v
-
 
 def build_rows(
     metadata: Dict[str, Any],
@@ -153,17 +156,17 @@ def build_rows(
         return []
     face_order = list(face_order) if face_order is not None else [f"face_{i}" for i in range(F)]
     angles = list(angles) if angles is not None else [float(i) for i in range(A)]
+
     rows: List[Dict[str, Any]] = []
     meta = {k: _to_py_scalar(v) for k, v in metadata.items()}
     if voxel_id is not None:
         meta["voxel_id"] = voxel_id
+
     for f in range(F):
         for a in range(A):
             row = dict(meta)
-            row["face_index"] = f
             row["face_name"] = face_order[f] if f < len(face_order) else f"face_{f}"
-            row["angle_index"] = a
-            row["angle_center_deg"] = float(angles[a]) if a < len(angles) else float(a)
+            row["zenith_angle"] = float(angles[a]) if a < len(angles) else float(a)
             for key, arr in stats.items():
                 if isinstance(arr, np.ndarray):
                     if arr.ndim == 2 and arr.shape == (F, A):
@@ -182,8 +185,11 @@ def build_rows(
 FACE_ORDER = ["bottom", "top", "xplus", "xminus", "yplus", "yminus"]
 _ROT_AXIS = {"xplus": "y", "xminus": "y", "bottom": "x", "top": "x", "yplus": "x", "yminus": "x"}
 
-def _grid(face_extent: float, ray_spacing: float):
-    s = np.arange(-face_extent / 2.0, face_extent / 2.0 + ray_spacing, ray_spacing)
+def _grid(face_extent: float, ray_spacing: float, offset: bool = False):
+    if offset:
+        s = np.arange(-face_extent / 2.0 + ray_spacing / 2.0, face_extent / 2.0 + ray_spacing / 2.0, ray_spacing)
+    else:
+        s = np.arange(-face_extent / 2.0, face_extent / 2.0 + ray_spacing, ray_spacing)
     return np.meshgrid(s, s, indexing="xy")
 
 def _rot_x(deg: float) -> np.ndarray:
@@ -202,6 +208,7 @@ class DeviceManager:
         self.using_warp: bool = False
         self.device_str: str = "cpu"
         self._detect()
+
     def _detect(self):
         if self.prefer_cuda and _HAS_WARP:
             try:
@@ -220,55 +227,65 @@ class DeviceManager:
         self.device_str = "cpu"
 
 class RayGrid:
-    def __init__(self, voxel_sizes: Sequence[float], ray_spacing: float):
+    def __init__(self, voxel_size: Sequence[float], ray_spacing: float, offset_mirror_face: bool = False):
         self.cache: Dict[float, Dict[str, Tuple[np.ndarray, np.ndarray]]] = {}
-        for vs in voxel_sizes:
+        for vs in voxel_size:
             face_len = float(vs) * np.sqrt(2) + 1e-6
-            XX, YY = _grid(face_len, ray_spacing)
-            self.cache[float(vs)] = {
-                "bottom": self._face_bottom(vs, XX, YY),
-                "top": self._face_top(vs, XX, YY),
-                "xplus": self._face_xplus(vs, XX, YY),
-                "xminus": self._face_xminus(vs, XX, YY),
-                "yplus": self._face_yplus(vs, XX, YY),
-                "yminus": self._face_yminus(vs, XX, YY),
+            # Compute grids for all faces
+            XX1, YY1 = _grid(face_len, ray_spacing)
+            XX2, YY2 = _grid(face_len, ray_spacing, offset=offset_mirror_face)
+            grids = {
+                "bottom": self._face_bottom(vs, XX1, YY1),
+                "xplus":  self._face_xplus (vs, XX1, YY1),
+                "yplus":  self._face_yplus (vs, XX1, YY1),
+                "top":    self._face_top   (vs, XX2, YY2),
+                "xminus": self._face_xminus(vs, XX2, YY2),
+                "yminus": self._face_yminus(vs, XX2, YY2),
             }
+            self.cache[float(vs)] = grids
+
     @staticmethod
     def _face_bottom(vs, XX, YY):
         z = -vs * 2
         org = np.column_stack([XX.ravel(), YY.ravel(), np.full(XX.size, z, dtype=np.float32)])
         dir = np.tile([0,0,1], (len(org),1)).astype(np.float32)
         return org.astype(np.float32), dir
+
     @staticmethod
     def _face_top(vs, XX, YY):
         z = +vs * 2
         org = np.column_stack([XX.ravel(), YY.ravel(), np.full(XX.size, z, dtype=np.float32)])
         dir = np.tile([0,0,-1], (len(org),1)).astype(np.float32)
         return org.astype(np.float32), dir
+
     @staticmethod
     def _face_xplus(vs, XX, YY):
         x = +vs * 2
         org = np.column_stack([np.full(YY.size, x, dtype=np.float32), XX.ravel(), YY.ravel()])
         dir = np.tile([-1,0,0], (len(org),1)).astype(np.float32)
         return org.astype(np.float32), dir
+
     @staticmethod
     def _face_xminus(vs, XX, YY):
         x = -vs * 2
         org = np.column_stack([np.full(YY.size, x, dtype=np.float32), XX.ravel(), YY.ravel()])
-        dir = np.tile([1,0,0], (len(org),1)).astype(np.float32)
+        dir = np.tile([ 1,0,0], (len(org),1)).astype(np.float32)
         return org.astype(np.float32), dir
+
     @staticmethod
     def _face_yplus(vs, XX, YY):
         y = +vs * 2
         org = np.column_stack([XX.ravel(), np.full(XX.size, y, dtype=np.float32), YY.ravel()])
         dir = np.tile([0,-1,0], (len(org),1)).astype(np.float32)
         return org.astype(np.float32), dir
+
     @staticmethod
     def _face_yminus(vs, XX, YY):
         y = -vs * 2
         org = np.column_stack([XX.ravel(), np.full(XX.size, y, dtype=np.float32), YY.ravel()])
-        dir = np.tile([0,1,0], (len(org),1)).astype(np.float32)
+        dir = np.tile([0, 1,0], (len(org),1)).astype(np.float32)
         return org.astype(np.float32), dir
+
     def build(self, voxel_center: np.ndarray, voxel_size: float, angles: Sequence[float]):
         grids = self.cache[float(voxel_size)]
         face_order = FACE_ORDER
@@ -307,6 +324,7 @@ class MeshClipper:
             tris = self.wood_mesh.triangles
             self.wood_tri_min = tris.min(axis=1)
             self.wood_tri_max = tris.max(axis=1)
+
     @staticmethod
     def _clip_one(mesh, tri_min, tri_max, voxel_center, voxel_size):
         if mesh is None or mesh.is_empty or tri_min is None or tri_max is None:
@@ -334,6 +352,7 @@ class MeshClipper:
         V = np.asarray(clipped.points, dtype=np.float32)
         F = np.asarray(clipped.faces.reshape((-1,4))[:,1:], dtype=np.int32)
         return V, F
+
     def clip(self, voxel_center, voxel_size):
         lv, lf = self._clip_one(self.leaf_mesh, self.leaf_tri_min, self.leaf_tri_max, voxel_center, voxel_size)
         wv, wf = self._clip_one(self.wood_mesh, self.wood_tri_min, self.wood_tri_max, voxel_center, voxel_size)
@@ -348,7 +367,7 @@ def ray_box_intersection_vectorized(orig, dirs, bmin, bmax, eps=1e-12):
     t1 = (bmin - orig) / safe
     t2 = (bmax - orig) / safe
     t_near = np.maximum.reduce(np.minimum(t1, t2), axis=1)
-    t_far  = np.minimum.reduce(np.maximum(t1, t2), axis=1)
+    t_far = np.minimum.reduce(np.maximum(t1, t2), axis=1)
     return t_near, t_far
 
 def compute_efpl_array(d_arr, lambda_1):
@@ -362,6 +381,7 @@ def compute_efpl_array(d_arr, lambda_1):
     return out
 
 # --- Multi-hit ω (omega) + λ MLE helpers ------------------------------------
+
 def _build_pascal_table(n_max: int) -> np.ndarray:
     C = np.zeros((n_max + 1, n_max + 1), dtype=np.float64)
     C[0, 0] = 1.0
@@ -376,7 +396,7 @@ def _precompute_B_omegas(omega_grid: np.ndarray, n_max: int, C: np.ndarray) -> n
     B = np.zeros((O, n_max + 1, n_max + 1), dtype=np.float64)
     for j, om in enumerate(omega_grid):
         one_minus = 1.0 - om
-        powers = one_minus ** np.arange(0, n_max + 1)  # power vector 0..n_max
+        powers = one_minus ** np.arange(0, n_max + 1)
         for n in range(1, n_max + 1):
             k_idx = np.arange(1, n + 1)
             # B[j, n, k] = C(n-1, k-1) * (1-ω)^(n-k)
@@ -411,11 +431,9 @@ class _LogPMFCache:
                 return
             L = self.lam_grid.size
             O = self.omega_grid.size
-            G = L * O
             C = _build_pascal_table(self.n_max)
             B = _precompute_B_omegas(self.omega_grid, self.n_max, C)
-
-            logP_all = np.empty((self.n_max + 1, G), dtype=np.float64)
+            logP_all = np.empty((self.n_max + 1, L * O), dtype=np.float64)
             eps = 1e-300
             idx = 0
             for i in range(L):
@@ -424,8 +442,8 @@ class _LogPMFCache:
                 for j in range(O):
                     om = float(self.omega_grid[j])
                     ol = om * lam
-                    T = _compute_T_vec(ol, self.n_max)  # len n_max+1, T[0]=0
-                    ssum = B[j] @ T  # (n_max+1,) with ssum[0]=0
+                    T = _compute_T_vec(ol, self.n_max)
+                    ssum = B[j] @ T  # (n_max+1,)
                     p = np.empty(self.n_max + 1, dtype=np.float64)
                     p[0] = e_neg
                     if self.n_max >= 1:
@@ -435,96 +453,38 @@ class _LogPMFCache:
             self.logP_all = logP_all
             self._built = True
 
-def _build_histograms(counts_FAR: np.ndarray,
-                      valid_mask_FAR: np.ndarray,
-                      n_max: int) -> np.ndarray:
+def _build_histograms(counts_FAR: np.ndarray, valid_mask_FAR: np.ndarray, n_max: int) -> np.ndarray:
     F, A, R = counts_FAR.shape
     M = F * A
     counts = counts_FAR.reshape(M, R)
     mask = valid_mask_FAR.reshape(M, R)
-    # Bin counts 0..n_max per (F,A)
-    # Using one big bincount on flattened (row_offset + n) indices
     flat_indices = np.arange(M)[:, None] * (n_max + 1) + np.clip(counts, 0, n_max)
     flat_indices = flat_indices[mask]
     H = np.bincount(flat_indices, minlength=M * (n_max + 1)).reshape(M, n_max + 1)
     return H
 
-def _mle_clustered_batched_np(counts_FAR: np.ndarray,
-                              valid_mask_FAR: np.ndarray,
-                              lam_grid: np.ndarray,
-                              omega_grid: np.ndarray,
-                              cache: _LogPMFCache | None = None):
-    # Determine max observed count within valid rays
+def _mle_clustered_batched_np(counts_FAR: np.ndarray, valid_mask_FAR: np.ndarray, lam_grid: np.ndarray, omega_grid: np.ndarray, cache: _LogPMFCache | None = None):
     n_max = int(np.max(np.where(valid_mask_FAR, counts_FAR, 0)))
     n_max = max(n_max, 0)
     if n_max == 0:
-        # trivial: all 0 hits -> λ=0, any ω; choose ω mid-range for stability
         M = counts_FAR.shape[0] * counts_FAR.shape[1]
         return (np.zeros(M), np.full(M, float(np.median(omega_grid))), np.zeros(M), None)
-
-    # Prepare cache
     if cache is None or cache.n_max != n_max \
        or cache.lam_grid.shape != lam_grid.shape or cache.omega_grid.shape != omega_grid.shape \
        or np.any(cache.lam_grid != lam_grid) or np.any(cache.omega_grid != omega_grid):
         cache = _LogPMFCache(lam_grid, omega_grid, n_max)
-    cache.build()
-
-    # Build histograms H[(F*A), n_max+1]
-    H = _build_histograms(counts_FAR.astype(np.int32), valid_mask_FAR, n_max)   # (M, n_max+1)
-    # Log-likelihood for all grid points: H dot logP
-    LL_all = H.astype(np.float64) @ cache.logP_all                               # (M, L*O)
+        cache.build()
+    H = _build_histograms(counts_FAR.astype(np.int32), valid_mask_FAR, n_max)
+    LL_all = H.astype(np.float64) @ cache.logP_all
     best_idx = np.argmax(LL_all, axis=1)
     L = lam_grid.size
     O = omega_grid.size
     lam_idx = best_idx // O
     omg_idx = best_idx % O
     best_lambda = lam_grid[lam_idx]
-    best_omega  = omega_grid[omg_idx]
-    best_ll     = LL_all[np.arange(LL_all.shape[0]), best_idx]
+    best_omega = omega_grid[omg_idx]
+    best_ll = LL_all[np.arange(LL_all.shape[0]), best_idx]
     return best_lambda, best_omega, best_ll, cache
-
-def compute_LIAD_from_o3d_mesh(mesh_legacy, num_bins=18):
-    if mesh_legacy is None:
-        return np.array([]), np.array([]), float('nan')
-    o3d, _ = _import_open3d()
-    if len(mesh_legacy.triangles) == 0:
-        return np.array([]), np.array([]), float('nan')
-    verts = np.asarray(mesh_legacy.vertices)
-    tris  = np.asarray(mesh_legacy.triangles)
-    v0 = verts[tris[:,1]] - verts[tris[:,0]]
-    v1 = verts[tris[:,2]] - verts[tris[:,0]]
-    cp = np.cross(v0, v1)
-    areas = 0.5 * np.linalg.norm(cp, axis=1)
-    norms = np.linalg.norm(cp, axis=1, keepdims=True)
-    normals = np.divide(cp, norms, where=(norms!=0), out=np.zeros_like(cp))
-    ang = np.degrees(np.arccos(np.clip(normals[:,2], -1, 1)))
-    ang = np.where(ang > 90, 180-ang, ang)
-    
-    mean_angle = float(np.nanmean(ang)) if ang.size else float('nan')
-    bin_edges = np.linspace(0, 90, num_bins+1)
-    idx = np.digitize(ang, bin_edges) - 1
-    idx = np.clip(idx, 0, num_bins-1)
-    bin_counts = np.bincount(idx, weights=areas, minlength=num_bins)
-    total_area = areas.sum()
-    liad = bin_counts / total_area if total_area > 0 else np.zeros(num_bins)
-    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    return bin_centers.astype(np.float32), liad.astype(np.float32), mean_angle
-
-def _warp_smoke(device="cuda:0"):
-    # one voxel centered at origin (1m box)
-    vc = np.array([0,0,0], np.float32); vs = 1.0
-    # small triangle inside the voxel
-    tri_v = np.array([[0.0, 0.0, 0.2],
-                    [0.1, 0.0, 0.2],
-                    [0.0, 0.1, 0.2]], dtype=np.float32)
-    tri_f = np.array([[0,1,2]], dtype=np.int32)
-    smoke_mesh = VoxelClip(vertices=tri_v, faces=tri_f)
-
-    caster = WarpRaycaster(device)
-    # a single near-normal direction from +z face
-    rays_FAR6, _, _ = RayGrid([vs], 0.05).build(vc, vs, [0.0001])
-    rc = caster.raycast(vc, vs, rays_FAR6, smoke_mesh, None)
-    print("smoke counts_all sum:", rc["counts_all"].sum())  # should be > 0
 
 # Raycasters
 if _HAS_WARP:
@@ -559,13 +519,13 @@ if _HAS_WARP:
         ok = (tfar >= 0.0) and (tnear <= tfar)
         SENT = wp.float32(1e32)
         if not ok:
-            first_any[i] = SENT
+            first_any[i]  = SENT
             first_leaf[i] = SENT
             first_wood[i] = SENT
             return
         start = o + d * tnear
         remain = tfar - tnear
-        first_any[i] = SENT
+        first_any[i]  = SENT
         first_leaf[i] = SENT
         first_wood[i] = SENT
         ca = int(0); cl = int(0); cw = int(0)
@@ -576,22 +536,22 @@ if _HAS_WARP:
             t_leaf = SENT; t_wood = SENT
             if has_leaf == 1:
                 ql = wp.mesh_query_ray(leaf_id, start, d, remain, -1)
-                if ql.result: 
+                if ql.result:
                     leaf_found = True
                     t_leaf = ql.t
             if has_wood == 1:
                 qw = wp.mesh_query_ray(wood_id, start, d, remain, -1)
-                if qw.result: 
+                if qw.result:
                     wood_found = True
                     t_wood = qw.t
             if (not leaf_found) and (not wood_found):
                 break
             hit_is_leaf = False; hit_is_wood = False
             if leaf_found and wood_found:
-                if t_leaf < t_wood: 
+                if t_leaf < t_wood:
                     hit_is_leaf = True
                     t_first = t_leaf
-                else:               
+                else:
                     hit_is_wood = True
                     t_first = t_wood
             elif leaf_found:
@@ -605,62 +565,75 @@ if _HAS_WARP:
             ca += 1
             if hit_is_leaf: cl += 1
             if hit_is_wood: cw += 1
-            if first_any[i] > 1.0e31: first_any[i] = t_accum + t_first
+            if first_any[i]  > 1.0e31: first_any[i]  = t_accum + t_first
             if leaf_found and first_leaf[i] > 1.0e31: first_leaf[i] = t_accum + t_leaf
             if wood_found and first_wood[i] > 1.0e31: first_wood[i] = t_accum + t_wood
-            t_step = t_first + eps_advance
-            start = start + d * t_step
-            remain = remain - t_step
+            t_step  = t_first + eps_advance
+            start   = start + d * t_step
+            remain  = remain - t_step
             t_accum = float(t_accum + t_step)
             h = int(h + 1)
-        count_all[i] = ca; count_leaf[i] = cl; count_wood[i] = cw
+        count_all[i]  = ca
+        count_leaf[i] = cl
+        count_wood[i] = cw
 
 class WarpRaycaster:
-    def __init__(self, device_str: str, max_hits=8, eps_advance=1e-5, max_rays_per_batch=1_000_000):
+    """
+    GLOBAL-MESH version: upload full-scene meshes once and reuse them for all voxels.
+    Keeps CPU-built rays_FAR6 (for stats); the GPU ignores per-voxel meshes and uses scene meshes.
+    """
+    def __init__(self, device_str: str, leaf_scene_md=None, wood_scene_md=None, max_hits=8, eps_advance=1e-5, max_rays_per_batch=1_000_000):
         self.device = device_str
         self.max_hits = int(max_hits)
         self.eps_advance = float(eps_advance)
-        # Reduce batch size to avoid OOM on GPU
         self.max_rays_per_batch = max_rays_per_batch
         import threading
         self._tls = threading.local()
         self.stream_per_voxel = False
-    
+        # Build scene-level meshes once (if provided)
+        self.leaf_wp = None
+        self.wood_wp = None
+        self.leaf_id = wp.uint64(0) if _HAS_WARP else 0
+        self.wood_id = wp.uint64(0) if _HAS_WARP else 0
+        if _HAS_WARP:
+            tls = self._get_tls()
+            stream = tls.stream
+            with wp.ScopedDevice(self.device), wp.ScopedStream(stream):
+                if leaf_scene_md is not None:
+                    self.leaf_wp = self._wp_mesh(leaf_scene_md)
+                if wood_scene_md is not None:
+                    self.wood_wp = self._wp_mesh(wood_scene_md)
+            if self.leaf_wp is not None:
+                self.leaf_id = self.leaf_wp.id
+            if self.wood_wp is not None:
+                self.wood_id = self.wood_wp.id
+
     def _get_tls(self):
-        # Ensure tls slots exist
         tls = self._tls
         if not hasattr(tls, 'stream') or tls.stream is None:
-            tls.stream = wp.Stream(device=self.device)
+            if _HAS_WARP:
+                tls.stream = wp.Stream(device=self.device)
+            else:
+                tls.stream = None
         if not hasattr(tls, 'keep'):
             tls.keep = []
         return tls
 
     def start_voxel(self):
-        """Prepare this thread for a new voxel."""
         tls = self._get_tls()
-        try:
-            wp.synchronize_stream(tls.stream)
-        except Exception:
-            pass
-        # Drop any lingering strong refs from previous voxel.
         tls.keep.clear()
         return tls.stream
 
     def finish_voxel(self):
-        """Cleanly finish a voxel: sync stream, drop refs, hint GC."""
         tls = self._get_tls()
-        try:
-            wp.synchronize_stream(tls.stream)
-        except Exception:
-            pass
         tls.keep.clear()
-        gc.collect()
+        # optional GC throttle
+        # gc.collect()
 
     def shutdown_thread(self):
-        """Called when the worker thread exits."""
         try:
             tls = self._tls
-            if getattr(tls, 'stream', None) is not None:
+            if getattr(tls, 'stream', None) is not None and _HAS_WARP:
                 try:
                     wp.synchronize_stream(tls.stream)
                 except Exception:
@@ -673,62 +646,39 @@ class WarpRaycaster:
         gc.collect()
 
     def _wp_mesh(self, md):
-        if not md or len(md.faces) == 0: return None
+        if not md or len(md.faces) == 0:
+            return None
         v = np.asarray(md.vertices, dtype=np.float32, order="C")
         f = np.asarray(md.faces, dtype=np.int32, order="C")
-        if v.size == 0 or f.size == 0: return None
-
-        
-        # faces must be triangles, 0-based, (T,3) or flat T*3
+        if v.size == 0 or f.size == 0:
+            return None
         if f.ndim == 2 and f.shape[1] == 3:
-            f_flat = f.reshape(-1)                     # flatten to 1-D
+            f_flat = f.reshape(-1)
         elif f.ndim == 1 and (f.size % 3 == 0):
             f_flat = f
         else:
             raise ValueError(f"faces has unexpected shape {f.shape}; expected (T,3) or (T*3,)")
-        
-        # Enforce contiguity & dtypes
         v = np.ascontiguousarray(v, dtype=np.float32)
         f_flat = np.ascontiguousarray(f_flat, dtype=np.int32)
-
         tls = self._get_tls()
         stream = tls.stream
-        try:
-            with wp.ScopedDevice(self.device), wp.ScopedStream(stream):
-                v_d = wp.array(v, dtype=wp.vec3, device=self.device)
-                f_d = wp.array(f_flat, dtype=wp.int32, device=self.device)
-                mesh = wp.Mesh(points=v_d, indices=f_d)
-                # Synchronize to ensure mesh is built before scope exits
-                wp.synchronize_stream(stream)
-            
-            # keep device arrays alive so GC can't free them prematurely
+        with wp.ScopedDevice(self.device), wp.ScopedStream(stream):
+            v_d = wp.array(v, dtype=wp.vec3, device=self.device)
+            f_d = wp.array(f_flat, dtype=wp.int32, device=self.device)
+            mesh = wp.Mesh(points=v_d, indices=f_d)
             try:
                 keep = self._tls.keep
             except AttributeError:
                 self._tls.keep = keep = []
             keep.append((mesh, v_d, f_d))
-
             return mesh
-        except RuntimeError as e:
-            if "allocate" in str(e).lower() or "illegal memory" in str(e).lower():
-                wp.synchronize()
-                gc.collect()
-                return None
-            raise
-    
-    def raycast(self, voxel_center, voxel_size, rays_FAR6, leaf_mesh, wood_mesh):
+
+    def raycast(self, voxel_center, voxel_size, rays_FAR6, leaf_mesh=None, wood_mesh=None):
+        if not _HAS_WARP:
+            raise RuntimeError("Warp not available")
         F,A,R,_ = rays_FAR6.shape
         n = F*A*R
         stream = self.start_voxel()
-        ### DEBUG
-        # print(f"[{threading.current_thread().name}] voxel start: n={n} F={F} A={A} R={R} "
-        # f"leaf={'Y' if leaf_mesh and len(leaf_mesh.faces) else 'N'} "
-        # f"wood={'Y' if wood_mesh and len(wood_mesh.faces) else 'N'}")
-
-        # Pre-build mesh objects outside loop to catch allocation errors early
-        leaf_wp = self._wp_mesh(leaf_mesh)
-        wood_wp = self._wp_mesh(wood_mesh)
-        
         with wp.ScopedDevice(self.device), wp.ScopedStream(stream):
             O = np.ascontiguousarray(rays_FAR6[...,0:3].reshape(n,3).astype(np.float32))
             D = np.ascontiguousarray(rays_FAR6[...,3:6].reshape(n,3).astype(np.float32))
@@ -742,32 +692,19 @@ class WarpRaycaster:
             cnt_all = np.zeros(n, np.int32)
             cnt_leaf = np.zeros(n, np.int32)
             cnt_wood = np.zeros(n, np.int32)
-
-            # print("leaf has V/F:", leaf_wp is not None,
-            #     "wood has V/F:", wood_wp is not None,
-            #     "rays:", n, "remain>0 count (first batch):", np.count_nonzero((D[:10] != 0).any(axis=1)))
-
-            leaf_id = leaf_wp.id if leaf_wp is not None else wp.uint64(0)
-            wood_id = wood_wp.id if wood_wp is not None else wp.uint64(0)
-            has_leaf = 1 if leaf_wp is not None else 0
-            has_wood = 1 if wood_wp is not None else 0
+            leaf_id = self.leaf_id
+            wood_id = self.wood_id
+            has_leaf = 1 if leaf_id != 0 else 0
+            has_wood = 1 if wood_id != 0 else 0
             nb = (n + self.max_rays_per_batch - 1)//self.max_rays_per_batch
             for bi in range(nb):
                 s = bi*self.max_rays_per_batch; e = min(s+self.max_rays_per_batch, n); B = e-s
-                origins_d = wp.array(
-                    np.ascontiguousarray(O[s:e], dtype=np.float32), 
-                    dtype=wp.vec3,
-                    device=self.device
-                )
-                dirs_d    = wp.array(
-                    np.ascontiguousarray(D[s:e], dtype=np.float32), 
-                    dtype=wp.vec3, 
-                    device=self.device
-                )
-                first_any_d  = wp.zeros(B, dtype=wp.float32, device=self.device)
+                origins_d = wp.array(np.ascontiguousarray(O[s:e], dtype=np.float32), dtype=wp.vec3, device=self.device)
+                dirs_d    = wp.array(np.ascontiguousarray(D[s:e], dtype=np.float32), dtype=wp.vec3, device=self.device)
+                first_any_d = wp.zeros(B, dtype=wp.float32, device=self.device)
                 first_leaf_d = wp.zeros(B, dtype=wp.float32, device=self.device)
                 first_wood_d = wp.zeros(B, dtype=wp.float32, device=self.device)
-                count_all_d  = wp.zeros(B, dtype=wp.int32, device=self.device)
+                count_all_d = wp.zeros(B, dtype=wp.int32, device=self.device)
                 count_leaf_d = wp.zeros(B, dtype=wp.int32, device=self.device)
                 count_wood_d = wp.zeros(B, dtype=wp.int32, device=self.device)
                 wp.launch(_raycast_voxel_kernel, dim=B, inputs=[
@@ -777,21 +714,11 @@ class WarpRaycaster:
                     first_any_d, first_leaf_d, first_wood_d,
                     count_all_d, count_leaf_d, count_wood_d
                 ], device=self.device)
-                wp.synchronize_stream(stream)
+                # No explicit synchronize; .numpy() will sync as needed.
                 first_any[s:e] = first_any_d.numpy(); first_leaf[s:e] = first_leaf_d.numpy(); first_wood[s:e] = first_wood_d.numpy()
-                cnt_all[s:e] = count_all_d.numpy(); cnt_leaf[s:e] = count_leaf_d.numpy(); cnt_wood[s:e] = count_wood_d.numpy()
-                # print(f"Processed rays {s} to {e} / {n}: first_any [{first_any[s:e].min():.4f}, {first_any[s:e].max():.4f}], first_leaf [{first_leaf[s:e].min():.4f}, {first_leaf[s:e].max():.4f}], first_wood [{first_wood[s:e].min():.4f}, {first_wood[s:e].max():.4f}], counts_all [{cnt_all[s:e].min()}, {cnt_all[s:e].max()}], counts_leaf [{cnt_leaf[s:e].min()}, {cnt_leaf[s:e].max()}], counts_wood [{cnt_wood[s:e].min()}, {cnt_wood[s:e].max()}]")
-                
-                del origins_d, dirs_d, first_any_d, first_leaf_d, first_wood_d, count_all_d, count_leaf_d, count_wood_d
-                gc.collect()
-        
-
-        # print(f"[{threading.current_thread().name}] voxel done: first_any finite={np.isfinite(first_any).sum()} "
-        # f"count_all sum={cnt_all.sum()} (n={n})")
-
-        wp.synchronize_stream(stream)
+                cnt_all[s:e]   = count_all_d.numpy();  cnt_leaf[s:e]  = count_leaf_d.numpy();  cnt_wood[s:e]  = count_wood_d.numpy()
+            # end batches
         self.finish_voxel()
-
         return {
             "first_hit_any": first_any.reshape(F,A,R),
             "first_hit_leaf": first_leaf.reshape(F,A,R),
@@ -802,10 +729,10 @@ class WarpRaycaster:
             "F": F, "A": A, "R": R,
         }
 
-
 class O3DRaycaster:
     def __init__(self):
         pass
+
     @staticmethod
     def _to_o3d(md):
         if not md or len(md.faces) == 0 or len(md.vertices) == 0:
@@ -815,6 +742,7 @@ class O3DRaycaster:
         m.vertices = o3d.utility.Vector3dVector(np.asarray(md.vertices, dtype=np.float64))
         m.triangles = o3d.utility.Vector3iVector(np.asarray(md.faces, dtype=np.int32))
         return m
+
     def raycast(self, voxel_center, voxel_size, rays_FAR6, leaf_mesh, wood_mesh):
         o3d, o3c = _import_open3d()
         F,A,R,_ = rays_FAR6.shape
@@ -837,11 +765,11 @@ class O3DRaycaster:
         counts_wood = np.zeros((F,A,R), np.int32)
         if isinstance(ans, dict) and ("geometry_ids" in ans):
             geom_ids = ans["geometry_ids"].numpy().astype(np.int64)
-            ray_ids  = ans.get("ray_ids", None)
-            t_hits   = ans.get("t_hit", None)
+            ray_ids = ans.get("ray_ids", None)
+            t_hits = ans.get("t_hit", None)
             if ray_ids is not None and t_hits is not None:
                 ray_ids = ray_ids.numpy().astype(np.int64)
-                t_hits  = t_hits.numpy().astype(np.float32)
+                t_hits = t_hits.numpy().astype(np.float32)
                 Ar = A*R
                 f_idx = (ray_ids // Ar).astype(np.int64)
                 a_idx = ((ray_ids % Ar)//R).astype(np.int64)
@@ -875,9 +803,7 @@ class O3DRaycaster:
         }
 
 class StatComputer:
-    def __init__(self, angles_order: Sequence[float],
-                 lam_grid: np.ndarray | None = None,
-                 omega_grid: np.ndarray | None = None):
+    def __init__(self, angles_order: Sequence[float], lam_grid: np.ndarray | None = None, omega_grid: np.ndarray | None = None):
         self.angles_order = list(angles_order)
         self.lam_grid = lam_grid if lam_grid is not None else np.linspace(1e-3, 3.0, 60)
         self.omega_grid = omega_grid if omega_grid is not None else np.linspace(1e-3, 0.999, 60)
@@ -888,7 +814,6 @@ class StatComputer:
 
     @staticmethod
     def _o3d_from_clipped(md):
-        # md is class VoxelClip
         if not md or md.vertices.size == 0 or md.faces.size == 0:
             return None
         o3d, _ = _import_open3d()
@@ -896,12 +821,13 @@ class StatComputer:
         m.vertices = o3d.utility.Vector3dVector(np.asarray(md.vertices, dtype=np.float64))
         m.triangles = o3d.utility.Vector3iVector(np.asarray(md.faces, dtype=np.int32))
         return m
+
     def mesh_metrics(self, voxel_center, voxel_size, leaf_md, wood_md, lambda_1, alpha, num_angle_bins=18):
         leaf_o3d = self._o3d_from_clipped(leaf_md)
         wood_o3d = self._o3d_from_clipped(wood_md)
         leaf_area = float(leaf_o3d.get_surface_area()) if leaf_o3d is not None and len(leaf_o3d.triangles) else 0.0
         wood_area = float(wood_o3d.get_surface_area()) if wood_o3d is not None and len(wood_o3d.triangles) else 0.0
-        all_area  = leaf_area + wood_area
+        all_area = leaf_area + wood_area
         LAI = leaf_area/(voxel_size**2) if voxel_size > 0 else 0.0
         WAI = wood_area/(voxel_size**2) if voxel_size > 0 else 0.0
         PAI = all_area /(voxel_size**2) if voxel_size > 0 else 0.0
@@ -909,8 +835,8 @@ class StatComputer:
         WAD = wood_area/(voxel_size**3) if voxel_size > 0 else 0.0
         PAD = all_area /(voxel_size**3) if voxel_size > 0 else 0.0
         leaf_fraction_ref = (LAI/PAI) if PAI>0 else 0.0
-        bin_leaf, liad, _ = compute_LIAD_from_o3d_mesh(leaf_o3d, num_bins=num_angle_bins)
-        bin_wood, wiad, _ = compute_LIAD_from_o3d_mesh(wood_o3d, num_bins=num_angle_bins)
+        bin_leaf, liad, _ = calculate_inclination_angle_distribution_o3dmesh(leaf_o3d, num_bins=num_angle_bins)
+        bin_wood, wiad, _ = calculate_inclination_angle_distribution_o3dmesh(wood_o3d, num_bins=num_angle_bins)
         if liad.size and wiad.size:
             piad = (liad*LAD + wiad*WAD)/(LAD+WAD) if (LAD+WAD)>0 else np.array([])
             bin_all = bin_leaf
@@ -941,10 +867,11 @@ class StatComputer:
             meta.setdefault("liad_dewit", "NA"); meta.setdefault("wiad_dewit", "NA"); meta.setdefault("piad_dewit", "NA")
         aux = {"bin_leaf": bin_leaf, "bin_wood": bin_wood, "bin_all": bin_all, "liad": liad, "wiad": wiad, "piad": piad, "lambda_1": lambda_1}
         return meta, aux
+
     def compute(self, voxel_center, voxel_size, rays_FAR6, rc, mesh_meta, aux):
         F,A,R = rc["F"], rc["A"], rc["R"]
-        f_any  = rc.get("first_hit_any"); f_leaf = rc.get("first_hit_leaf"); f_wood = rc.get("first_hit_wood")
-        c_all  = rc.get("counts_all")
+        f_any = rc.get("first_hit_any"); f_leaf = rc.get("first_hit_leaf"); f_wood = rc.get("first_hit_wood")
+        c_all = rc.get("counts_all")
         c_leaf = rc.get("counts_leaf") if rc.get("counts_leaf") is not None else np.zeros_like(c_all)
         c_wood = rc.get("counts_wood") if rc.get("counts_wood") is not None else np.zeros_like(c_all)
         O = rays_FAR6[...,0:3].reshape(-1,3); D = rays_FAR6[...,3:6].reshape(-1,3)
@@ -953,19 +880,18 @@ class StatComputer:
         t_near = t_near.reshape(F,A,R); t_far = t_far.reshape(F,A,R)
         valid_mask = (t_near <= t_far) & (t_far >= 0.0)
         path_len = np.zeros_like(t_far, np.float32); path_len[valid_mask] = (t_far[valid_mask] - t_near[valid_mask]).astype(np.float32)
-        # IMPORTANT: derive hits from counts arrays
-        valid_any  = (c_all  > 0) & valid_mask if c_all  is not None else np.zeros_like(valid_mask, bool)
+        valid_any = (c_all > 0) & valid_mask if c_all is not None else np.zeros_like(valid_mask, bool)
         valid_leaf = (c_leaf > 0) & valid_mask
         valid_wood = (c_wood > 0) & valid_mask
-        free_any  = path_len.copy(); free_leaf = path_len.copy(); free_wood = path_len.copy()
-        if f_any  is not None: free_any [valid_any ] = f_any [valid_any ]
+        free_any = path_len.copy(); free_leaf = path_len.copy(); free_wood = path_len.copy()
+        if f_any is not None:  free_any [valid_any ] = f_any [valid_any ]
         if f_leaf is not None: free_leaf[valid_leaf] = f_leaf[valid_leaf]
         if f_wood is not None: free_wood[valid_wood] = f_wood[valid_wood]
         lambda_1 = mesh_meta.get("lambda_1", 1.0)
         efpl_any  = np.zeros_like(free_any , np.float32); efpl_any [valid_mask] = compute_efpl_array(free_any [valid_mask], lambda_1)
         efpl_leaf = np.zeros_like(free_leaf, np.float32); efpl_leaf[valid_mask] = compute_efpl_array(free_leaf[valid_mask], lambda_1)
         efpl_wood = np.zeros_like(free_wood, np.float32); efpl_wood[valid_mask] = compute_efpl_array(free_wood[valid_mask], lambda_1)
-        N      = valid_mask.sum(axis=2).astype(np.int32)
+        N = valid_mask.sum(axis=2).astype(np.int32)
         n_all  = valid_any.sum(axis=2).astype(np.int32)
         n_leaf = valid_leaf.sum(axis=2).astype(np.int32)
         n_wood = valid_wood.sum(axis=2).astype(np.int32)
@@ -979,8 +905,8 @@ class StatComputer:
         sum_efpl_wood = efpl_wood.sum(axis=2); sum_efpl_hits_wood = (efpl_wood*valid_wood).sum(axis=2)
         safeN = np.maximum(N,1)
         mean_count_all = np.divide(np.where(valid_mask, c_all, 0).sum(axis=2), safeN)
-        sum_x2_all     = (np.where(valid_mask, c_all, 0)**2).sum(axis=2)
-        var_count_all  = np.zeros_like(mean_count_all, np.float32)
+        sum_x2_all = (np.where(valid_mask, c_all, 0)**2).sum(axis=2)
+        var_count_all = np.zeros_like(mean_count_all, np.float32)
         has2 = (N>1); var_count_all[has2] = (sum_x2_all[has2] - (mean_count_all[has2]*safeN[has2]))/(safeN[has2]-1)
         dirs0 = rays_FAR6[:, :, 0, 3:6]
         norms = np.linalg.norm(dirs0, axis=2, keepdims=True)
@@ -989,11 +915,11 @@ class StatComputer:
         viewing_angles = np.degrees(np.arccos(np.clip(np.abs(dz), 0.0, 1.0))).astype(np.float32)
         bin_all = aux.get("bin_all", np.array([])); liad = aux.get("liad", np.array([])); wiad = aux.get("wiad", np.array([])); piad = aux.get("piad", np.array([]))
         bin_leaf = aux.get("bin_leaf", np.array([])); bin_wood = aux.get("bin_wood", np.array([]))
-        G_all = np.zeros_like(viewing_angles, np.float32); G_leaf = np.zeros_like(viewing_angles, np.float32); G_wood = np.zeros_like(viewing_angles, np.float32)
+        G_all  = np.zeros_like(viewing_angles, np.float32); G_leaf = np.zeros_like(viewing_angles, np.float32); G_wood = np.zeros_like(viewing_angles, np.float32)
         if piad.size and bin_all.size:  G_all  = calculate_G(viewing_angles.ravel(), bin_all , piad).reshape(viewing_angles.shape).astype(np.float32)
         if liad.size and bin_leaf.size: G_leaf = calculate_G(viewing_angles.ravel(), bin_leaf, liad).reshape(viewing_angles.shape).astype(np.float32)
         if wiad.size and bin_wood.size: G_wood = calculate_G(viewing_angles.ravel(), bin_wood, wiad).reshape(viewing_angles.shape).astype(np.float32)
-        pgap_all = 1.0 - (n_all / np.maximum(N,1))
+        pgap_all  = 1.0 - (n_all  / np.maximum(N,1))
         pgap_leaf = 1.0 - (n_leaf / np.maximum(N,1))
         pgap_wood = 1.0 - (n_wood / np.maximum(N,1))
         LAD_ref = mesh_meta.get("LAD_ref", 0.0); WAD_ref = mesh_meta.get("WAD_ref", 0.0); PAD_ref = mesh_meta.get("PAD_ref", 0.0)
@@ -1001,55 +927,46 @@ class StatComputer:
         CI_leaf = np.full((F,A), np.nan, np.float32)
         CI_wood = np.full((F,A), np.nan, np.float32)
         valid_ci = (pgap_all>0)&(pgap_all<1)&(G_all>0)&(mean_ppl>0)
-        if PAD_ref>0:  CI_all [valid_ci] = (-np.log(pgap_all [valid_ci])/(G_all [valid_ci]*PAD_ref*mean_ppl[valid_ci])).astype(np.float32)
+        if PAD_ref>0: CI_all [valid_ci] = (-np.log(pgap_all [valid_ci])/(G_all [valid_ci]*PAD_ref*mean_ppl[valid_ci])).astype(np.float32)
         valid_ci = (pgap_leaf>0)&(pgap_leaf<1)&(G_leaf>0)&(mean_ppl>0)
         if LAD_ref>0: CI_leaf[valid_ci] = (-np.log(pgap_leaf[valid_ci])/(G_leaf[valid_ci]*LAD_ref*mean_ppl[valid_ci])).astype(np.float32)
         valid_ci = (pgap_wood>0)&(pgap_wood<1)&(G_wood>0)&(mean_ppl>0)
         if WAD_ref>0: CI_wood[valid_ci] = (-np.log(pgap_wood[valid_ci])/(G_wood[valid_ci]*WAD_ref*mean_ppl[valid_ci])).astype(np.float32)
-        
-        # Multi-hit approach stats
         def _reshape_FA(x_flat):
             return x_flat.reshape(F, A).astype(np.float32)
-
-        # ALL
-        lam_hat_all = np.zeros((F, A), np.float32)
-        omg_hat_all = np.zeros((F, A), np.float32)
-        ll_hat_all  = np.zeros((F, A), np.float32)
-        if c_all is not None:
+        lam_hat_all  = np.full((F, A), np.nan, np.float32)
+        omg_hat_all  = np.full((F, A), np.nan, np.float32)
+        ll_hat_all   = np.full((F, A), np.nan, np.float32)
+        if c_all.max() > 0:
             lam_hat_flat, omg_hat_flat, ll_hat_flat, self._pmf_cache_all = _mle_clustered_batched_np(
                 c_all, valid_mask, self.lam_grid, self.omega_grid, cache=self._pmf_cache_all
             )
             lam_hat_all = _reshape_FA(lam_hat_flat)
             omg_hat_all = _reshape_FA(omg_hat_flat)
             ll_hat_all  = _reshape_FA(ll_hat_flat)
-
-        # LEAF
-        lam_hat_leaf = np.zeros((F, A), np.float32)
-        omg_hat_leaf = np.zeros((F, A), np.float32)
-        ll_hat_leaf  = np.zeros((F, A), np.float32)
-        if c_leaf is not None:
+        lam_hat_leaf = np.full((F, A), np.nan, np.float32)
+        omg_hat_leaf = np.full((F, A), np.nan, np.float32)
+        ll_hat_leaf  = np.full((F, A), np.nan, np.float32)
+        if c_leaf.max() > 0:
             lam_hat_flat, omg_hat_flat, ll_hat_flat, self._pmf_cache_leaf = _mle_clustered_batched_np(
                 c_leaf, valid_mask, self.lam_grid, self.omega_grid, cache=self._pmf_cache_leaf
             )
             lam_hat_leaf = _reshape_FA(lam_hat_flat)
             omg_hat_leaf = _reshape_FA(omg_hat_flat)
             ll_hat_leaf  = _reshape_FA(ll_hat_flat)
-
-        # WOOD
-        lam_hat_wood = np.zeros((F, A), np.float32)
-        omg_hat_wood = np.zeros((F, A), np.float32)
-        ll_hat_wood  = np.zeros((F, A), np.float32)
-        if c_wood is not None:
+        lam_hat_wood = np.full((F, A), np.nan, np.float32)
+        omg_hat_wood = np.full((F, A), np.nan, np.float32)
+        ll_hat_wood  = np.full((F, A), np.nan, np.float32)
+        if c_wood.max() > 0:
             lam_hat_flat, omg_hat_flat, ll_hat_flat, self._pmf_cache_wood = _mle_clustered_batched_np(
                 c_wood, valid_mask, self.lam_grid, self.omega_grid, cache=self._pmf_cache_wood
             )
             lam_hat_wood = _reshape_FA(lam_hat_flat)
             omg_hat_wood = _reshape_FA(omg_hat_flat)
-            ll_hat_wood  = _reshape_FA(ll_hat_flat)    
-        
+            ll_hat_wood  = _reshape_FA(ll_hat_flat)
         stats = {
             "dx": dnorm[:,:,0].astype(np.float32), "dy": dnorm[:,:,1].astype(np.float32), "dz": dnorm[:,:,2].astype(np.float32),
-            "zenith_angle": np.round(viewing_angles.astype(np.float32), 1), "num_rays": N.astype(np.int32),
+            "num_rays": N.astype(np.int32),
             "num_hits_all": n_all.astype(np.int32), "num_hits_leaf": n_leaf.astype(np.int32), "num_hits_wood": n_wood.astype(np.int32),
             "pgap_all": pgap_all.astype(np.float32), "pgap_leaf": pgap_leaf.astype(np.float32), "pgap_wood": pgap_wood.astype(np.float32),
             "G_all": G_all.astype(np.float32), "G_leaf": G_leaf.astype(np.float32), "G_wood": G_wood.astype(np.float32),
@@ -1117,7 +1034,6 @@ def load_and_split_by_group(scene_file: str, leaf_keys: Sequence[str], wood_keys
             wood_mesh = trimesh.Trimesh(vertices=verts, faces=wood_faces, process=False)
             try: wood_mesh.export(wood_path)
             except Exception: pass
-    # bounds (union)
     bounds_list = []
     if leaf_mesh is not None and hasattr(leaf_mesh, 'bounds'): bounds_list.append(leaf_mesh.bounds)
     if wood_mesh is not None and hasattr(wood_mesh, 'bounds'): bounds_list.append(wood_mesh.bounds)
@@ -1128,7 +1044,6 @@ def load_and_split_by_group(scene_file: str, leaf_keys: Sequence[str], wood_keys
     else:
         scene = trimesh.load_mesh(scene_file, process=False)
         bounds6 = tuple(scene.bounds.flatten().tolist())
-
     global _CLIPPER
     _CLIPPER = MeshClipper(leaf_mesh, wood_mesh)
     return leaf_mesh, wood_mesh, bounds6
@@ -1157,13 +1072,12 @@ def filter_voxel_centers(centers, leaf_bounds6, wood_bounds6, voxel_size):
 STOP = object()
 
 class WriterThread(threading.Thread):
-    def __init__(self, write_q: Queue, csv_path: str, progress_q: Queue = None):
+    def __init__(self, write_q: Queue, csv_path: str):
         super().__init__(daemon=True)
         self.write_q = write_q
-        self.progress_q = progress_q
         self.writer = CSVWriter(csv_path, metadata_keys_order=[
             "voxel_cx","voxel_cy","voxel_cz","voxel_size","voxel_id","face_index","face_name",
-            "angle_index","angle_center_deg","alpha","LAI_ref","WAI_ref","PAI_ref","LAD_ref","WAD_ref","PAD_ref",
+            "zenith_angle","alpha","LAI_ref","WAI_ref","PAI_ref","LAD_ref","WAD_ref","PAD_ref",
             "leaf_fraction","liad_dewit","wiad_dewit","piad_dewit","liad_json","wiad_json","piad_json",
         ])
         self.written_voxels = 0
@@ -1176,11 +1090,6 @@ class WriterThread(threading.Thread):
             try:
                 self.writer.write_rows(rows)
                 self.written_voxels += 1
-                if self.progress_q is not None:
-                    try:
-                        self.progress_q.put_nowait(1)
-                    except Exception:
-                        pass
             finally:
                 self.write_q.task_done()
         self.writer.close()
@@ -1196,52 +1105,39 @@ class RaycastWorker(threading.Thread):
         self.raycaster = raycaster
         self.in_q = in_q
         self.out_q = out_q
-        self.prep_done = False  # gate
-        self.buffer = deque()   # holds (job, rc) while prep runs
-
-    def _flush_all(self):
-        while self.buffer:
-            qr = self.buffer.popleft()
-            self.out_q.put((qr.job, qr.rc))
-
+        self.jobs_out = 0
     def run(self):
         while True:
             job = self.in_q.get()
             if job is STOP:
-                if self.prep_done:
-                    self._flush_all()
-                self.in_q.task_done(); break
-            if job == "PREP_DONE":
-                self.prep_done = True
-                self._flush_all()
-                self.in_q.task_done()
-                continue
+                break
             try:
-                if job is not None:
-                    vc, vs, leaf_md, wood_md, rays_FAR6, face_order, angles_sorted, mesh_meta, aux, voxel_id = job
+                (vc, vs, leaf_md, wood_md, rays_FAR6, face_order, angles_sorted, mesh_meta, aux, voxel_id) = job
+                # Raycast (GPU/CPU)
+                if isinstance(self.raycaster, WarpRaycaster):
                     rc = self.raycaster.raycast(vc, vs, rays_FAR6, leaf_md, wood_md)
-
-                    if self.prep_done:
-                        self.out_q.put((job, rc))
-                    else:
-                        self.buffer.append(RaycastQueuedResults(job=job, rc=rc))
+                else:
+                    rc = self.raycaster.raycast(vc, vs, rays_FAR6, leaf_md, wood_md)
+                self.out_q.put((job, rc))
+                self.jobs_out += 1
             except Exception as e:
                 print(f"[raycast:{self.name}] error: {e}\n{traceback.format_exc()}")
             finally:
                 self.in_q.task_done()
-        
         try:
             self.raycaster.shutdown_thread()
         except Exception:
             pass
 
 class StatsWorker(threading.Thread):
-    def __init__(self, name: str, stat_eng, in_q: Queue, write_q: Queue):
+    def __init__(self, name: str, stat_eng, in_q: Queue, write_q: Queue, start_evt):
         super().__init__(daemon=True, name=name)
         self.stat_eng = stat_eng
         self.in_q = in_q
         self.write_q = write_q
+        self.start_evt = start_evt
     def run(self):
+        self.start_evt.wait()
         while True:
             item = self.in_q.get()
             if item is STOP:
@@ -1256,6 +1152,45 @@ class StatsWorker(threading.Thread):
             finally:
                 self.in_q.task_done()
 
+class ResultsRouter(threading.Thread):
+    def __init__(self, result_q: Queue, stats_q: Queue, start_evt: threading.Event):
+        super().__init__(daemon=True, name="results-router")
+        self.result_q = result_q
+        self.stats_q = stats_q
+        self.start_evt = start_evt
+        self.jobs_out = 0
+    def run(self):
+        self.start_evt.wait()
+        while True:
+            item = self.result_q.get()
+            if item is STOP:
+                self.stats_q.put(STOP)
+                self.result_q.task_done()
+                break
+            self.stats_q.put(item)
+            self.result_q.task_done()
+            self.jobs_out += 1
+
+# --------------
+# Smoke test
+# --------------
+
+def _warp_smoke(device="cuda:0"):
+    if not _HAS_WARP:
+        print("Warp not available; skipping smoke test")
+        return
+    # one voxel centered at origin (1m box)
+    vc = np.array([0,0,0], np.float32); vs = 1.0
+    # small triangle inside the voxel
+    tri_v = np.array([[0.0, 0.0, 0.2], [0.1, 0.0, 0.2], [0.0, 0.1, 0.2]], dtype=np.float32)
+    tri_f = np.array([[0,1,2]], dtype=np.int32)
+    smoke_mesh = VoxelClip(vertices=tri_v, faces=tri_f)
+    caster = WarpRaycaster(device_str=device, leaf_scene_md=smoke_mesh, wood_scene_md=None)
+    # a single near-normal direction from +z face
+    rays_FAR6, _, _ = RayGrid([vs], 0.05).build(vc, vs, [0.0001])
+    rc = caster.raycast(vc, vs, rays_FAR6, smoke_mesh, None)
+    print("smoke counts_all sum:", rc["counts_all"].sum())  # should be > 0
+
 # --------------
 # Main
 # --------------
@@ -1263,43 +1198,35 @@ class StatsWorker(threading.Thread):
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Process voxel batch.")
     parser.add_argument("scene_file", type=str, help="Path to the single .obj scene file. This will automatically extract leaf and wood meshes.")
-    parser.add_argument("--voxel_sizes", type=float, nargs='+', default=[0.2,0.5,1.0,2.0], help="Voxel sizes for processing.")
+    parser.add_argument("--voxel_size", type=float, default=0.5, help="Voxel size for processing.")
     parser.add_argument("--num_angle_bins", type=int, default=18, help="Number of angle bins for ray tracing.")
-    parser.add_argument("--ray_spacing", type=float, default=0.01, help="Ray spacing.")
+    parser.add_argument("--ray_spacing", type=float, default=0.01, help="Ray spacing. Default 0.01")
+    parser.add_argument("--offset_mirror_faces", action='store_true', help="This will move mirrored faces by ray_spacing/2 essentially doubling resolution, but only from each face side")
     parser.add_argument("--wood_volume_voxel_size", type=float, default=0.01, help="(unused placeholder, preserved)")
     parser.add_argument("--wood_volume_threshold", type=int, default=4, help="(unused placeholder, preserved)")
-    parser.add_argument("--cpu_workers", type=int, default=0, help="Max CPU workers for clipping/prep. Default to num_cpus")
-    parser.add_argument("--gpu_workers", type=int, default=4, help="Number of concurrent Warp raycasting threads. Default based on GPU capacity.")
+    parser.add_argument("--workers", type=int, default=0, help="Max CPU workers for clipping/prep. Default to num_cpus")
     parser.add_argument("--stats_threads", type=int, default=4, help="Number of concurrent stats computation threads. This will create cpu_workers // stats_threads workers for the final vectorised calculations.")
     parser.add_argument("--force_cpu", action='store_true', help="Force CPU raycasting (for testing/debugging).")
     parser.add_argument("--debug", action='store_true', help="Verbose errors.")
     args = parser.parse_args(argv)
 
     print(f"Scene: {args.scene_file}")
-    print(f"Voxel sizes: {args.voxel_sizes}")
+    print(f"Voxel sizes: {args.voxel_size}")
     print(f"Angle bins: {args.num_angle_bins}")
     print(f"Ray spacing: {args.ray_spacing}")
 
     # CPU capacity
     if os.environ.get("SLURM_CPUS_PER_TASK") is None:
-        num_cpus = psutil.cpu_count(logical=True)
+        num_cpus = psutil.cpu_count(logical=False)
     else:
-        num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", psutil.cpu_count(logical=False)))*2
+        num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", psutil.cpu_count(logical=False))) * 2
     num_cpus = max(1, num_cpus)
-    n_workers = min(args.cpu_workers, num_cpus) if args.cpu_workers > 0 else num_cpus
+    n_workers = min(args.workers, num_cpus) if args.workers > 0 else num_cpus
     print(f"Max workers (CPU clip/prep): {n_workers}")
-
-    # GPU capacity
-    if os.environ.get("SLURM_GPUS_PER_TASK") is None:
-        gpu_workers = 8 if DeviceManager(prefer_cuda=True).using_warp and args.gpu_workers == 0 else 1
-    else:
-        gpu_workers = int(os.environ.get("SLURM_GPUS_PER_TASK", 1))
-
-    print(f"GPU workers: {gpu_workers}")
     print(f"Force CPU raycasting: {args.force_cpu}")
+
     # Device
     dev = DeviceManager(prefer_cuda=True)
-    # raycaster = WarpRaycaster(dev.device_str) if dev.using_warp and not args.force_cpu else O3DRaycaster()
 
     # Load meshes
     leaf_keys = ["leaf","leaves","leafs"]
@@ -1308,7 +1235,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     leaf_bounds6 = tuple(leaf_mesh.bounds.flatten().tolist()) if leaf_mesh is not None else (0,0,0,0,0,0)
     wood_bounds6 = tuple(wood_mesh.bounds.flatten().tolist()) if wood_mesh is not None else (0,0,0,0,0,0)
 
-    # Load wood volume file
+    # Wood volume file
     wood_volume_file = os.path.join(os.path.dirname(args.scene_file), os.path.basename(args.scene_file).replace(".obj", f"_inside_voxels_size{args.wood_volume_voxel_size}_thresh{args.wood_volume_threshold}.txt"))
     if not os.path.exists(wood_volume_file):
         print(f"Wood volume file {wood_volume_file} does not exist. Generating wood volume data.")
@@ -1318,10 +1245,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             wood_voxel_size=args.wood_volume_voxel_size,
             threshold=args.wood_volume_threshold
         )
-    # Load wood volume file as fast numpy array (x y z space-delimited no header), for quick alpha calcs per voxel
-    wood_vol_arr = np.load(wood_volume_file)
+    wood_vol_arr = np.loadtxt(wood_volume_file)
 
-    # Load leaf statistics file
+    # Leaf stats file
     leaf_area_csv = os.path.join(os.path.dirname(args.scene_file), os.path.basename(args.scene_file).replace(".obj", "_leaf_area.csv"))
     if not os.path.exists(leaf_area_csv):
         print(f"Leaf area CSV {leaf_area_csv} does not exist. Generating leaf area data.")
@@ -1339,128 +1265,139 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         num_leaves = leaf_df['num_leaves'][0]
         total_leaf_area = leaf_df['total_leaf_area'][0]
 
+    vs = args.voxel_size
+    lambda_1 = calculate_lambda_1(avg_leaf_area, vs)
 
-    for vs in args.voxel_sizes:
-        # lambda_1 for effective path length corrections
-        lambda_1 = calculate_lambda_1(leaf_df["avg_leaf_area"], vs)
+    # Angles
+    edges = np.linspace(0, 90, args.num_angle_bins + 1)
+    centers_deg = np.round((edges[:-1] + edges[1:]) / 2.0, 3)
+    angle_set = set(centers_deg.tolist())
+    if 0 in angle_set: angle_set.remove(0); angle_set.add(0.0001)
+    if 90 in angle_set: angle_set.remove(90); angle_set.add(89.9999)
+    ANGLE_ORDER = sorted(angle_set)
 
-        # Calculate alpha (wood volume percentage from wood_vol_arr)
-        wood_vol = compute_wood_volume_in_voxel(wood_vol_arr, )
+    # Rays helper
+    raygrid = RayGrid([vs], args.ray_spacing)
+
+    # Voxel centers
+    centers, _ = generate_voxel_centers(vs, bounds6)
+    centers = filter_voxel_centers(centers, leaf_bounds6, wood_bounds6, vs)
+    if centers.size == 0:
+        print(f"[skip] No voxel centers for size {vs}")
+        raise SystemExit(0)
+
+    stat_eng = StatComputer(angles_order=ANGLE_ORDER)
+
+    print("Preparing jobs ...")
+
+    def _prep_one(vc, vs, ray_spacing, angle_order):
+        vc = np.array(vc, dtype=np.float32)
+        leaf_md, wood_md = _CLIPPER.clip(vc, vs)
+        if leaf_md is None and wood_md is None:
+            return None
+        key = (float(vs), float(ray_spacing))
+        rg = _RAYGRID.get(key)
+        if rg is None:
+            rg = RayGrid([vs], ray_spacing)
+            _RAYGRID[key] = rg
+        wood_vol = compute_wood_volume_in_voxel(wood_vol_arr, vc, vs, small_voxel_size=args.wood_volume_voxel_size)
         alpha = np.clip(wood_vol / (vs**3), 0.0, 1.0)
-    
-        # Angles
-        edges = np.linspace(0, 90, args.num_angle_bins + 1)
-        centers_deg = np.round((edges[:-1] + edges[1:]) / 2.0, 3)
-        angle_set = set(centers_deg.tolist())
-        if 0 in angle_set: angle_set.remove(0); angle_set.add(0.0001)
-        if 90 in angle_set: angle_set.remove(90); angle_set.add(89.9999)
-        ANGLE_ORDER = sorted(angle_set)
-        # Rays helper
-        raygrid = RayGrid([vs], args.ray_spacing)
-        # Voxel centers
-        centers, _ = generate_voxel_centers(vs, bounds6)
-        centers = filter_voxel_centers(centers, leaf_bounds6, wood_bounds6, vs)
-        if centers.size == 0:
-            print(f"[skip] No voxel centers for size {vs}")
-            continue
+        mesh_meta, aux = stat_eng.mesh_metrics(vc, vs, leaf_md, wood_md, lambda_1, alpha, num_angle_bins=args.num_angle_bins)
+        rays_FAR6, face_order, angles_sorted = rg.build(vc, vs, ANGLE_ORDER)
+        voxel_id = create_voxel_id(voxel_size=vs, x=vc[0], y=vc[1], z=vc[2])
+        aux = dict(aux)
+        aux["ray_spacing"] = float(ray_spacing)
+        return (vc, vs, leaf_md, wood_md, rays_FAR6, face_order, angles_sorted, mesh_meta, aux, voxel_id)
 
-        stat_eng = StatComputer(angles_order=ANGLE_ORDER)
-        jobs: List[tuple] = []
-        print("Preparing jobs ...")
-        def _prep_one(vc, vs, ray_spacing, angle_order):
-            # Clip first
-            vc = np.array(vc, dtype=np.float32)
-            leaf_md, wood_md = _CLIPPER.clip(vc, vs)
+    # QUEUES
+    raycast_q: Queue = Queue(maxsize=2)
+    result_q: Queue = Queue(maxsize=len(centers))
+    stats_q: Queue = Queue(maxsize=max(256, 4*n_workers))
+    write_q: Queue = Queue(maxsize=128)
+    stage_q = Queue(maxsize=len(centers))
+    prep_done = threading.Event()
 
-            if leaf_md is None and wood_md is None:
-                return None  # skip empty voxels early
-            
-            key = (float(vs), float(ray_spacing))
-            rg = _RAYGRID.get(key)
-            if rg is None:
-                rg = RayGrid([vs], ray_spacing)
-                _RAYGRID[key] = rg
-
-            mesh_meta, aux = stat_eng.mesh_metrics(vc, vs, leaf_md, wood_md, lambda_1, alpha, num_angle_bins=args.num_angle_bins)
-            rays_FAR6, face_order, angles_sorted = rg.build(vc, vs, ANGLE_ORDER)
-            voxel_id = create_voxel_id(voxel_size=vs, x=vc[0], y=vc[1], z=vc[2])
-            return (vc, vs, leaf_md, wood_md, rays_FAR6, face_order, angles_sorted, mesh_meta, aux, voxel_id)
-        ### --- PROCESSING --- ###
-        # First clip and prepare the valid voxels, then pass them immediately into the raycasting queue as they become ready, instead of waiting for all to be prepared. This allows for better pipelining and resource utilization, especially when the number of voxels is large.
-        # Ensure the statistics queue does not start until all prep workers are completed.
-
-        ## QUEUES
-        raycast_q: Queue = Queue(maxsize=1)
-        stats_q: Queue = Queue(maxsize=4*n_workers)
-        write_q: Queue = Queue(maxsize=16)
-        progress_q: Queue = Queue(maxsize=256)
-
-        # Raycast workers: O3D -> single worker; Warp -> gpu_workers
-        ray_workers: List[threading.Thread] = []
-        n_ray_workers = 1 if not dev.using_warp else max(1, int(args.gpu_workers))
-        for i in range(n_ray_workers):
-            caster = (WarpRaycaster(dev.device_str) if (dev.using_warp and not args.force_cpu) else O3DRaycaster())
-            rw = RaycastWorker(name=f"ray-{i}", raycaster=caster, in_q=raycast_q, out_q=stats_q)
-            rw.start(); ray_workers.append(rw)
-
-        out_csv = os.path.join(os.path.dirname(args.scene_file), os.path.basename(args.scene_file).replace('.obj', f'_results_{vs}_{dt.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv'))
-        writer_thr = WriterThread(write_q, out_csv, progress_q=progress_q)
-        writer_thr.start()
-
-        # Call GPU initialiser once
-        _warp_smoke()
-
-        # Use ThreadPoolExecutor to access jobs as they complete
-        jobs = []
-        with ThreadPoolExecutor(max_workers=n_workers) as executor, tqdm(total=len(centers), desc="Prep", unit="voxel") as pbar:
-            futures = [executor.submit(_prep_one, vc, vs, args.ray_spacing, ANGLE_ORDER) for vc in centers]
-            for fut in as_completed(futures):
-                job = fut.result()
-                if job is not None:
-                    jobs.append(job)
-                    if dev.using_warp:
-                        raycast_q.put(job)  # feed into raycasting queue immediately
-                pbar.update(1)
-        
-        # Send notice to GPU to start passing outputs to stats_q
-        if dev.using_warp:
-            raycast_q.put("PREP_DONE")  # special signal to indicate all jobs are prepared and sent
-        
-        if not dev.using_warp:
-            # If not using Warp, we need to feed the raycasting queue now after all jobs are prepared
-            for job in jobs:
-                raycast_q.put(job)
-
-        # Stats workers aren't initialised until all voxels are prepared.
-        stat_workers: List[threading.Thread] = []
-        stats_workers = n_workers // args.stats_threads # Ensure some threads are left inside worker for vectorisation
-        for i in range(stats_workers):
-            sw = StatsWorker(name=f"stat-{i}", stat_eng=stat_eng, in_q=stats_q, write_q=write_q)
-            sw.start(); stat_workers.append(sw)
-        
-        # Progress
-        pbar = tqdm(total=len(jobs), desc='Process', unit='voxel')
-
-        # Drain loop: update when writer outputs a voxel
-        last_written = 0
-        while last_written < len(jobs):
+    def gpu_feeder():
+        while True:
+            if prep_done.is_set() and stage_q.empty():
+                break
             try:
-                progress_q.get(timeout=1.0)  # wait for a signal that a voxel was written
-                pbar.update(1)
-                last_written += 1
-                progress_q.task_done()
-            except Exception:
-                pass
+                job = stage_q.get(timeout=0.1)
+            except Empty:
+                continue
+            raycast_q.put(job)
+            stage_q.task_done()
 
-        # Stop: signal queues
-        for _ in ray_workers: raycast_q.put(STOP)
-        for w in ray_workers: w.join()
-        for _ in stat_workers: stats_q.put(STOP)
-        for w in stat_workers: w.join()
-        write_q.put(STOP)
-        writer_thr.join()
-        pbar.close()
-        print(f"Saved results to {out_csv}.")
+    start_stats_evt = threading.Event()
+    router_thr = ResultsRouter(result_q, stats_q, start_evt=start_stats_evt)
+    router_thr.start()
+
+    # Raycast workers: O3D -> single worker; Warp -> gpu_workers
+    caster = (WarpRaycaster(dev.device_str, leaf_scene_md=_CLIPPER.leaf_mesh, wood_scene_md=_CLIPPER.wood_mesh) if (dev.using_warp and not args.force_cpu) else O3DRaycaster())
+    ray_worker = RaycastWorker(name=f"ray-worker", raycaster=caster, in_q=raycast_q, out_q=result_q)
+    ray_worker.start()
+
+    # Stats workers
+    stat_workers: List[threading.Thread] = []
+    stats_workers = max(1, n_workers // args.stats_threads)
+    for i in range(stats_workers):
+        sw = StatsWorker(name=f"stat-{i}", stat_eng=stat_eng, in_q=stats_q, write_q=write_q, start_evt=start_stats_evt)
+        sw.start(); stat_workers.append(sw)
+
+    feeder_thr = threading.Thread(target=gpu_feeder, name="gpu-feeder", daemon=True)
+    feeder_thr.start()
+
+    out_csv = os.path.join(os.path.dirname(args.scene_file), os.path.basename(args.scene_file).replace('.obj', f'_results_{vs}_{dt.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv'))
+    writer_thr = WriterThread(write_q, out_csv)
+    writer_thr.start()
+
+    # Optional smoke test
+    _warp_smoke() if dev.using_warp and not args.force_cpu else None
+
+    jobs = []
+    with ThreadPoolExecutor(max_workers=n_workers) as executor, tqdm(total=len(centers), desc="Prep", unit="voxel") as pbar:
+        futures = [executor.submit(_prep_one, vc, vs, args.ray_spacing, ANGLE_ORDER) for vc in centers]
+        for fut in as_completed(futures):
+            job = fut.result()
+            if job is not None:
+                jobs.append(job)
+                if dev.using_warp:
+                    try:
+                        stage_q.put(job, timeout=0.5)
+                    except Exception:
+                        stage_q.put(job)
+            pbar.update(1)
+
+    prep_done.set()
+    start_stats_evt.set()
+    if not dev.using_warp:
+        for job in jobs:
+            raycast_q.put(job)
+
+    pbar = tqdm(total=len(jobs), desc='Process', unit='voxel')
+    last_seen = 0
+    while last_seen < len(jobs):
+        try:
+            now = writer_thr.written_voxels
+            if now > last_seen:
+                pbar.update(now - last_seen)
+                last_seen = now
+            time.sleep(0.1)
+        except Exception:
+            pass
+
+    # Stop
+    raycast_q.put(STOP)
+    ray_worker.join()
+    result_q.put(STOP)
+    router_thr.join()
+    for _ in stat_workers: stats_q.put(STOP)
+    for w in stat_workers: w.join()
+    write_q.put(STOP)
+    writer_thr.join()
+    pbar.close()
+
+    print(f"Saved results to {out_csv}.")
     print("All done.")
     return 0
 
