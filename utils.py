@@ -9724,7 +9724,7 @@ def voxel_ray_intersections_nodask(valid_rays_dir: str,
     # Remove one thread from max if n_jobs = -1 to account for monitoring
     if debug:
         if n_jobs == -1:
-            n_jobs = max(1, os.cpu_count() - 1)
+            n_jobs = max(1, psutil.cpu_count(logical=False))
         log(f"  ✓ Using n_jobs={n_jobs} (adjusted for monitoring thread)")
 
     try:
