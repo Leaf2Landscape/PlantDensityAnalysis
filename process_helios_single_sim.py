@@ -29,7 +29,7 @@ Raises:
 
 This code processes Helios simulation data to prep all the voxel-ray intersections completed in order to gather voxel metrics from various scanning inputs.
 """
-from utils import test_helios_settings, prepare_helios_data, add_normals_weights_to_valid_rays, voxel_ray_intersections, voxel_ray_intersections_dask_new, voxel_ray_intersections_nodask 
+from utils import test_helios_settings, prepare_helios_data, voxel_ray_intersections, voxel_ray_intersections_nodask, voxel_ray_intersections_nodask_04
 
 import os
 import argparse
@@ -45,6 +45,7 @@ if __name__ == "__main__":
     parser.add_argument("--helios_data_path", type=str, default=None, help="OPTIONAL: Path to the Helios simulation data. Defaults to 'helios' folder in project directory.")
     parser.add_argument("--reference_data_path", type=str, default=None, help="OPTIONAL: Path to the reference data. Defaults to 'references' folder in project directory.")
     parser.add_argument("--test_mode", action='store_true', help="If set, only outputs plot of wood and leaf points to check settings.")
+    parser.add_argument("--overwrite_valid_rays", action='store_true', help="If set, will overwrite existing valid rays files in output directory. Default: False (will skip processing if valid rays files are found)")
     parser.add_argument("--debug", action='store_true', help="If set, runs in debug mode with verbose outputs and extra saved files")
     args = parser.parse_args()
 
@@ -80,20 +81,22 @@ if __name__ == "__main__":
             print("Test mode completed successfully. Please check the output plot for leaf and wood point classification.")
             exit(0)
 
-    # # Step 1: Prepare Helios data
-    # try:
-    #     prepare_helios_data(
-    #         input_dir=helios_dir,
-    #         output_dir=valid_rays_dir,
-    #         references_dir=reference_dir,
-    #         leaf_object_ids=args.leaf_ids,
-    #         wood_object_ids=args.wood_ids,
-    #         use_class = args.use_class,
-    #         debug=args.debug
-    #     )
-    # except Exception as e:
-    #     raise RuntimeError(f"Error during Helios data preparation: {e}")
-    # print("Helios data preparation completed. Proceeding to normals and voxel-ray intersections...")
+    # Step 1: Prepare Helios data
+    if args.overwrite_valid_rays or not any(fname.endswith("valid_rays.parquet") for fname in os.listdir(valid_rays_dir)):
+        print("No existing valid rays files found or overwrite enabled. Processing Helios data to generate valid rays...")
+        try:
+            prepare_helios_data(
+                input_dir=helios_dir,
+                output_dir=valid_rays_dir,
+                references_dir=reference_dir,
+                leaf_object_ids=args.leaf_ids,
+                wood_object_ids=args.wood_ids,
+                use_class = args.use_class,
+                debug=args.debug
+            )
+        except Exception as e:
+            raise RuntimeError(f"Error during Helios data preparation: {e}")
+        print("Helios data preparation completed. Proceeding to normals and voxel-ray intersections...")
 
     # Step 2: Calculate voxel-ray intersections for chosen voxel sizes
     try:
