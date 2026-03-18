@@ -29,7 +29,7 @@ Raises:
 
 This code processes Helios simulation data to prep all the voxel-ray intersections completed in order to gather voxel metrics from various scanning inputs.
 """
-from utils import test_helios_settings, prepare_helios_data, voxel_ray_intersections, voxel_ray_intersections_nodask, voxel_ray_intersections_nodask_04
+from utils import test_helios_settings, prepare_helios_data, voxel_ray_intersections, voxel_ray_intersections_nodask
 
 import os
 import argparse
