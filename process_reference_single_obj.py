@@ -76,7 +76,7 @@ def _raycast_voxel_kernel(
     first_any: wp.array(dtype=wp.float32),
     first_leaf: wp.array(dtype=wp.float32),
     first_wood: wp.array(dtype=wp.float32),
-    count_all: wp.array(dtype=wp.int32),
+    count_lw: wp.array(dtype=wp.int32),
     count_leaf: wp.array(dtype=wp.int32),
     count_wood: wp.array(dtype=wp.int32)
 ):
@@ -182,7 +182,7 @@ def _raycast_voxel_kernel(
         t_accum = float(t_accum + t_step)
         h = int(h + 1)
 
-    count_all[i] = ca
+    count_lw[i] = ca
     count_leaf[i] = cl
     count_wood[i] = cw
     
@@ -1165,7 +1165,7 @@ def simulate_voxel_grouped_warp(
         first_any = np.full(n_rays, np.inf, dtype=np.float32)
         first_leaf = np.full(n_rays, np.inf, dtype=np.float32)
         first_wood = np.full(n_rays, np.inf, dtype=np.float32)
-        cnt_all = np.zeros(n_rays, dtype=np.int32)
+        cnt_lw = np.zeros(n_rays, dtype=np.int32)
         cnt_leaf = np.zeros(n_rays, dtype=np.int32)
         cnt_wood = np.zeros(n_rays, dtype=np.int32)
 
@@ -1187,7 +1187,7 @@ def simulate_voxel_grouped_warp(
             first_any_d  = wp.zeros(batch_size, dtype=float,     device=device)
             first_leaf_d = wp.zeros(batch_size, dtype=float,     device=device)
             first_wood_d = wp.zeros(batch_size, dtype=float,     device=device)
-            count_all_d  = wp.zeros(batch_size, dtype=wp.int32,  device=device)
+            count_lw_d  = wp.zeros(batch_size, dtype=wp.int32,  device=device)
             count_leaf_d = wp.zeros(batch_size, dtype=wp.int32,  device=device)
             count_wood_d = wp.zeros(batch_size, dtype=wp.int32,  device=device)
 
@@ -1206,7 +1206,7 @@ def simulate_voxel_grouped_warp(
                     bmin, bmax,
                     int(max_hits), float(eps_advance),
                     first_any_d, first_leaf_d, first_wood_d,
-                    count_all_d, count_leaf_d, count_wood_d
+                    count_lw_d, count_leaf_d, count_wood_d
                 ],
                 device=device
             )
@@ -1215,21 +1215,21 @@ def simulate_voxel_grouped_warp(
             first_any[start_idx:end_idx] = first_any_d.numpy()
             first_leaf[start_idx:end_idx] = first_leaf_d.numpy()
             first_wood[start_idx:end_idx] = first_wood_d.numpy()
-            cnt_all[start_idx:end_idx] = count_all_d.numpy()
+            cnt_lw[start_idx:end_idx] = count_lw_d.numpy()
             cnt_leaf[start_idx:end_idx] = count_leaf_d.numpy()
             cnt_wood[start_idx:end_idx] = count_wood_d.numpy()
 
         # Clean up batch arrays
         del origins_d, dirs_d
         del first_any_d, first_leaf_d, first_wood_d
-        del count_all_d, count_leaf_d, count_wood_d
+        del count_lw_d, count_leaf_d, count_wood_d
         gc.collect()
 
     # --------- 5) Reshape to (F, A, R) ----------
     first_any  = first_any.reshape(F, A, R)
     first_leaf = first_leaf.reshape(F, A, R)
     first_wood = first_wood.reshape(F, A, R)
-    cnt_all    = cnt_all.reshape(F, A, R)
+    cnt_lw    = cnt_lw.reshape(F, A, R)
     cnt_leaf   = cnt_leaf.reshape(F, A, R)
     cnt_wood   = cnt_wood.reshape(F, A, R)
 
@@ -1238,7 +1238,7 @@ def simulate_voxel_grouped_warp(
         "first_hit_any":  first_any,
         "first_hit_leaf": first_leaf,
         "first_hit_wood": first_wood,
-        "counts_all":     cnt_all,
+        "counts_lw":     cnt_lw,
         "counts_leaf":    cnt_leaf,
         "counts_wood":    cnt_wood,
         # Convenience for valid-ray mask (anything finite after slab clip)
@@ -1352,16 +1352,16 @@ def process_voxel(
         # Calculate PIAD from aggregated liad and wiad and renormalising
         if liad.size > 0 and wiad.size > 0:
             piad = (liad * LAD + wiad * WAD) / (LAD + WAD) if (LAD + WAD) > 0 else np.array([])
-            bin_all = bin_leaf # Assuming same bins for combined; adjust if needed
+            bin_lw = bin_leaf # Assuming same bins for combined; adjust if needed
         elif liad.size > 0 and not wiad.size > 0:
             piad = liad
-            bin_all = bin_leaf
+            bin_lw = bin_leaf
         elif wiad.size > 0 and not liad.size > 0:
             piad = wiad
-            bin_all = bin_wood
+            bin_lw = bin_wood
         else:
             piad = np.array([])
-            bin_all = np.array([])
+            bin_lw = np.array([])
         
         if liad.size > 0 and bin_leaf.size > 0:
             liad_dewit, liad_rmse, liad_l1 = classify_liad_to_dewit(
@@ -1385,10 +1385,10 @@ def process_voxel(
             wiad_rmse = np.nan if wiad_rmse is None else wiad_rmse
             wiad_l1 = np.nan if wiad_l1 is None else wiad_l1
 
-        if piad.size > 0 and bin_all.size> 0:
+        if piad.size > 0 and bin_lw.size> 0:
             piad_dewit, piad_rmse, piad_l1 = classify_liad_to_dewit(
                 liad=piad,
-                bin_centres_deg=bin_all,
+                bin_centres_deg=bin_lw,
                 return_scores=True
             )
             piad_rmse = np.nan if piad_rmse is None else piad_rmse
@@ -1469,48 +1469,48 @@ def process_voxel(
     # ---------- 4) Aggregate per-(F,A) ----------
     N = valid_mask.sum(axis=2).astype(np.int32)
 
-    n_hits_all  = valid_any .sum(axis=2).astype(np.int32)
+    n_hits_lw  = valid_any .sum(axis=2).astype(np.int32)
     n_hits_leaf = valid_leaf.sum(axis=2).astype(np.int32)
     n_hits_wood = valid_wood.sum(axis=2).astype(np.int32)
 
     sum_ppl = path_lengths.sum(axis=2)                           # potential
     mean_ppl = np.divide(sum_ppl, N, out=np.zeros_like(sum_ppl), where=(N>0))
 
-    sum_fpl_all  = free_any .sum(axis=2)
+    sum_fpl_lw  = free_any .sum(axis=2)
     sum_fpl_leaf = free_leaf.sum(axis=2)
     sum_fpl_wood = free_wood.sum(axis=2)
 
-    mean_fpl_all  = np.divide(sum_fpl_all,  N, out=np.zeros_like(sum_fpl_all ), where=(N>0))
+    mean_fpl_lw  = np.divide(sum_fpl_lw,  N, out=np.zeros_like(sum_fpl_lw ), where=(N>0))
     mean_fpl_leaf = np.divide(sum_fpl_leaf, N, out=np.zeros_like(sum_fpl_leaf), where=(N>0))
     mean_fpl_wood = np.divide(sum_fpl_wood, N, out=np.zeros_like(sum_fpl_wood), where=(N>0))
 
-    sum_efpl_all   = eff_any .sum(axis=2)
+    sum_efpl_lw   = eff_any .sum(axis=2)
     sum_efpl_leaf  = eff_leaf.sum(axis=2)
     sum_efpl_wood  = eff_wood.sum(axis=2)
-    sum_efpl_hits_all  = (eff_any  * valid_any ).sum(axis=2)
+    sum_efpl_hits_lw  = (eff_any  * valid_any ).sum(axis=2)
     sum_efpl_hits_leaf = (eff_leaf * valid_leaf).sum(axis=2)
     sum_efpl_hits_wood = (eff_wood * valid_wood).sum(axis=2)
 
     # Multi-hit statistics from kernel (mean/var over rays)
-    counts_all  = rc["counts_all"]
+    counts_lw  = rc["counts_lw"]
     counts_leaf = rc["counts_leaf"]
     counts_wood = rc["counts_wood"]
 
     safeN = np.maximum(N, 1)
-    masked_all = np.where(valid_mask, counts_all, 0)
+    masked_all = np.where(valid_mask, counts_lw, 0)
 
     sum_x_all = masked_all.sum(axis=2).astype(np.float64)
     sum_x2_all = (masked_all **2).sum(axis=2).astype(np.float64)
-    mean_count_all = sum_x_all / safeN
-    var_count_all  = np.zeros_like(mean_count_all, dtype=np.float64)
+    mean_count_lw = sum_x_all / safeN
+    var_count_lw  = np.zeros_like(mean_count_lw, dtype=np.float64)
     has2 = (N > 1)
-    var_count_all[has2] = (sum_x2_all[has2] - (sum_x_all[has2]**2)/N[has2]) / (N[has2]-1)
+    var_count_lw[has2] = (sum_x2_all[has2] - (sum_x_all[has2]**2)/N[has2]) / (N[has2]-1)
 
     # Repeat for leaf/wood if you need them; omitted here for brevity
     # mean_count_leaf, var_count_leaf, mean_count_wood, var_count_wood ...
 
     # pgap (first-hit based)
-    pgap_all  = 1.0 - (n_hits_all  / np.maximum(N, 1))
+    pgap_lw  = 1.0 - (n_hits_lw  / np.maximum(N, 1))
     pgap_leaf = 1.0 - (n_hits_leaf / np.maximum(N, 1))
     pgap_wood = 1.0 - (n_hits_wood / np.maximum(N, 1))
 
@@ -1522,24 +1522,24 @@ def process_voxel(
     dz = dnorm[:, :, 2]
     viewing_angles = np.degrees(np.arccos(np.clip(np.abs(dz), 0.0, 1.0))).astype(np.float32)
 
-    G_all = np.zeros_like(viewing_angles, dtype=np.float32)
+    G_lw = np.zeros_like(viewing_angles, dtype=np.float32)
     G_leaf = np.zeros_like(viewing_angles, dtype=np.float32)
     G_wood = np.zeros_like(viewing_angles, dtype=np.float32)
-    if piad.size > 0 and bin_all.size > 0:
-        G_all = calculate_G(viewing_angles.ravel(), bin_all, piad).reshape(viewing_angles.shape).astype(np.float32)
+    if piad.size > 0 and bin_lw.size > 0:
+        G_lw = calculate_G(viewing_angles.ravel(), bin_lw, piad).reshape(viewing_angles.shape).astype(np.float32)
     if liad.size > 0 and bin_leaf.size > 0:
         G_leaf = calculate_G(viewing_angles.ravel(), bin_leaf, liad).reshape(viewing_angles.shape).astype(np.float32)
     if wiad.size > 0 and bin_wood.size > 0:
         G_wood = calculate_G(viewing_angles.ravel(), bin_wood, wiad).reshape(viewing_angles.shape).astype(np.float32)
 
     # ---------- 6) Compute CI (unchanged formulas) ----------
-    CI_all  = np.full((F, A), np.nan, dtype=np.float32)
+    CI_lw  = np.full((F, A), np.nan, dtype=np.float32)
     CI_leaf = np.full((F, A), np.nan, dtype=np.float32)
     CI_wood = np.full((F, A), np.nan, dtype=np.float32)
 
     if PAD > 0:
-        valid_ci = (pgap_all > 0) & (pgap_all < 1) & (G_all > 0) & (mean_ppl > 0)
-        CI_all[valid_ci] = (-np.log(pgap_all[valid_ci]) / (G_all[valid_ci] * PAD * mean_ppl[valid_ci])).astype(np.float32)
+        valid_ci = (pgap_lw > 0) & (pgap_lw < 1) & (G_lw > 0) & (mean_ppl > 0)
+        CI_lw[valid_ci] = (-np.log(pgap_lw[valid_ci]) / (G_lw[valid_ci] * PAD * mean_ppl[valid_ci])).astype(np.float32)
     if LAD > 0:
         valid_ci = (pgap_leaf > 0) & (pgap_leaf < 1) & (G_leaf > 0) & (mean_ppl > 0)
         CI_leaf[valid_ci] = (-np.log(pgap_leaf[valid_ci]) / (G_leaf[valid_ci] * LAD * mean_ppl[valid_ci])).astype(np.float32)
@@ -1585,35 +1585,35 @@ def process_voxel(
         "sum_ppl":  sum_ppl.astype(np.float32),
         "mean_ppl": mean_ppl.astype(np.float32),
 
-        "num_hits_all":  n_hits_all.astype(np.int32),
+        "num_hits_lw":  n_hits_lw.astype(np.int32),
         "num_hits_leaf": n_hits_leaf.astype(np.int32),
         "num_hits_wood": n_hits_wood.astype(np.int32),
 
-        "pgap_all":  pgap_all.astype(np.float32),
+        "pgap_lw":  pgap_lw.astype(np.float32),
         "pgap_leaf": pgap_leaf.astype(np.float32),
         "pgap_wood": pgap_wood.astype(np.float32),
 
-        "G_all":  G_all.astype(np.float32),
+        "G_lw":  G_lw.astype(np.float32),
         "G_leaf": G_leaf.astype(np.float32),
         "G_wood": G_wood.astype(np.float32),
 
-        "sum_fpl_all":  sum_fpl_all.astype(np.float32),
-        "mean_fpl_all": mean_fpl_all.astype(np.float32),
+        "sum_fpl_lw":  sum_fpl_lw.astype(np.float32),
+        "mean_fpl_lw": mean_fpl_lw.astype(np.float32),
         "sum_fpl_leaf": sum_fpl_leaf.astype(np.float32),
         "mean_fpl_leaf": mean_fpl_leaf.astype(np.float32),
         "sum_fpl_wood": sum_fpl_wood.astype(np.float32),
         "mean_fpl_wood": mean_fpl_wood.astype(np.float32),
 
-        "sum_efpl_all":  sum_efpl_all.astype(np.float32),
-        "sum_efpl_hits_all":  sum_efpl_hits_all.astype(np.float32),
+        "sum_efpl_lw":  sum_efpl_lw.astype(np.float32),
+        "sum_efpl_hits_lw":  sum_efpl_hits_lw.astype(np.float32),
         "sum_efpl_leaf": sum_efpl_leaf.astype(np.float32),
         "sum_efpl_hits_leaf": sum_efpl_hits_leaf.astype(np.float32),
         "sum_efpl_wood": sum_efpl_wood.astype(np.float32),
         "sum_efpl_hits_wood": sum_efpl_hits_wood.astype(np.float32),
 
         # Multi-hit (ANY); add leaf/wood if desired
-        "mean_count_all": mean_count_all.astype(np.float32),
-        "var_count_all":  var_count_all.astype(np.float32),
+        "mean_count_lw": mean_count_lw.astype(np.float32),
+        "var_count_lw":  var_count_lw.astype(np.float32),
     }
 
     return metadata, stats
@@ -1674,7 +1674,7 @@ def process_voxel(
 
             counts_leaf_multi = np.zeros((F, A, R), dtype=np.int32) if leaf_gids is not None else None
             counts_wood_multi = np.zeros((F, A, R), dtype=np.int32) if wood_gids is not None else None
-            counts_all_multi = np.zeros((F, A, R), dtype=np.int32) 
+            counts_lw_multi = np.zeros((F, A, R), dtype=np.int32) 
 
             # -------------------------
             # Pattern 1: ragged dict
@@ -1720,7 +1720,7 @@ def process_voxel(
                             # No specified classification, use ALL hits for first_hit_any:
                             np.minimum.at(first_hit_any, (f_idx, a_idx, r_idx), t_hits)
                             counts = np.bincount(ray_idx, minlength=F*A*R).astype(np.int32)
-                            counts_all_multi[...] = counts.reshape(F, A, R)
+                            counts_lw_multi[...] = counts.reshape(F, A, R)
                         else:
                             any_gids = []
                             if leaf_gids is not None:
@@ -1732,7 +1732,7 @@ def process_voxel(
                                 if m_any.sum() > 0:
                                     np.minimum.at(first_hit_any, (f_idx[m_any], a_idx[m_any], r_idx[m_any]), t_hits[m_any])
                                     counts = np.bincount(ray_idx[m_any], minlength=F*A*R).astype(np.int32)
-                                    counts_all_multi[...] = counts.reshape(F, A, R)
+                                    counts_lw_multi[...] = counts.reshape(F, A, R)
 
                     # DEBUG
                     if DEBUG_MODE:
@@ -1741,11 +1741,11 @@ def process_voxel(
                             rs = ray_splits.numpy().astype(np.int64)
                             gt_all = np.diff(rs).reshape(F, A, R)
 
-                            mism = (counts_all_multi != gt_all)
+                            mism = (counts_lw_multi != gt_all)
                             if mism.any():
                                 bad = np.argwhere(mism)
                                 for f, a, r in bad[:5]:
-                                    print(f"[DEBUG] mismatch @ (f={f}, a={a}, r-{r}: bincount={counts_all_multi[f,a,r]}, splits={gt_all[f,a,r]})")
+                                    print(f"[DEBUG] mismatch @ (f={f}, a={a}, r-{r}: bincount={counts_lw_multi[f,a,r]}, splits={gt_all[f,a,r]})")
                             else:
                                 print(f"[DEBUG] bincount matches ray_splits across {gt_all.size} rays.")
                     # cleanup
@@ -1793,7 +1793,7 @@ def process_voxel(
                                 if (leaf_gids is None and wood_gids is None) or include_all_points:
                                     # No specified classification, use ALL hits for first_hit_any:
                                     first_hit_any[f, a, r] = min(first_hit_any[f, a, r], t_arr.min())
-                                    counts_all_multi[f, a, r] = int(t_arr.count())
+                                    counts_lw_multi[f, a, r] = int(t_arr.count())
                                 else:
                                     m_any = np.isin(geom_ids, np.concatenate([
                                         np.asarray(leaf_gids, dtype=np.uint32) if leaf_gids is not None else np.array([], dtype=np.uint32),
@@ -1801,7 +1801,7 @@ def process_voxel(
                                     ]))
                                     if m_any.sum() > 0:
                                         first_hit_any[f, a, r] = min(first_hit_any[f, a, r], t_arr[m_any].min())
-                                        counts_all_multi[f, a, r] = int(m_any.sum())
+                                        counts_lw_multi[f, a, r] = int(m_any.sum())
 
                             # Multi-hit class counts for this ray (count ALL hits, not just first)
                             if counts_leaf_multi is not None and leaf_gids is not None and geom_ids.size:
@@ -1828,7 +1828,7 @@ def process_voxel(
         valid_all_hits_mask = np.isfinite(first_hit_any) & valid_rays_mask
 
         # Count hits for each class (for BL approach to CI)
-        n_hits_all = valid_all_hits_mask.sum(axis=2)  # (F,A)
+        n_hits_lw = valid_all_hits_mask.sum(axis=2)  # (F,A)
         n_hits_leaf = valid_leaf_hits_mask.sum(axis=2)  # (F,A)
         n_hits_wood = valid_wood_hits_mask.sum(axis=2)  # (F,A)
 
@@ -1911,22 +1911,22 @@ def process_voxel(
         if wiad is not None and wiad.size > 0:
             G_wood = calculate_G(viewing_angles.ravel(), bin_wood, wiad).reshape(viewing_angles.shape).astype(np.float32, copy=False)
         if piad is not None and piad.size > 0:
-            G_all = calculate_G(viewing_angles.ravel(), bin_all, piad).reshape(viewing_angles.shape).astype(np.float32, copy=False)
+            G_lw = calculate_G(viewing_angles.ravel(), bin_lw, piad).reshape(viewing_angles.shape).astype(np.float32, copy=False)
 
         # Calculate first hit pgap
-        pgap_all = 1.0 - (n_hits_all / np.maximum(N, 1))
+        pgap_lw = 1.0 - (n_hits_lw / np.maximum(N, 1))
         pgap_leaf = 1.0 - (n_hits_leaf / np.maximum(N, 1))
         pgap_wood = 1.0 - (n_hits_wood / np.maximum(N, 1))
 
         # Vectorized CI calculation for all (F, A) combinations        # We will add multi-hit statistics to these dictionaries if counts_leaf_multi and counts_wood_multi are available; otherwise, we return only first-hit-based statistics.
-        CI_all = np.full((F, A), np.nan, dtype=np.float32)
+        CI_lw = np.full((F, A), np.nan, dtype=np.float32)
         CI_leaf = np.full((F, A), np.nan, dtype=np.float32)
         CI_wood = np.full((F, A), np.nan, dtype=np.float32)
 
         # Compute CI where valid
         if PAD is not None and PAD > 0:
-            valid_ci_all = (pgap_all > 0) & (pgap_all < 1) & (G_all > 0) & (mean_path_length > 0)
-            CI_all[valid_ci_all] = (-np.log(pgap_all[valid_ci_all]) / (G_all[valid_ci_all] * PAD * mean_path_length[valid_ci_all])).astype(np.float32)
+            valid_CI_lw = (pgap_lw > 0) & (pgap_lw < 1) & (G_lw > 0) & (mean_path_length > 0)
+            CI_lw[valid_CI_lw] = (-np.log(pgap_lw[valid_CI_lw]) / (G_lw[valid_CI_lw] * PAD * mean_path_length[valid_CI_lw])).astype(np.float32)
 
         if LAD is not None and LAD > 0:
             valid_ci_leaf = (pgap_leaf > 0) & (pgap_leaf < 1) & (G_leaf > 0) & (mean_path_length > 0)
@@ -1948,8 +1948,8 @@ def process_voxel(
         #     for a in range(A):
         #         stats_comb[f][a] = dict(
         #             N=int(N[f, a]),
-        #             n_hits=int(n_hits_all[f, a]),
-        #             I=(float(n_hits_all[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
+        #             n_hits=int(n_hits_lw[f, a]),
+        #             I=(float(n_hits_lw[f, a]) / float(N[f, a])) if N[f, a] else 0.0,
         #             mean_path_length=float(mean_path_length[f, a]),
         #             sum_path_length=float(sum_path_length[f, a]),
         #             sum_free_path_length=float(sum_free_path_length_all[f, a]),
@@ -2001,7 +2001,7 @@ def process_voxel(
 
         # ------------------------------------------------------------
         # MULTI-HIT (Option A/B) per (face, angle) — unchanged wiring
-        # (Now uses counts_all_multi / counts_leaf_multi / counts_wood_multi if present)
+        # (Now uses counts_lw_multi / counts_leaf_multi / counts_wood_multi if present)
         # ------------------------------------------------------------
         
         ## --- Helper Functions --- ##
@@ -2182,9 +2182,9 @@ def process_voxel(
         lam_grid = _LAM_GRID
         omega_grid = _OMEGA_GRID
 
-        if counts_all_multi is not None:
+        if counts_lw_multi is not None:
             multihit_stats_all = _compute_multihit_stats(
-                counts_all_multi, valid_rays_mask, F, A, lam_grid, omega_grid
+                counts_lw_multi, valid_rays_mask, F, A, lam_grid, omega_grid
             )
 
         if counts_leaf_multi is not None:
@@ -2212,28 +2212,28 @@ def process_voxel(
             "sum_ppl": _as32(sum_path_length, np.float32),
 
             # First-hit stats
-            "num_hits_all": _as32(n_hits_all, np.int32),
+            "num_hits_lw": _as32(n_hits_lw, np.int32),
             "num_hits_leaf": _as32(n_hits_leaf, np.int32),
             "num_hits_wood": _as32(n_hits_wood, np.int32),
 
             # pgap/G and other gap related metrics
-            "pgap_all": _as32(pgap_all, np.float32),
+            "pgap_lw": _as32(pgap_lw, np.float32),
             "pgap_leaf": _as32(pgap_leaf, np.float32),
             "pgap_wood": _as32(pgap_wood, np.float32),      
-            "G_all": _as32(G_all, np.float32),
+            "G_lw": _as32(G_lw, np.float32),
             "G_leaf": _as32(G_leaf, np.float32),
             "G_wood": _as32(G_wood, np.float32),
 
             # path length related metrics
-            "sum_fpl_all": _as32(sum_free_path_length_all, np.float32),
-            "mean_fpl_all": _as32(mean_free_path_length_all, np.float32),
+            "sum_fpl_lw": _as32(sum_free_path_length_all, np.float32),
+            "mean_fpl_lw": _as32(mean_free_path_length_all, np.float32),
             "sum_fpl_leaf": _as32(sum_free_path_length_leaf, np.float32),
             "mean_fpl_leaf": _as32(mean_free_path_length_leaf, np.float32),
             "sum_fpl_wood": _as32(sum_free_path_length_wood, np.float32),
             "mean_fpl_wood": _as32(mean_free_path_length_wood, np.float32),
 
-            "sum_efpl_all": _as32(sum_eff_free_path_length_all, np.float32),
-            "sum_efpl_hits_all": _as32(sum_hits_eff_free_path_length_all, np.float32),
+            "sum_efpl_lw": _as32(sum_eff_free_path_length_all, np.float32),
+            "sum_efpl_hits_lw": _as32(sum_hits_eff_free_path_length_all, np.float32),
             "mean_efpl_all": _as32(mean_eff_free_path_length_all, np.float32),
             "var_efpl_all": _as32(var_eff_free_path_length_all, np.float32),
             "sum_efpl_leaf": _as32(sum_eff_free_path_length_leaf, np.float32),

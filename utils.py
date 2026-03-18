@@ -154,7 +154,7 @@ voxel_metrics_schema_singlereturn = pa.schema([
     pa.field('piad_dewit_l1', pa.float64()),         # De Wit l1 for designated label
     pa.field('lambda_1', pa.float64()),
     pa.field('mean_angle_leaf', pa.float32()), # Mean angle of leaf hits only
-    pa.field('mean_angle_all', pa.float32()), # Mean angle of all hits
+    pa.field('mean_angle_lw', pa.float32()), # Mean angle of all hits
     pa.field('mean_path_length', pa.float64()),
     pa.field('sum_path_length', pa.float64()),
     pa.field('mean_free_path_length', pa.float64()),
@@ -218,7 +218,7 @@ voxel_metrics_schema_multireturn = pa.schema([
     pa.field('LAD_MLE_bias', pa.float64()),
     pa.field('LAD_MLE_lambda1_bias', pa.float64()), 
     pa.field('mean_angle_leaf', pa.float32()), # Mean angle of leaf hits only
-    pa.field('mean_angle_all', pa.float32()), # Mean angle of all hits
+    pa.field('mean_angle_lw', pa.float32()), # Mean angle of all hits
     pa.field('mean_path_length', pa.float64()),
     pa.field('sum_path_length', pa.float64()),
     pa.field('mean_free_path_length', pa.float64()),
@@ -5081,7 +5081,7 @@ def get_voxel_metrics_oldcode(intersections_files, lambda_1, is_leaf_true=True, 
         leaf_mask = hit_mask & voxel_df['is_leaf'].values if is_leaf_true else hit_mask & ~voxel_df['is_leaf'].values
 
         # Calculate mean viewing angles
-        mean_angle_all = np.nanmean(voxel_df['viewing_angle'][hit_mask].values)
+        mean_angle_lw = np.nanmean(voxel_df['viewing_angle'][hit_mask].values)
         mean_angle_leaf = np.nanmean(voxel_df['viewing_angle'][leaf_mask].values)
 
         # Calculate pgap_lw and I
@@ -5196,7 +5196,7 @@ def get_voxel_metrics_oldcode(intersections_files, lambda_1, is_leaf_true=True, 
             # 'LIAD_lw_bin_87.5': LIAD_lw_values[17],
             # 'mean_angle_lw': mean_angle_lw,
             'mean_angle_leaf': mean_angle_leaf,
-            'mean_angle_all': mean_angle_all,
+            'mean_angle_lw': mean_angle_lw,
             'mean_path_length': mean_path_length,
             'sum_path_length': sum_path_length,
             'mean_free_path_length': mean_free_path_length,
@@ -5723,7 +5723,7 @@ def _metrics_for_voxel_block(
 
     # Mean viewing angles
     va = block["viewing_angle"].to_numpy()
-    mean_angle_all  = float(np.nanmean(va[current_hit])) if num_lw_hits > 0 else np.nan
+    mean_angle_lw  = float(np.nanmean(va[current_hit])) if num_lw_hits > 0 else np.nan
     mean_angle_leaf = float(np.nanmean(va[current_leaf_mask])) if num_leaf_hits > 0 else np.nan
     mean_angle_wood = float(np.nanmean(va[current_hit & ~leaf_mask])) if num_wood_hits > 0 else np.nan
 
@@ -6059,7 +6059,7 @@ def _metrics_for_voxel_block(
     out.loc[0, 'wiad_dewit_l1'] = float(wiad_dewit_l1) if wiad_dewit_l1 is not None else np.nan
 
     out.loc[0, 'mean_angle_leaf'] = np.float32(mean_angle_leaf)
-    out.loc[0, 'mean_angle_all']  = np.float32(mean_angle_all)
+    out.loc[0, 'mean_angle_lw']  = np.float32(mean_angle_lw)
     out.loc[0, 'mean_angle_wood']  = np.float32(mean_angle_wood)
 
     out.loc[0, 'mean_path_length'] = np.float64(mean_pl)
@@ -6687,7 +6687,7 @@ def get_voxel_metrics(
             return data_df
 
         # Calculate mean viewing angles
-        mean_angle_all = np.nanmean(voxel_df['viewing_angle'][current_hit].values) if current_hit.sum() > 0 else np.nan
+        mean_angle_lw = np.nanmean(voxel_df['viewing_angle'][current_hit].values) if current_hit.sum() > 0 else np.nan
         mean_angle_leaf = np.nanmean(voxel_df['viewing_angle'][current_leaf_mask].values) if current_leaf_mask.sum() > 0 else np.nan
 
         # Calculate pgap_lw and I
@@ -7178,7 +7178,7 @@ def get_voxel_metrics(
         data_df.loc[0, "piad_dewit_l1"] = piad_dewit_l1
         data_df.loc[0, 'lambda_1'] = lambda_1
         data_df.loc[0, 'mean_angle_leaf'] = np.float32(mean_angle_leaf)
-        data_df.loc[0, 'mean_angle_all'] = np.float32(mean_angle_all)
+        data_df.loc[0, 'mean_angle_lw'] = np.float32(mean_angle_lw)
         data_df.loc[0, 'mean_path_length'] = np.float64(mean_path_length)
         data_df.loc[0, 'sum_path_length'] = np.float64(sum_path_length)
         data_df.loc[0, 'mean_free_path_length'] = np.float64(mean_free_path_length)
@@ -7481,7 +7481,7 @@ def get_voxel_metrics_dask(
     num_leaf_hits = curr_leaf.groupby("voxel_id").size().rename("num_leaf_hits")
 
     # mean viewing angles (all current vs leaf-only current)
-    mean_angle_all  = curr_lw.groupby("voxel_id")["viewing_angle"].mean().rename("mean_angle_all")
+    mean_angle_lw  = curr_lw.groupby("voxel_id")["viewing_angle"].mean().rename("mean_angle_lw")
     mean_angle_leaf = curr_leaf.groupby("voxel_id")["viewing_angle"].mean().rename("mean_angle_leaf")
 
     # path length aggregates
@@ -7509,7 +7509,7 @@ def get_voxel_metrics_dask(
         vox_scan = ddf[["voxel_id", scan_col]].drop_duplicates(subset=["voxel_id"]).set_index("voxel_id")[scan_col].rename(scan_col)
 
     # --- Per-voxel aggregates computed above ---
-    # (We already have: num_rays, num_hits, num_leaf_hits, mean_angle_all, mean_angle_leaf,
+    # (We already have: num_rays, num_hits, num_leaf_hits, mean_angle_lw, mean_angle_leaf,
     #  mean_pl, sum_pl, mean_fpl, sum_fpl, sum_fpl_hit, sum_fpl_hit_leaf, sum_fpl_exit,
     #  vox_cx, vox_cy, vox_cz, vox_vs, vox_scan [optional])
 
@@ -7531,7 +7531,7 @@ def get_voxel_metrics_dask(
 
     voxel_tbl = _m(voxel_tbl, num_hits)
     voxel_tbl = _m(voxel_tbl, num_leaf_hits)
-    voxel_tbl = _m(voxel_tbl, mean_angle_all)
+    voxel_tbl = _m(voxel_tbl, mean_angle_lw)
     voxel_tbl = _m(voxel_tbl, mean_angle_leaf)
     voxel_tbl = _m(voxel_tbl, mean_pl)
     voxel_tbl = _m(voxel_tbl, sum_pl)
