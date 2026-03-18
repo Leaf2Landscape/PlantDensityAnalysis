@@ -55,6 +55,7 @@
             "console": "integratedTerminal",
             "args": [
                 "/home/capheus/projects/AMAPVox_test/second_test/ACPL_erectophile/ACPL.obj",
+                "--voxel_sizes", "1.0", "--debug"
             ]
         },
         {

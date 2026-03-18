@@ -25,7 +25,9 @@ import pyvista as pv
 from typing import List, Tuple, Union, Optional
 from pathlib import Path
 
-from utils import classify_liad_to_dewit, calculate_G, resolve_cuda_index
+import matplotlib.pyplot as plt
+
+from utils import classify_liad_to_dewit, calculate_G, resolve_cuda_index, calculate_inclination_angle_distribution_o3dmesh
     
 from numba import njit, prange
 
@@ -673,38 +675,6 @@ def compute_wood_volume_in_voxel(wood_volume, voxel_center, voxel_size, small_vo
 
     return wood_volume
 
-def compute_LIAD_from_mesh(o3d_mesh, num_bins=18):
-    """
-    Compute area-weighted leaf inclination distribution.
-    Returns: (bin centers, LIAD, mean angle)
-    """
-    if (o3d_mesh is None) or (len(o3d_mesh.triangles) == 0):
-        return np.array([]), np.array([]), np.nan
-    
-    verts = np.asarray(o3d_mesh.vertices)
-    tris = np.asarray(o3d_mesh.triangles)
-    v0 = verts[tris[:, 1]] - verts[tris[:, 0]]
-    v1 = verts[tris[:, 2]] - verts[tris[:, 0]]
-
-    cross_prod = np.cross(v0, v1)
-    areas = 0.5 * np.linalg.norm(cross_prod, axis=1)
-    norms = np.linalg.norm(cross_prod, axis=1, keepdims=True)
-    normals = np.divide(cross_prod, norms, where=(norms != 0), out=np.zeros_like(cross_prod))
-
-    angle_facets = np.degrees(np.arccos(np.clip(normals[:, 2], -1, 1)))
-    angle_facets = np.where(angle_facets > 90, 180 - angle_facets, angle_facets)
-    angle_facets = 90.0 - angle_facets  # Convert to plane such that vertical leaves are small angles and horizontal leaves are large
-
-    mean_angle = angle_facets.mean() if angle_facets.size > 0 else np.nan
-    bin_edges = np.linspace(0, 90, num_bins + 1)
-    idx = np.digitize(angle_facets, bin_edges) - 1
-    idx = np.clip(idx, 0, num_bins - 1)
-    bin_counts = np.bincount(idx, weights=areas, minlength=num_bins)
-    total_area = areas.sum()
-    liad = bin_counts / total_area if total_area > 0 else np.zeros(num_bins)
-    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    return bin_centers, liad, mean_angle
-
 def ray_box_intersection_vectorized(orig, dirs, bmin, bmax, eps=1e-12):
     safe = np.where(np.abs(dirs) < eps,
                     np.where(dirs >= 0, eps, -eps),
@@ -1286,7 +1256,8 @@ def process_voxel(
     wood_mesh, 
     angles, 
     wood_volume_points, 
-    lambda_1
+    lambda_1,
+    debug=False
     ):
     """
     Process a single voxel center with the given parameters.
@@ -1350,12 +1321,38 @@ def process_voxel(
     
     # Compute LIAD bins for voxel
     try:
-        bin_leaf, liad, _ = compute_LIAD_from_mesh(o3d_leaf) if o3d_leaf else (np.array([]), np.array([]), None)
-        bin_wood, wiad, _ = compute_LIAD_from_mesh(o3d_wood) if o3d_wood else (np.array([]), np.array([]), None)
+        liad_results = calculate_inclination_angle_distribution_o3dmesh(o3d_leaf, debug=debug) if o3d_leaf else (np.array([]), np.array([]), None)
+        wiad_results = calculate_inclination_angle_distribution_o3dmesh(o3d_wood, debug=debug) if o3d_wood else (np.array([]), np.array([]), None)
+
+        if len(liad_results) == 3:
+            bin_leaf, liad, _ = liad_results
+        elif len(liad_results) == 4:
+            bin_leaf, liad, _, fig = liad_results
+            # Save fig to DEBUG_PATH with voxel_center in filename
+            fig_path = os.path.join(DEBUG_PATH, f"liad_{voxel_center[0]}_{voxel_center[1]}_{voxel_center[2]}.png")
+            fig.savefig(fig_path)
+            plt.close(fig)
+        else:
+            raise ValueError(f"Unexpected LIAD results size: {len(liad_results)}")
+        
+        if liad.size == 0:
+            bin_leaf, liad = np.array([]), np.array([])
+
+        if len(wiad_results) == 3:
+            bin_wood, wiad, _ = wiad_results
+        elif len(wiad_results) == 4:
+            bin_wood, wiad, _, fig = wiad_results
+            # Save fig to DEBUG_PATH with voxel_center in filename
+            fig_path = os.path.join(DEBUG_PATH, f"wiad_{voxel_center[0]}_{voxel_center[1]}_{voxel_center[2]}.png")
+            fig.savefig(fig_path)
+            plt.close(fig)
+        else:
+            raise ValueError(f"Unexpected WIAD results size: {len(wiad_results)}")
+
         # Calculate PIAD from aggregated liad and wiad and renormalising
         if liad.size > 0 and wiad.size > 0:
             piad = (liad * LAD + wiad * WAD) / (LAD + WAD) if (LAD + WAD) > 0 else np.array([])
-            bin_all = bin_leaf  # Assuming same bins for combined; adjust if needed
+            bin_all = bin_leaf # Assuming same bins for combined; adjust if needed
         elif liad.size > 0 and not wiad.size > 0:
             piad = liad
             bin_all = bin_leaf
@@ -2540,9 +2537,9 @@ if __name__ == "__main__":
 
 
 
-        def process_voxel_wrapper(voxel_center, leaf_mesh, wood_mesh, voxel_size, angles, wood_volume_points, lambda_1):
+        def process_voxel_wrapper(voxel_center, leaf_mesh, wood_mesh, voxel_size, angles, wood_volume_points, lambda_1, debug=False):
             try:
-                args = (voxel_center, voxel_size, leaf_mesh, wood_mesh, angles, wood_volume_points, lambda_1)
+                args = (voxel_center, voxel_size, leaf_mesh, wood_mesh, angles, wood_volume_points, lambda_1, debug)
                 metadata, stats = process_voxel(*args)
                 # print(f" Processed voxel {args[0]} successfully.")
                 return metadata, stats
@@ -2662,7 +2659,8 @@ if __name__ == "__main__":
             voxel_size=voxel_size,
             angles=angles,
             wood_volume_points=wood_volume_points,
-            lambda_1=lambda_1
+            lambda_1=lambda_1,
+            debug=DEBUG_MODE
         )
 
         
@@ -2680,6 +2678,8 @@ if __name__ == "__main__":
                 pbar.update(1)
             pbar.close()
         else:
+            if DEBUG_MODE:
+                n_workers = 1
             print(f"Running in parallel with {n_workers} workers on {_DEV}...")
             pbar = tqdm(total=len(clipped_voxel_centres), desc="Processing voxels", unit="voxel")
             with tqdm_joblib(pbar):
