@@ -1347,7 +1347,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     feeder_thr = threading.Thread(target=gpu_feeder, name="gpu-feeder", daemon=True)
     feeder_thr.start()
 
-    out_csv = os.path.join(os.path.dirname(args.scene_file), os.path.basename(args.scene_file).replace('.obj', f'_results_{vs}_{dt.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv'))
+    timestamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    out_csv = os.path.join(os.path.dirname(args.scene_file), os.path.basename(args.scene_file).replace('.obj', f'_results_{vs}_{timestamp}.csv'))
     writer_thr = WriterThread(write_q, out_csv)
     writer_thr.start()
 

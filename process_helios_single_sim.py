@@ -29,7 +29,7 @@ Raises:
 
 This code processes Helios simulation data to prep all the voxel-ray intersections completed in order to gather voxel metrics from various scanning inputs.
 """
-from utils import test_helios_settings, prepare_helios_data, voxel_ray_intersections, voxel_ray_intersections_nodask
+from utils import test_helios_settings, prepare_helios_data, voxel_ray_intersections
 
 import os
 import argparse
@@ -100,7 +100,7 @@ if __name__ == "__main__":
 
     # Step 2: Calculate voxel-ray intersections for chosen voxel sizes
     try:
-        voxel_ray_intersections_nodask(
+        voxel_ray_intersections(
             valid_rays_dir=valid_rays_dir,
             references_dir=reference_dir
         )

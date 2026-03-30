@@ -1,4 +1,4 @@
-from utils import calculate_lambda_1, get_voxel_metrics, get_voxel_metrics_nodask
+from utils import calculate_lambda_1, get_voxel_metrics
 
 import os
 import glob
@@ -13,6 +13,7 @@ if __name__ == "__main__":
     parser.add_argument("--legs", type=int, nargs='+', default=None, help="List of leg IDs to process (i.e. --legs 1 3 6 7 will limit the outputs to use voxel-ray intersections from legs 1, 3, 6, and 7 even if more were processed). Default: None (will analyse all legs in project folder)")
     parser.add_argument("--valid_rays_path", type=str, default=None, help="Path to the valid rays directory. Defaults to 'valid_rays' folder in project directory.")
     parser.add_argument("--results_path", type=str, default=None, help="Path to the results directory. Defaults to 'results' folder in project directory.")
+    parser.add_argument("--same_normals", action='store_true', help="If set, uses the same normals for all voxel sizes (instead of calculating separate normals for each voxel size). This can speed up processing if you have many voxel sizes and want to use the same normals for all of them.")
     parser.add_argument("--debug", action='store_true', help="If set, runs in debug mode with verbose outputs and extra saved files")
     args = parser.parse_args()
 
@@ -63,7 +64,7 @@ if __name__ == "__main__":
         print(f"Using average leaf area from argument: {average_leaf_area} cm²")
 
     # Compute metrics and pass in desired output path
-    voxel_metrics_df = get_voxel_metrics_nodask(
+    voxel_metrics_df = get_voxel_metrics(
         intersections_folder=intersection_folder, 
         average_leaf_area=average_leaf_area, 
         output_dir=results_dir,
