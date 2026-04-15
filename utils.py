@@ -6420,6 +6420,14 @@ def _process_single_leg_task(
     verbose: bool,
 ):
     """Top-level worker entrypoint for process-based leg parallelism."""
+    _threads = max(1, int(numba_threads_override))
+    # Keep native thread pools aligned with per-worker budget.
+    os.environ["OMP_NUM_THREADS"] = str(_threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(_threads)
+    os.environ["MKL_NUM_THREADS"] = str(_threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(_threads)
+    set_num_threads(_threads)
+
     return process_files_numba_for_size(
         [pf],
         grid,
@@ -6442,6 +6450,14 @@ def _process_file_group_task(
     verbose: bool,
 ):
     """Top-level worker entrypoint for grouped file processing."""
+    _threads = max(1, int(numba_threads_override))
+    # Keep native thread pools aligned with per-worker budget.
+    os.environ["OMP_NUM_THREADS"] = str(_threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(_threads)
+    os.environ["MKL_NUM_THREADS"] = str(_threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(_threads)
+    set_num_threads(_threads)
+
     return process_files_numba_for_size(
         list(pf_group),
         grid,
@@ -6590,7 +6606,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
         env_target_threads_raw = os.environ.get("VOXEL_RI_TARGET_THREADS_PER_WORKER")
         env_max_workers_raw = os.environ.get("VOXEL_RI_MAX_WORKERS")
         env_max_threads_raw = os.environ.get("VOXEL_RI_MAX_THREADS_PER_WORKER")
-        mp_start_method = os.environ.get("VOXEL_RI_MP_START_METHOD", "fork").strip().lower()
+        mp_start_method = os.environ.get("VOXEL_RI_MP_START_METHOD", "spawn").strip().lower()
 
         if row_groups_by_file:
             observed_max_row_groups = max(1, max(int(v) for v in row_groups_by_file.values()))
@@ -6611,6 +6627,8 @@ def voxel_ray_intersections(valid_rays_dir: str,
             f"max_row_groups={observed_max_row_groups}, "
             f"target_threads_per_worker={target_threads_per_worker}"
         )
+        if _sys.platform == "linux" and mp_start_method == "fork":
+            log("  ⚠ Using fork start method; set VOXEL_RI_MP_START_METHOD=spawn for better stability")
 
         env_max_workers = None
         if env_max_workers_raw:
