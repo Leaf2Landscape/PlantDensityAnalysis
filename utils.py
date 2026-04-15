@@ -5952,6 +5952,7 @@ def process_files_numba_for_size(
         epsilon, 
         output_dir,
         schema=None,
+    numba_threads_override: Optional[int] = None,
         show_progress: bool = True,
         verbose: bool = True
     ):
@@ -5991,6 +5992,9 @@ def process_files_numba_for_size(
     import pandas as pd
     import pyarrow.parquet as pq
     from tqdm.auto import tqdm
+
+    if numba_threads_override is not None:
+        set_num_threads(max(1, int(numba_threads_override)))
 
     rays_traversed = 0
     echos = 0
@@ -6437,6 +6441,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
                                    *,
                                    epsilon: float = 1e-6,
                                    n_jobs: int = -1,
+                                   leg_workers: Optional[int] = None,
                                    debug: bool = True):
     """
     Produces a DataFrame with exactly OUTPUT_COLUMNS
@@ -6477,6 +6482,23 @@ def voxel_ray_intersections(valid_rays_dir: str,
     files = list_parquet_files(valid_rays_dir)
     log(f"\n[3/5] Processing {len(files)} parquet file(s) in parallel...")
 
+    # Fast metadata scan: use max row groups per leg to infer useful leg-level concurrency.
+    max_row_groups_per_leg = 1
+    row_groups_per_leg = []
+    if files:
+        for pf in files:
+            try:
+                nrg = pq.ParquetFile(pf).num_row_groups
+            except Exception:
+                # Conservative fallback if metadata read fails for any leg.
+                nrg = 1
+            row_groups_per_leg.append(max(1, int(nrg)))
+        max_row_groups_per_leg = max(row_groups_per_leg)
+        log(
+            f"  ✓ Parquet metadata: max_row_groups_per_leg={max_row_groups_per_leg}, "
+            f"min={min(row_groups_per_leg)}, mean={float(np.mean(row_groups_per_leg)):.2f}"
+        )
+
     # Configure Numba threads: use n_jobs if specified, otherwise detect from HPC environment
     if n_jobs >= 0:
         nthreads = max(1, n_jobs)
@@ -6490,10 +6512,43 @@ def voxel_ray_intersections(valid_rays_dir: str,
 
     try:
         for vs, grid in grids.items():
-            process_files_numba_for_size(
-                files, grid, epsilon, valid_rays_dir,
-                schema=voxel_ray_intersection_schema, verbose=debug
-            )
+            if leg_workers is None:
+                # Heuristic: each leg contributes up to max_row_groups_per_leg chunks.
+                # If legs have few row groups, run more legs concurrently.
+                inferred_workers = max(1, nthreads // max(1, max_row_groups_per_leg))
+                effective_leg_workers = min(len(files), inferred_workers)
+            else:
+                effective_leg_workers = max(1, int(leg_workers))
+
+            if effective_leg_workers > 1 and len(files) > 1:
+                threads_per_leg = max(1, nthreads // effective_leg_workers)
+                log(
+                    f"  ✓ Using leg-level parallelism: {effective_leg_workers} workers × "
+                    f"{threads_per_leg} Numba threads/worker"
+                )
+                Parallel(n_jobs=effective_leg_workers, prefer="processes")(
+                    delayed(process_files_numba_for_size)(
+                        [pf],
+                        grid,
+                        epsilon,
+                        valid_rays_dir,
+                        schema=voxel_ray_intersection_schema,
+                        numba_threads_override=threads_per_leg,
+                        show_progress=False,
+                        verbose=debug,
+                    )
+                    for pf in files
+                )
+            else:
+                process_files_numba_for_size(
+                    files,
+                    grid,
+                    epsilon,
+                    valid_rays_dir,
+                    schema=voxel_ray_intersection_schema,
+                    numba_threads_override=nthreads,
+                    verbose=debug,
+                )
     except Exception as e:
         log(f"  ✗ Error during processing: {e}")
         raise Exception(f"Error in process_files_numba_for_size: {e}")
