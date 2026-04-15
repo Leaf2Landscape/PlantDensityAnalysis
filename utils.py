@@ -1721,6 +1721,7 @@ def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, 
     # Import modules
     import os
     import glob
+    import re
     import shutil
     import logging
     import dask.delayed
@@ -1761,21 +1762,35 @@ def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, 
     voxel_references = [os.path.join(references_dir, f) for f in os.listdir(references_dir)
                         if os.path.isfile(os.path.join(references_dir, f)) and f.endswith('.csv')]
 
+    def _extract_voxel_size_from_filename(voxel_ref_path):
+        """Extract voxel size from reference filename patterns such as *_results_0.5.csv."""
+        stem = os.path.splitext(os.path.basename(voxel_ref_path))[0]
+
+        if "voxel_size_" in stem:
+            try:
+                return float(stem.split("voxel_size_")[-1])
+            except ValueError:
+                pass
+
+        # Fallback: expected format is *_results_{voxel_size}.csv
+        match = re.search(r"_results_(\d+(?:\.\d+)?)$", stem)
+        if match:
+            return float(match.group(1))
+
+        raise ValueError(f"Voxel size not found in {voxel_ref_path}. Please check the file name.")
+
     dfs = []
     for voxel_ref in tqdm(voxel_references, desc='Reading reference voxel files', unit='file'):
 
         df = pd.read_csv(voxel_ref, index_col=None, header=0)
 
         if "voxel_size" not in df.columns:
-            # Extract from filename if not in csv
-            voxel_size = os.path.basename(voxel_ref)
-            voxel_size = os.path.splitext(voxel_size)[0]
-            if "voxel_size_" in voxel_size:
-                voxel_size = float(voxel_size.split("voxel_size_")[1])
-            elif os.path.splitext(voxel_ref)[0].split("_")[-1].replace('.', '', 1).isdigit():
-                voxel_size = float(os.path.splitext(voxel_ref)[0].split("_")[-1])
-            else:
-                raise ValueError(f"Voxel size not found in {voxel_ref}. Please check the file name.")
+            voxel_size = _extract_voxel_size_from_filename(voxel_ref)
+            df['voxel_size'] = voxel_size
+            df.to_csv(voxel_ref, index=False)
+            logger.info(f"Added missing voxel_size={voxel_size} to {voxel_ref}")
+        else:
+            voxel_size = float(df['voxel_size'].iloc[0])
         
 
         if 'voxel_id' not in df.columns:
@@ -1796,7 +1811,7 @@ def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, 
             voxel_ids = new_df.apply(parallel_voxel_id, axis=1)
             df['voxel_id'] = voxel_ids
 
-            df.to_csv(voxel_ref)
+            df.to_csv(voxel_ref, index=False)
 
             logger.info(f"Updated voxel_ids for {voxel_ref}")
 
