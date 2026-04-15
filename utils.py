@@ -6586,7 +6586,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
                 for leg_info in legs_with_threads:
                     _, _, leg_threads = leg_info
                     # Stop batch if: (1) thread budget exceeded, OR (2) process worker limit reached
-                    if batch and (batch_threads + leg_threads > nthreads or len(batch) >= _max_process_workers):
+                    if batch and (batch_threads + leg_threads > nthreads or len(batch) >= _max_concurrent_procs):
                         batches.append(batch)
                         batch = [leg_info]
                         batch_threads = leg_threads
@@ -6598,7 +6598,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
 
                 log(
                     f"  ✓ Using row-group-aware batching: {len(batches)} batch(es) under "
-                    # f"{nthreads} Numba threads, max {_max_process_workers} process workers"
+                    f"{nthreads} Numba threads, max {_max_concurrent_procs} process workers"
                 )
                 try:
                     import concurrent.futures
