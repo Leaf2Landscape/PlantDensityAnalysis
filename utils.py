@@ -72,6 +72,47 @@ from collections import defaultdict
 import tqdm_joblib
 
 
+### Module Initialization: Configure Numba threading from HPC environment ###
+def _setup_numba_threads():
+    """
+    Configure Numba threading on module load based on HPC environment.
+    Respects SLURM_CPUS_PER_TASK, OMP_NUM_THREADS, or falls back to cpu_count.
+    """
+    # Detect number of CPUs from environment
+    nthreads = 1
+    if 'SLURM_CPUS_PER_TASK' in os.environ:
+        try:
+            n = int(os.environ['SLURM_CPUS_PER_TASK'])
+            if n > 0:
+                nthreads = n
+        except (ValueError, TypeError):
+            pass
+    elif 'OMP_NUM_THREADS' in os.environ:
+        try:
+            n = int(os.environ['OMP_NUM_THREADS'])
+            if n > 0:
+                nthreads = n
+        except (ValueError, TypeError):
+            pass
+    else:
+        # Fall back to os.cpu_count()
+        n = os.cpu_count()
+        if n and n > 0:
+            nthreads = n
+    
+    # Set OMP_NUM_THREADS environment variable (Numba respects this)
+    os.environ['OMP_NUM_THREADS'] = str(nthreads)
+    
+    # Also explicitly set Numba threads
+    set_num_threads(nthreads)
+    
+    # Verify
+    actual = get_num_threads()
+    print(f"[Numba] Configured for {nthreads} threads (actual via get_num_threads: {actual})")
+    print(f"[Numba] Environment: SLURM_CPUS_PER_TASK={os.environ.get('SLURM_CPUS_PER_TASK', 'not set')}, OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', 'not set')}")
+
+_setup_numba_threads()
+
 ### CONSTANTS ###
 beam_divergence = np.float32(0.001) # Beam divergence in radians
 
