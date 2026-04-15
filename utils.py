@@ -36,6 +36,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from tqdm import tqdm
+import joblib
 from joblib import Parallel, delayed
 from multiprocessing import Manager
 from threading import Thread
@@ -6510,6 +6511,26 @@ def voxel_ray_intersections(valid_rays_dir: str,
     log(f"  ✓ Configured Numba for {nthreads} threads (actual: {actual_threads})")
     log(f"  ℹ Environment: SLURM_CPUS_PER_TASK={os.environ.get('SLURM_CPUS_PER_TASK', 'not set')}, OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', 'not set')}")
 
+    def _run_parallel_with_progress(prefer_backend: str, tasks, total_tasks: int, desc: str, workers: int):
+        """Run joblib tasks with a parent-side tqdm that updates as batches complete."""
+        if not debug:
+            return Parallel(n_jobs=workers, prefer=prefer_backend)(tasks)
+
+        pbar = tqdm(total=total_tasks, desc=desc, dynamic_ncols=True, leave=True)
+
+        class _TqdmBatchCompletionCallback(joblib.parallel.BatchCompletionCallBack):
+            def __call__(self, *args, **kwargs):
+                pbar.update(n=self.batch_size)
+                return super().__call__(*args, **kwargs)
+
+        old_batch_callback = joblib.parallel.BatchCompletionCallBack
+        joblib.parallel.BatchCompletionCallBack = _TqdmBatchCompletionCallback
+        try:
+            return Parallel(n_jobs=workers, prefer=prefer_backend)(tasks)
+        finally:
+            joblib.parallel.BatchCompletionCallBack = old_batch_callback
+            pbar.close()
+
     try:
         for vs, grid in grids.items():
             if leg_workers is None:
@@ -6527,19 +6548,25 @@ def voxel_ray_intersections(valid_rays_dir: str,
                     f"{threads_per_leg} Numba threads/worker"
                 )
                 try:
-                    Parallel(n_jobs=effective_leg_workers, prefer="processes")(
-                        delayed(process_files_numba_for_size)(
-                            [pf],
-                            grid,
-                            epsilon,
-                            valid_rays_dir,
-                            # Avoid sending Arrow schema over process boundaries.
-                            schema=None,
-                            numba_threads_override=threads_per_leg,
-                            show_progress=False,
-                            verbose=debug,
-                        )
-                        for pf in files
+                    _run_parallel_with_progress(
+                        "processes",
+                        (
+                            delayed(process_files_numba_for_size)(
+                                [pf],
+                                grid,
+                                epsilon,
+                                valid_rays_dir,
+                                # Avoid sending Arrow schema over process boundaries.
+                                schema=None,
+                                numba_threads_override=threads_per_leg,
+                                show_progress=False,
+                                verbose=debug,
+                            )
+                            for pf in files
+                        ),
+                        total_tasks=len(files),
+                        desc=f"Legs (voxel={float(grid['voxel_size']):.1f}m)",
+                        workers=effective_leg_workers,
                     )
                 except Exception as par_exc:
                     msg = str(par_exc).lower()
@@ -6547,18 +6574,24 @@ def voxel_ray_intersections(valid_rays_dir: str,
                         log("  ! Process backend failed to serialize task; retrying with threading backend")
                         # For threading backend, set once globally to avoid per-task race on set_num_threads.
                         set_num_threads(threads_per_leg)
-                        Parallel(n_jobs=effective_leg_workers, prefer="threads")(
-                            delayed(process_files_numba_for_size)(
-                                [pf],
-                                grid,
-                                epsilon,
-                                valid_rays_dir,
-                                schema=voxel_ray_intersection_schema,
-                                numba_threads_override=None,
-                                show_progress=False,
-                                verbose=debug,
-                            )
-                            for pf in files
+                        _run_parallel_with_progress(
+                            "threads",
+                            (
+                                delayed(process_files_numba_for_size)(
+                                    [pf],
+                                    grid,
+                                    epsilon,
+                                    valid_rays_dir,
+                                    schema=voxel_ray_intersection_schema,
+                                    numba_threads_override=None,
+                                    show_progress=False,
+                                    verbose=debug,
+                                )
+                                for pf in files
+                            ),
+                            total_tasks=len(files),
+                            desc=f"Legs (voxel={float(grid['voxel_size']):.1f}m, threads fallback)",
+                            workers=effective_leg_workers,
                         )
                     else:
                         raise
