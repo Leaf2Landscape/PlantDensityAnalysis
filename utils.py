@@ -6743,7 +6743,9 @@ def voxel_ray_intersections(valid_rays_dir: str,
                                             done_rays += int(res.get("rays_traversed", 0))
                                         if pbar is not None:
                                             pbar.update(1)
-                        pbar.close()
+                        
+                        if pbar is not None:
+                            pbar.close()
                 except Exception as par_exc:
                     msg = str(par_exc).lower()
                     _is_broken = (isinstance(par_exc, concurrent.futures.BrokenExecutor)
