@@ -6565,12 +6565,42 @@ def voxel_ray_intersections(valid_rays_dir: str,
             gc.collect()
             
             if leg_workers is None and len(files) > 1:
-                # Cap process worker count to physical CPUs to avoid oversubscription.
-                # Numba threads control parallelism *within* each worker;
-                # we don't want more concurrent processes than CPUs available.
+                # Estimate safe process worker count to avoid OOM during fork + compute.
+                # Check SLURM first (HPC systems), then fall back to psutil.
                 import psutil as _psutil
+                
+                # Determine available memory: SLURM_MEM_PER_NODE or SLURM_MEM_PER_CPU first, then psutil
+                _available_mb = None
+                if 'SLURM_MEM_PER_NODE' in os.environ:
+                    try:
+                        _available_mb = float(os.environ['SLURM_MEM_PER_NODE'])
+                        log(f"  ℹ Using SLURM_MEM_PER_NODE={_available_mb:.0f} MB")
+                    except (ValueError, TypeError):
+                        pass
+                elif 'SLURM_MEM_PER_CPU' in os.environ and 'SLURM_CPUS_PER_TASK' in os.environ:
+                    try:
+                        _mem_per_cpu = float(os.environ['SLURM_MEM_PER_CPU'])
+                        _cpus = int(os.environ['SLURM_CPUS_PER_TASK'])
+                        _available_mb = _mem_per_cpu * _cpus
+                        log(f"  ℹ Using SLURM_MEM_PER_CPU={_mem_per_cpu} MB × {_cpus} CPUs = {_available_mb:.0f} MB")
+                    except (ValueError, TypeError):
+                        pass
+                
+                if _available_mb is None:
+                    _available_mb = _psutil.virtual_memory().available / (1024 ** 2)
+                    log(f"  ℹ Using psutil available RAM={_available_mb:.0f} MB")
+                
                 _phys_cpus = _psutil.cpu_count(logical=False) or _psutil.cpu_count(logical=True) or max(1, nthreads // 2)
-                _max_process_workers = max(1, min(_phys_cpus, nthreads))
+                _parent_rss_mb = _psutil.Process().memory_info().rss / (1024 ** 2)
+                # Conservative: assume each worker will dirty ~2x parent RSS; leave 20% headroom
+                _memory_safe_workers = max(1, int(_available_mb * 0.80 / max(1.0, _parent_rss_mb * 2.0)))
+                _max_process_workers = min(_phys_cpus, _memory_safe_workers, nthreads)
+                
+                log(
+                    f"  ℹ Memory safety: parent RSS={_parent_rss_mb:.0f} MB, assumed peak per worker={_parent_rss_mb * 2.0:.0f} MB "
+                    f"→ estimate {_memory_safe_workers} safe workers; capping to {_max_process_workers} "
+                    f"(phys CPUs={_phys_cpus}, thread budget={nthreads})"
+                )
                 
                 # Build batches where sum(per-leg threads) does not exceed total threads.
                 # Per-leg threads follow that leg's row-group count (capped by total threads).
@@ -6598,7 +6628,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
 
                 log(
                     f"  ✓ Using row-group-aware batching: {len(batches)} batch(es) under "
-                    f"{nthreads} Numba threads, max {_max_process_workers} process workers (phys CPUs={_phys_cpus})"
+                    f"{nthreads} Numba threads, max {_max_process_workers} process workers"
                 )
                 try:
                     import concurrent.futures
