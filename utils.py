@@ -6350,6 +6350,45 @@ def process_files_numba_for_size(
         overall_bar.close()
 
 # ------------------------------------------------------------
+# Helper: Detect CPU count from HPC environment
+# ------------------------------------------------------------
+def _detect_num_cpus() -> int:
+    """
+    Detect available CPUs for Numba parallelization.
+    Checks SLURM environment first (HPC systems), then falls back to os.cpu_count().
+    
+    Returns
+    -------
+    int
+        Number of CPUs to use for Numba parallelization.
+    """
+    # Check SLURM_CPUS_PER_TASK (set by Slurm job scheduler on HPC)
+    if 'SLURM_CPUS_PER_TASK' in os.environ:
+        try:
+            cpus = int(os.environ['SLURM_CPUS_PER_TASK'])
+            if cpus > 0:
+                return cpus
+        except (ValueError, TypeError):
+            pass
+    
+    # Check OMP_NUM_THREADS (OpenMP standard)
+    if 'OMP_NUM_THREADS' in os.environ:
+        try:
+            cpus = int(os.environ['OMP_NUM_THREADS'])
+            if cpus > 0:
+                return cpus
+        except (ValueError, TypeError):
+            pass
+    
+    # Fall back to os.cpu_count()
+    cpus = os.cpu_count()
+    if cpus and cpus > 0:
+        return cpus
+    
+    # Final fallback
+    return 1
+
+# ------------------------------------------------------------
 # Main function: traversal-first voxel-ray intersections
 # ------------------------------------------------------------
 def voxel_ray_intersections(valid_rays_dir: str,
@@ -6397,8 +6436,13 @@ def voxel_ray_intersections(valid_rays_dir: str,
     files = list_parquet_files(valid_rays_dir)
     log(f"\n[3/5] Processing {len(files)} parquet file(s) in parallel...")
 
+    # Configure Numba threads: use n_jobs if specified, otherwise detect from HPC environment
     if n_jobs >= 0:
-        set_num_threads(max(1, n_jobs)) # else let numba handle itself
+        nthreads = max(1, n_jobs)
+    else:
+        nthreads = _detect_num_cpus()
+    set_num_threads(nthreads)
+    log(f"  ✓ Configured Numba for {nthreads} threads")
 
     try:
         for vs, grid in grids.items():
