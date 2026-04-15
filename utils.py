@@ -6404,6 +6404,28 @@ def process_files_numba_for_size(
         "rays_traversed": int(rays_traversed),
     }
 
+
+def _process_single_leg_task(
+    pf: str,
+    grid,
+    epsilon: float,
+    valid_rays_dir: str,
+    numba_threads_override: int,
+    verbose: bool,
+):
+    """Top-level worker entrypoint for process-based leg parallelism."""
+    return process_files_numba_for_size(
+        [pf],
+        grid,
+        epsilon,
+        valid_rays_dir,
+        schema=None,
+        numba_threads_override=numba_threads_override,
+        show_progress=False,
+        quiet=True,
+        verbose=verbose,
+    )
+
 # ------------------------------------------------------------
 # Helper: Detect CPU count from HPC environment
 # ------------------------------------------------------------
@@ -6520,55 +6542,13 @@ def voxel_ray_intersections(valid_rays_dir: str,
     log(f"  ✓ Configured Numba for {nthreads} threads (actual: {actual_threads})")
     log(f"  ℹ Environment: SLURM_CPUS_PER_TASK={os.environ.get('SLURM_CPUS_PER_TASK', 'not set')}, OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', 'not set')}")
 
-    def _run_parallel_with_progress(prefer_backend: str, tasks, total_tasks: int, desc: str, workers: int):
-        """Run joblib tasks with a parent-side tqdm that updates as batches complete."""
+    def _should_use_tqdm() -> bool:
         import sys
-        start_ts = time.time()
-        use_tqdm = False
+
         try:
-            use_tqdm = bool(getattr(sys.stderr, "isatty", lambda: False)())
+            return bool(getattr(sys.stderr, "isatty", lambda: False)())
         except Exception:
-            use_tqdm = False
-
-        pbar = None
-        if use_tqdm:
-            pbar = tqdm(total=total_tasks, desc=desc, dynamic_ncols=True, leave=True)
-        else:
-            print(f"  -> {desc}: started {total_tasks} legs on {workers} workers", flush=True)
-        progress_done = {"count": 0}
-        report_every = max(1, total_tasks // 20)  # ~5% increments
-
-        class _TqdmBatchCompletionCallback(joblib.parallel.BatchCompletionCallBack):
-            def __call__(self, *args, **kwargs):
-                progress_done["count"] += int(self.batch_size)
-                if pbar is not None:
-                    pbar.update(n=self.batch_size)
-                else:
-                    done = progress_done["count"]
-                    if done >= total_tasks or (done % report_every == 0):
-                        elapsed = max(1e-9, time.time() - start_ts)
-                        rate = done / elapsed
-                        pct = 100.0 * done / max(1, total_tasks)
-                        print(f"  -> {desc}: {done}/{total_tasks} ({pct:.1f}%) at {rate:.2f} legs/s", flush=True)
-                return super().__call__(*args, **kwargs)
-
-        old_batch_callback = joblib.parallel.BatchCompletionCallBack
-        joblib.parallel.BatchCompletionCallBack = _TqdmBatchCompletionCallback
-        try:
-            return Parallel(n_jobs=workers, prefer=prefer_backend)(tasks)
-        finally:
-            joblib.parallel.BatchCompletionCallBack = old_batch_callback
-            if pbar is not None:
-                pbar.close()
-            elif progress_done["count"] < total_tasks:
-                elapsed = max(1e-9, time.time() - start_ts)
-                rate = progress_done["count"] / elapsed
-                print(
-                    f"  -> {desc}: {progress_done['count']}/{total_tasks} "
-                    f"({100.0 * progress_done['count'] / max(1, total_tasks):.1f}%) "
-                    f"at {rate:.2f} legs/s",
-                    flush=True,
-                )
+            return False
 
     try:
         for vs, grid in grids.items():
@@ -6587,27 +6567,61 @@ def voxel_ray_intersections(valid_rays_dir: str,
                     f"{threads_per_leg} Numba threads/worker"
                 )
                 try:
-                    _run_parallel_with_progress(
-                        "processes",
-                        (
-                            delayed(process_files_numba_for_size)(
-                                [pf],
+                    import concurrent.futures
+
+                    total_legs = len(files)
+                    desc = f"Legs (voxel={float(grid['voxel_size']):.1f}m)"
+                    use_tqdm = _should_use_tqdm()
+
+                    start_ts = time.time()
+                    done_legs = 0
+                    done_rays = 0
+                    report_every = max(1, total_legs // 20)
+                    pbar = None
+                    if use_tqdm:
+                        pbar = tqdm(total=total_legs, desc=desc, dynamic_ncols=True, leave=True)
+                    else:
+                        print(f"  -> {desc}: started {total_legs} legs on {effective_leg_workers} workers", flush=True)
+
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=effective_leg_workers) as ex:
+                        futs = [
+                            ex.submit(
+                                _process_single_leg_task,
+                                pf,
                                 grid,
                                 epsilon,
                                 valid_rays_dir,
-                                # Avoid sending Arrow schema over process boundaries.
-                                schema=None,
-                                numba_threads_override=threads_per_leg,
-                                show_progress=False,
-                                quiet=True,
-                                verbose=debug,
+                                threads_per_leg,
+                                debug,
                             )
                             for pf in files
-                        ),
-                        total_tasks=len(files),
-                        desc=f"Legs (voxel={float(grid['voxel_size']):.1f}m)",
-                        workers=effective_leg_workers,
-                    )
+                        ]
+                        for fut in concurrent.futures.as_completed(futs):
+                            res = fut.result()
+                            done_legs += 1
+                            if isinstance(res, dict):
+                                done_rays += int(res.get("rays_traversed", 0))
+
+                            elapsed = max(1e-9, time.time() - start_ts)
+                            legs_rate = done_legs / elapsed
+                            rays_rate = done_rays / elapsed
+
+                            if pbar is not None:
+                                pbar.update(1)
+                                pbar.set_postfix_str(
+                                    f"rays={done_rays:,} | {rays_rate:,.0f} rays/s",
+                                    refresh=True,
+                                )
+                            elif done_legs >= total_legs or done_legs % report_every == 0:
+                                pct = 100.0 * done_legs / max(1, total_legs)
+                                print(
+                                    f"  -> {desc}: {done_legs}/{total_legs} ({pct:.1f}%) | "
+                                    f"{legs_rate:.2f} legs/s | {done_rays:,} rays | {rays_rate:,.0f} rays/s",
+                                    flush=True,
+                                )
+
+                    if pbar is not None:
+                        pbar.close()
                 except Exception as par_exc:
                     msg = str(par_exc).lower()
                     if "un-serialize" in msg or "pickle" in msg or "picklable" in msg:
@@ -6619,11 +6633,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
 
                         total_legs = len(files)
                         desc = f"Legs (voxel={float(grid['voxel_size']):.1f}m, threads fallback)"
-                        use_tqdm = False
-                        try:
-                            use_tqdm = bool(getattr(sys.stderr, "isatty", lambda: False)())
-                        except Exception:
-                            use_tqdm = False
+                        use_tqdm = _should_use_tqdm()
 
                         start_ts = time.time()
                         done_legs = 0
