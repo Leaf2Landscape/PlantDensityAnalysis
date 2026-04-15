@@ -6522,9 +6522,6 @@ def voxel_ray_intersections(valid_rays_dir: str,
 
     def _run_parallel_with_progress(prefer_backend: str, tasks, total_tasks: int, desc: str, workers: int):
         """Run joblib tasks with a parent-side tqdm that updates as batches complete."""
-        if not debug:
-            return Parallel(n_jobs=workers, prefer=prefer_backend)(tasks)
-
         import sys
         start_ts = time.time()
         use_tqdm = False
@@ -6537,7 +6534,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
         if use_tqdm:
             pbar = tqdm(total=total_tasks, desc=desc, dynamic_ncols=True, leave=True)
         else:
-            print(f"  -> {desc}: started {total_tasks} legs on {workers} workers")
+            print(f"  -> {desc}: started {total_tasks} legs on {workers} workers", flush=True)
         progress_done = {"count": 0}
         report_every = max(1, total_tasks // 20)  # ~5% increments
 
@@ -6552,7 +6549,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
                         elapsed = max(1e-9, time.time() - start_ts)
                         rate = done / elapsed
                         pct = 100.0 * done / max(1, total_tasks)
-                        print(f"  -> {desc}: {done}/{total_tasks} ({pct:.1f}%) at {rate:.2f} legs/s")
+                        print(f"  -> {desc}: {done}/{total_tasks} ({pct:.1f}%) at {rate:.2f} legs/s", flush=True)
                 return super().__call__(*args, **kwargs)
 
         old_batch_callback = joblib.parallel.BatchCompletionCallBack
@@ -6569,7 +6566,8 @@ def voxel_ray_intersections(valid_rays_dir: str,
                 print(
                     f"  -> {desc}: {progress_done['count']}/{total_tasks} "
                     f"({100.0 * progress_done['count'] / max(1, total_tasks):.1f}%) "
-                    f"at {rate:.2f} legs/s"
+                    f"at {rate:.2f} legs/s",
+                    flush=True,
                 )
 
     try:
@@ -6632,10 +6630,10 @@ def voxel_ray_intersections(valid_rays_dir: str,
                         done_rays = 0
                         report_every = max(1, total_legs // 20)
                         pbar = None
-                        if debug and use_tqdm:
+                        if use_tqdm:
                             pbar = tqdm(total=total_legs, desc=desc, dynamic_ncols=True, leave=True)
-                        elif debug:
-                            print(f"  -> {desc}: started {total_legs} legs on {effective_leg_workers} workers")
+                        else:
+                            print(f"  -> {desc}: started {total_legs} legs on {effective_leg_workers} workers", flush=True)
 
                         def _run_one_leg(_pf):
                             return process_files_numba_for_size(
@@ -6668,11 +6666,13 @@ def voxel_ray_intersections(valid_rays_dir: str,
                                         f"rays={done_rays:,} | {rays_rate:,.0f} rays/s",
                                         refresh=True,
                                     )
-                                elif debug and (done_legs >= total_legs or done_legs % report_every == 0):
+                                elif done_legs >= total_legs or done_legs % report_every == 0:
                                     pct = 100.0 * done_legs / max(1, total_legs)
                                     print(
                                         f"  -> {desc}: {done_legs}/{total_legs} ({pct:.1f}%) | "
                                         f"{legs_rate:.2f} legs/s | {done_rays:,} rays | {rays_rate:,.0f} rays/s"
+                                        ,
+                                        flush=True,
                                     )
 
                         if pbar is not None:
