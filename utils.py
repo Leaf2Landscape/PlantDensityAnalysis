@@ -5955,6 +5955,7 @@ def process_files_numba_for_size(
         schema=None,
     numba_threads_override: Optional[int] = None,
         show_progress: bool = True,
+    quiet: bool = False,
         verbose: bool = True
     ):
     """
@@ -6007,6 +6008,8 @@ def process_files_numba_for_size(
     # --- Helpers for consistent, non-interleaving output ---
     def log(msg: str):
         """Write a line without disrupting tqdm's rendering."""
+        if quiet:
+            return
         if overall_bar is not None:
             overall_bar.write(msg)
         else:
@@ -6101,7 +6104,7 @@ def process_files_numba_for_size(
         if overall_bar is not None:
         # Note: set_postfix is efficient; refresh triggers a single re-render
             overall_bar.set_postfix_str(_postfix_str(), refresh=True)
-        else:
+        elif not quiet:
             log("Summary | " + _postfix_str())
 
     # --- main loop over files (legs) ---------------------------------------
@@ -6560,6 +6563,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
                                 schema=None,
                                 numba_threads_override=threads_per_leg,
                                 show_progress=False,
+                                quiet=True,
                                 verbose=debug,
                             )
                             for pf in files
@@ -6585,6 +6589,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
                                     schema=voxel_ray_intersection_schema,
                                     numba_threads_override=None,
                                     show_progress=False,
+                                    quiet=True,
                                     verbose=debug,
                                 )
                                 for pf in files
@@ -6603,6 +6608,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
                     valid_rays_dir,
                     schema=voxel_ray_intersection_schema,
                     numba_threads_override=nthreads,
+                    quiet=False,
                     verbose=debug,
                 )
     except Exception as e:
