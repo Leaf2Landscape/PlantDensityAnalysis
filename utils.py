@@ -6609,22 +6609,31 @@ def voxel_ray_intersections(valid_rays_dir: str,
         mp_start_method = os.environ.get("VOXEL_RI_MP_START_METHOD", "spawn").strip().lower()
 
         if row_groups_by_file:
-            observed_max_row_groups = max(1, max(int(v) for v in row_groups_by_file.values()))
+            _rg_values = np.array([max(1, int(v)) for v in row_groups_by_file.values()], dtype=np.int32)
+            observed_max_row_groups = int(np.max(_rg_values))
+            observed_mean_row_groups = float(np.mean(_rg_values))
+            observed_p90_row_groups = int(max(1, math.ceil(float(np.percentile(_rg_values, 90)))))
         else:
             observed_max_row_groups = 1
+            observed_mean_row_groups = 1.0
+            observed_p90_row_groups = 1
+
+        auto_target_threads_per_worker = 1 if observed_p90_row_groups <= 1 else 2
 
         if env_target_threads_raw:
             try:
                 target_threads_per_worker = max(1, int(env_target_threads_raw))
             except (TypeError, ValueError):
                 # Invalid override; fall back to metadata-driven default.
-                target_threads_per_worker = 1 if observed_max_row_groups <= 1 else 2
+                target_threads_per_worker = auto_target_threads_per_worker
         else:
-            target_threads_per_worker = 1 if observed_max_row_groups <= 1 else 2
+            target_threads_per_worker = auto_target_threads_per_worker
 
         log(
             "  ℹ Scheduler defaults: "
             f"max_row_groups={observed_max_row_groups}, "
+            f"p90_row_groups={observed_p90_row_groups}, "
+            f"mean_row_groups={observed_mean_row_groups:.2f}, "
             f"target_threads_per_worker={target_threads_per_worker}"
         )
         if _sys.platform == "linux" and mp_start_method == "fork":
@@ -6803,6 +6812,9 @@ def voxel_ray_intersections(valid_rays_dir: str,
 
                 if env_max_workers is not None:
                     requested_workers = min(requested_workers, env_max_workers)
+                elif leg_workers is None and cpu_budget > 32:
+                    # Stability guard for high-core nodes: avoid extreme process fan-out by default.
+                    requested_workers = min(requested_workers, max(1, cpu_budget // 2))
 
                 requested_workers = min(requested_workers, len(files), cpu_budget)
                 if requested_workers < 1:
