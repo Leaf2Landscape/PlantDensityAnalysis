@@ -101,6 +101,11 @@ def _setup_numba_threads():
         if n and n > 0:
             nthreads = n
     
+    # Clamp to Numba's actual maximum (e.g. physical cores, not hyperthreads)
+    numba_max = get_num_threads()
+    if nthreads > numba_max:
+        nthreads = numba_max
+
     # Set OMP_NUM_THREADS environment variable (Numba respects this)
     os.environ['OMP_NUM_THREADS'] = str(nthreads)
     
