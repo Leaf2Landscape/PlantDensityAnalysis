@@ -6559,7 +6559,19 @@ def voxel_ray_intersections(valid_rays_dir: str,
 
     try:
         for vs, grid in grids.items():
+            # Clean up memory from the previous voxel size iteration
+            # to avoid inheriting accumulated state across fork boundaries
+            import gc
+            gc.collect()
+            
             if leg_workers is None and len(files) > 1:
+                # Cap process worker count to physical CPUs to avoid oversubscription.
+                # Numba threads control parallelism *within* each worker;
+                # we don't want more concurrent processes than CPUs available.
+                import psutil as _psutil
+                _phys_cpus = _psutil.cpu_count(logical=False) or _psutil.cpu_count(logical=True) or max(1, nthreads // 2)
+                _max_process_workers = max(1, min(_phys_cpus, nthreads))
+                
                 # Build batches where sum(per-leg threads) does not exceed total threads.
                 # Per-leg threads follow that leg's row-group count (capped by total threads).
                 legs_with_threads = []
@@ -6573,7 +6585,8 @@ def voxel_ray_intersections(valid_rays_dir: str,
                 batch_threads = 0
                 for leg_info in legs_with_threads:
                     _, _, leg_threads = leg_info
-                    if batch and (batch_threads + leg_threads > nthreads):
+                    # Stop batch if: (1) thread budget exceeded, OR (2) process worker limit reached
+                    if batch and (batch_threads + leg_threads > nthreads or len(batch) >= _max_process_workers):
                         batches.append(batch)
                         batch = [leg_info]
                         batch_threads = leg_threads
@@ -6585,7 +6598,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
 
                 log(
                     f"  ✓ Using row-group-aware batching: {len(batches)} batch(es) under "
-                    f"{nthreads} total Numba threads"
+                    f"{nthreads} Numba threads, max {_max_process_workers} process workers (phys CPUs={_phys_cpus})"
                 )
                 try:
                     import concurrent.futures
@@ -6613,7 +6626,9 @@ def voxel_ray_intersections(valid_rays_dir: str,
                                 flush=True,
                             )
 
-                        with concurrent.futures.ProcessPoolExecutor(max_workers=len(batch)) as ex:
+                        import multiprocessing, sys as _sys
+                        _mp_ctx = multiprocessing.get_context('fork') if _sys.platform == 'linux' else None
+                        with concurrent.futures.ProcessPoolExecutor(max_workers=len(batch), mp_context=_mp_ctx) as ex:
                             futs = [
                                 ex.submit(
                                     _process_single_leg_task,
@@ -6654,13 +6669,18 @@ def voxel_ray_intersections(valid_rays_dir: str,
                         pbar.close()
                 except Exception as par_exc:
                     msg = str(par_exc).lower()
-                    if "un-serialize" in msg or "pickle" in msg or "picklable" in msg:
-                        log("  ! Process backend failed to serialize task; retrying with threading backend")
+                    _is_broken = (isinstance(par_exc, concurrent.futures.BrokenExecutor)
+                                  or "terminated abruptly" in msg or "broken" in msg)
+                    _is_pickle = "un-serialize" in msg or "pickle" in msg or "picklable" in msg
+                    if _is_pickle or _is_broken:
+                        if _is_broken:
+                            log("  ! Worker process killed (OOM or signal); retrying with threading backend")
+                        else:
+                            log("  ! Process backend failed to serialize task; retrying with threading backend")
                         # For threading backend, set once globally to avoid per-task race on set_num_threads.
                         fallback_workers = max(1, min(len(files), int(leg_workers) if leg_workers is not None else nthreads))
                         fallback_threads_per_leg = max(1, nthreads // fallback_workers)
                         set_num_threads(fallback_threads_per_leg)
-                        import concurrent.futures
                         import sys
 
                         total_legs = len(files)
@@ -6745,7 +6765,9 @@ def voxel_ray_intersections(valid_rays_dir: str,
                     else:
                         print(f"  -> {desc}: started {total_legs} legs on {effective_leg_workers} workers", flush=True)
 
-                    with concurrent.futures.ProcessPoolExecutor(max_workers=effective_leg_workers) as ex:
+                    import multiprocessing, sys as _sys
+                    _mp_ctx = multiprocessing.get_context('fork') if _sys.platform == 'linux' else None
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=effective_leg_workers, mp_context=_mp_ctx) as ex:
                         futs = [
                             ex.submit(
                                 _process_single_leg_task,
@@ -6786,11 +6808,16 @@ def voxel_ray_intersections(valid_rays_dir: str,
                         pbar.close()
                 except Exception as par_exc:
                     msg = str(par_exc).lower()
-                    if "un-serialize" in msg or "pickle" in msg or "picklable" in msg:
-                        log("  ! Process backend failed to serialize task; retrying with threading backend")
+                    _is_broken = (isinstance(par_exc, concurrent.futures.BrokenExecutor)
+                                  or "terminated abruptly" in msg or "broken" in msg)
+                    _is_pickle = "un-serialize" in msg or "pickle" in msg or "picklable" in msg
+                    if _is_pickle or _is_broken:
+                        if _is_broken:
+                            log("  ! Worker process killed (OOM or signal); retrying with threading backend")
+                        else:
+                            log("  ! Process backend failed to serialize task; retrying with threading backend")
                         # For threading backend, set once globally to avoid per-task race on set_num_threads.
                         set_num_threads(threads_per_leg)
-                        import concurrent.futures
                         import sys
 
                         total_legs = len(files)
