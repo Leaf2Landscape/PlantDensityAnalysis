@@ -111,11 +111,6 @@ def _setup_numba_threads():
     
     # Also explicitly set Numba threads
     set_num_threads(nthreads)
-    
-    # Verify
-    actual = get_num_threads()
-    print(f"[Numba] Configured for {nthreads} threads (actual via get_num_threads: {actual})")
-    print(f"[Numba] Environment: SLURM_CPUS_PER_TASK={os.environ.get('SLURM_CPUS_PER_TASK', 'not set')}, OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', 'not set')}")
 
 _setup_numba_threads()
 
