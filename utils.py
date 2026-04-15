@@ -1761,8 +1761,8 @@ def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, 
     voxel_references = [os.path.join(references_dir, f) for f in os.listdir(references_dir)
                         if os.path.isfile(os.path.join(references_dir, f)) and f.endswith('.csv')]
 
-    dfs =[]
-    for voxel_ref in voxel_references:
+    dfs = []
+    for voxel_ref in tqdm(voxel_references, desc='Reading reference voxel files', unit='file'):
 
         df = pd.read_csv(voxel_ref, index_col=None, header=0)
 
@@ -1822,109 +1822,100 @@ def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, 
     # Cleanup memory
     del plot_bounds, df, dfs, voxel_references
 
-    ### DEFINE FUNCTIONS REQUIRED FOR VALID RAYS PREPARATION ###
-
-    # Function to traverse plot and remove any rays which do not intersect the voxel plot
-    # Plot min and max are already calculated
-    def is_in_plot(ray_origins, ray_directions):
-        t_min = da.divide(plot_min - ray_origins, ray_directions, out=da.full_like(ray_origins, np.inf), where=da.all(ray_directions!=0))
-        t_max = da.divide(plot_max - ray_origins, ray_directions, out=da.full_like(ray_origins, np.inf), where=da.all(ray_directions!=0))
-        t1 = da.minimum(t_min, t_max)
-        t2 = da.maximum(t_min, t_max)
-        t_enter = da.max(t1, axis=1)
-        t_exit = da.min(t2, axis=1)
-        mask = (t_enter <= t_exit) & (t_exit >= 0)
-        return mask
-    
-    # Function to enable map_partitions functionality
-    def valid_mask(df):
-        origins = da.array([df['origin_x'].values, df['origin_y'].values, df['origin_z'].values]).T
-        directions = da.array([df['direction_x'].values, df['direction_y'].values, df['direction_z'].values]).T
-        mask = is_in_plot(origins, directions).compute()
-        return df[mask]
-    
-    @dask.delayed
-    def import_helios_leg(pulse_file, xyz_file):
-        # Import all rays into dask dataframe
-        leg_rays = dd.read_csv(pulse_file, delimiter=' ', header=None, names=['origin_x', 'origin_y', 'origin_z', 'direction_x', 'direction_y', 'direction_z', 'gps_time', 'ray_id', '_'])
-        leg_rays = leg_rays.drop(columns=['gps_time', '_'])
-
-        # Check for valid rays on partitions
-        leg_rays = leg_rays.map_partitions(valid_mask, meta=leg_rays._meta)
-
-        # Import all hits into dask dataframe
-        leg_hits = dd.read_csv(xyz_file, delimiter=' ', header=None, names=['point_x', 'point_y', 'point_z', 'echo_intensity', 'echo_width', 'return_number', 'number_of_returns', 'ray_id', 'hit_object_id', 'class', 'gps_time'])
-
-        leg_rays = leg_rays.merge(leg_hits, on='ray_id', how='left')
-        leg_rays = leg_rays.drop(columns=['gps_time', 'echo_width']) # drop gps_time post merge
-
-        return leg_rays
-    
-
     ### START LEG RAY PROCESSING ###
-    pulses = glob.glob(os.path.join(input_dir, '*_pulse.txt'))
-    points = glob.glob(os.path.join(input_dir, '*_points.xyz'))
-    pulses.sort()
-    points.sort()
 
-    ray_processing_list = []
-    for i, pulse_file in enumerate(pulses):
-        xyz_file = points[i]
+    pulses = sorted(glob.glob(os.path.join(input_dir, '*_pulse.txt')))
+    points = sorted(glob.glob(os.path.join(input_dir, '*_points.xyz')))
+    leg_indices = [int(pf.split('leg')[1].split('_')[0]) for pf in pulses]
 
-        leg = pulse_file.split("leg")[1].split("_")[0]
+    def _process_single_leg(leg_idx, pulse_file, xyz_file):
+        """Read, AABB-filter, classify, and write one scanner leg to parquet."""
+        import pyarrow as pa
+        import pyarrow.csv as pac
+        import numpy as np
+        import pandas as pd
+        import shutil
 
-        delayed_result = import_helios_leg(pulse_file=pulse_file, xyz_file=xyz_file)
-        ray_processing_list.append((leg, delayed_result))
+        delimiter_opts = pac.ParseOptions(delimiter=' ')
 
-    # Count number of rays and points in output
-    total_rays = 0
-    total_points = 0
+        # --- Read pulse file (one row per emitted ray) ---
+        pulses_df = pac.read_csv(
+            pulse_file,
+            read_options=pac.ReadOptions(
+                column_names=['origin_x', 'origin_y', 'origin_z',
+                              'direction_x', 'direction_y', 'direction_z',
+                              'gps_time', 'ray_id', '_']
+            ),
+            parse_options=delimiter_opts,
+            convert_options=pac.ConvertOptions(
+                include_columns=['origin_x', 'origin_y', 'origin_z',
+                                 'direction_x', 'direction_y', 'direction_z', 'ray_id'],
+                column_types={'ray_id': pa.uint64()}
+            )
+        ).to_pandas()
 
-    # Process legs
-    with ProgressBar():
-        statement = "Processing dask delayed functions..."
-        print(statement)
-        logger.info(statement)
-        results = dask.compute(*[ray_processing_list[i][1] for i in range(len(ray_processing_list))])
-        
-        for leg, result in enumerate(results):
-            statement = f"Processing leg {leg}..."
-            logger.info(statement)
-            print(statement)
+        # --- AABB slab test (vectorised NumPy; IEEE 754 handles zero-dirs correctly) ---
+        origins    = pulses_df[['origin_x',    'origin_y',    'origin_z'   ]].to_numpy()
+        directions = pulses_df[['direction_x', 'direction_y', 'direction_z']].to_numpy()
+        with np.errstate(divide='ignore', invalid='ignore'):
+            t1 = (plot_min - origins) / directions
+            t2 = (plot_max - origins) / directions
+        t_enter = np.max(np.minimum(t1, t2), axis=1)
+        t_exit  = np.min(np.maximum(t1, t2), axis=1)
+        keep = (t_enter <= t_exit) & (t_exit >= 0.0)
+        pulses_df = pulses_df[keep].reset_index(drop=True)
+        del origins, directions, t1, t2, t_enter, t_exit, keep
 
-            rays = result.compute()
-            logger.info("Dask computation complete.")
-            
-            leg = int(leg)
-            rays_file = os.path.join(output_dir, valid_rays_template.format(leg=leg))
-            if os.path.exists(rays_file):
-                if os.path.isfile(rays_file):
-                    os.remove(rays_file)
-                else:
-                    shutil.rmtree(rays_file)
-            
-            logger.info(f"Saving valid rays for leg {leg} to {rays_file}")
-            rays['scan_id'] = leg
-            hit_object_key = 'hit_object_id' if not use_class else 'class'
-            rays['is_leaf'] = rays[hit_object_key].isin(leaf_object_ids)
-            # Filter out points with unknown object ids
-            rays = rays[
-                pd.isna(rays[hit_object_key]) |
-                rays[hit_object_key].isin(wood_object_ids + leaf_object_ids)
-            ]
+        # --- Read hit-points file ---
+        hits_df = pac.read_csv(
+            xyz_file,
+            read_options=pac.ReadOptions(
+                column_names=['point_x', 'point_y', 'point_z', 'echo_intensity',
+                              'echo_width', 'return_number', 'number_of_returns',
+                              'ray_id', 'hit_object_id', 'class', 'gps_time']
+            ),
+            parse_options=delimiter_opts,
+            convert_options=pac.ConvertOptions(
+                include_columns=['point_x', 'point_y', 'point_z', 'echo_intensity',
+                                 'return_number', 'number_of_returns',
+                                 'ray_id', 'hit_object_id', 'class'],
+                column_types={'ray_id': pa.uint64()}
+            )
+        ).to_pandas()
 
-            rays = rays.drop(columns=['hit_object_id', 'class'])
-            rays.to_parquet(rays_file, engine='pyarrow', compression='snappy', schema=valid_rays_schema)
+        # --- Left-join filtered rays with their hits ---
+        rays = pulses_df.merge(hits_df, on='ray_id', how='left')
+        del pulses_df, hits_df
 
-            logger.info("Counting points...")
+        # --- Classify and remove unknown object ids ---
+        rays['scan_id'] = np.uint64(leg_idx)
+        hit_object_key = 'hit_object_id' if not use_class else 'class'
+        rays['is_leaf'] = rays[hit_object_key].isin(leaf_object_ids)
+        valid_ids = set(wood_object_ids) | set(leaf_object_ids)
+        rays = rays[rays[hit_object_key].isna() | rays[hit_object_key].isin(valid_ids)]
+        rays = rays.drop(columns=['hit_object_id', 'class'])
 
-            num_rays = len(rays)
-            num_points = (~rays['point_x'].isna()).sum()
-            logger.info(f"Leg {leg} has {num_rays} valid rays and {num_points} points.")
+        # --- Write parquet ---
+        rays_file = os.path.join(output_dir, valid_rays_template.format(leg=leg_idx))
+        if os.path.exists(rays_file):
+            shutil.rmtree(rays_file) if os.path.isdir(rays_file) else os.remove(rays_file)
+        rays.to_parquet(rays_file, engine='pyarrow', compression='snappy', schema=valid_rays_schema)
 
-            total_rays += int(num_rays)
-            total_points += int(num_points)
-            logger.info(f"Updated totals: {total_rays} rays and {total_points} points.")
+        num_points = int((~rays['point_x'].isna()).sum())
+        logger.info(f"Leg {leg_idx}: {len(rays)} rays, {num_points} points written.")
+        return len(rays), num_points
+
+    print(f"Processing {len(pulses)} scanner legs in parallel...")
+    logger.info(f"Processing {len(pulses)} legs...")
+    with tqdm_joblib.tqdm_joblib(tqdm(desc='Processing scanner legs', total=len(pulses), unit='leg')):
+        results = Parallel(n_jobs=-1)(
+            delayed(_process_single_leg)(leg_idx, pf, xf)
+            for leg_idx, pf, xf in zip(leg_indices, pulses, points)
+        )
+
+    total_rays   = sum(r for r, _ in results)
+    total_points = sum(p for _, p in results)
+    logger.info(f"Total: {total_rays} valid rays, {total_points} hit points.")
     
     if debug:
         print("Debugging output...")
