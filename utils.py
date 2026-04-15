@@ -6432,6 +6432,28 @@ def _process_single_leg_task(
         verbose=verbose,
     )
 
+
+def _process_file_group_task(
+    pf_group,
+    grid,
+    epsilon: float,
+    valid_rays_dir: str,
+    numba_threads_override: int,
+    verbose: bool,
+):
+    """Top-level worker entrypoint for grouped file processing."""
+    return process_files_numba_for_size(
+        list(pf_group),
+        grid,
+        epsilon,
+        valid_rays_dir,
+        schema=None,
+        numba_threads_override=numba_threads_override,
+        show_progress=False,
+        quiet=True,
+        verbose=verbose,
+    )
+
 # ------------------------------------------------------------
 # Helper: Detect CPU count from HPC environment
 # ------------------------------------------------------------
@@ -6558,275 +6580,170 @@ def voxel_ray_intersections(valid_rays_dir: str,
             return False
 
     try:
-        for vs, grid in grids.items():
-            # Clean up memory from the previous voxel size iteration
-            # to avoid inheriting accumulated state across fork boundaries
-            import gc
-            gc.collect()
-            
-            if leg_workers is None and len(files) > 1:
-                # CRITICAL: Limit concurrent process count VERY conservatively to avoid heap corruption
-                # from excessive forking and page dirtying. Use at most 1/4 of physical CPUs to prevent
-                # thread-local state corruption in BLAS/MKL and memory fragmentation.
-                # Hard cap: max 1/4 of physical CPUs, but at least 1
-                _max_concurrent_procs = max(1, nthreads // 4)
-                log(f"  ℹ Process concurrency cap: {_max_concurrent_procs} (from {nthreads} physical CPUs / 4)")
-                
-                # Build batches where sum(per-leg threads) does not exceed total threads.
-                # Per-leg threads follow that leg's row-group count (capped by total threads).
-                legs_with_threads = []
-                for pf in files:
-                    nrg = row_groups_by_file.get(pf, 1)
-                    leg_threads = max(1, min(nthreads, int(nrg)))
-                    legs_with_threads.append((pf, int(nrg), leg_threads))
+        import collections
+        import concurrent.futures
+        import math
+        import multiprocessing
+        import sys as _sys
 
-                batches = []
-                batch = []
-                batch_threads = 0
-                for leg_info in legs_with_threads:
-                    _, _, leg_threads = leg_info
-                    # Stop batch if: (1) thread budget exceeded, OR (2) process worker limit reached
-                    if batch and (batch_threads + leg_threads > nthreads or len(batch) >= _max_concurrent_procs):
-                        batches.append(batch)
-                        batch = [leg_info]
-                        batch_threads = leg_threads
-                    else:
-                        batch.append(leg_info)
-                        batch_threads += leg_threads
-                if batch:
-                    batches.append(batch)
+        max_files_per_task = max(1, int(os.environ.get("VOXEL_RI_MAX_FILES_PER_TASK", "4")))
+        env_target_threads_raw = os.environ.get("VOXEL_RI_TARGET_THREADS_PER_WORKER")
+        env_max_workers_raw = os.environ.get("VOXEL_RI_MAX_WORKERS")
+        env_max_threads_raw = os.environ.get("VOXEL_RI_MAX_THREADS_PER_WORKER")
+        mp_start_method = os.environ.get("VOXEL_RI_MP_START_METHOD", "fork").strip().lower()
 
-                log(
-                    f"  ✓ Using row-group-aware batching: {len(batches)} batch(es) under "
-                    f"{nthreads} Numba threads, max {_max_concurrent_procs} process workers"
+        if row_groups_by_file:
+            observed_max_row_groups = max(1, max(int(v) for v in row_groups_by_file.values()))
+        else:
+            observed_max_row_groups = 1
+
+        if env_target_threads_raw:
+            try:
+                target_threads_per_worker = max(1, int(env_target_threads_raw))
+            except (TypeError, ValueError):
+                # Invalid override; fall back to metadata-driven default.
+                target_threads_per_worker = 1 if observed_max_row_groups <= 1 else 2
+        else:
+            target_threads_per_worker = 1 if observed_max_row_groups <= 1 else 2
+
+        log(
+            "  ℹ Scheduler defaults: "
+            f"max_row_groups={observed_max_row_groups}, "
+            f"target_threads_per_worker={target_threads_per_worker}"
+        )
+
+        env_max_workers = None
+        if env_max_workers_raw:
+            try:
+                env_max_workers = max(1, int(env_max_workers_raw))
+            except (TypeError, ValueError):
+                env_max_workers = None
+
+        env_max_threads = None
+        if env_max_threads_raw:
+            try:
+                env_max_threads = max(1, int(env_max_threads_raw))
+            except (TypeError, ValueError):
+                env_max_threads = None
+
+        def _build_file_tasks(_files, _row_groups_by_file, _workers):
+            if not _files:
+                return []
+
+            costs = {pf: max(1, int(_row_groups_by_file.get(pf, 1))) for pf in _files}
+            total_cost = sum(costs.values())
+            target_cost = max(1, int(math.ceil(total_cost / max(1, _workers * 2))))
+
+            light_to_heavy = sorted(_files, key=lambda _pf: costs[_pf])
+            tasks = []
+            cur_task = []
+            cur_cost = 0
+            for pf in light_to_heavy:
+                c = costs[pf]
+                would_overflow = cur_task and (cur_cost + c > target_cost or len(cur_task) >= max_files_per_task)
+                if would_overflow:
+                    tasks.append(cur_task)
+                    cur_task = [pf]
+                    cur_cost = c
+                else:
+                    cur_task.append(pf)
+                    cur_cost += c
+            if cur_task:
+                tasks.append(cur_task)
+
+            min_task_count = min(len(_files), _workers)
+            idx = 0
+            while len(tasks) < min_task_count and idx < len(tasks):
+                grp = tasks[idx]
+                if len(grp) > 1:
+                    mid = len(grp) // 2
+                    tasks[idx] = grp[:mid]
+                    tasks.insert(idx + 1, grp[mid:])
+                idx += 1
+            return tasks
+
+        def _run_task_queue(_task_groups, _worker_count, _threads_per_worker, _grid, _backend_name, *, _use_processes):
+            if not _task_groups:
+                return
+
+            total_legs = len(files)
+            desc = f"Legs (voxel={float(_grid['voxel_size']):.1f}m, {_backend_name})"
+            use_tqdm = _should_use_tqdm()
+
+            start_ts = time.time()
+            done_legs = 0
+            done_rays = 0
+            report_every = max(1, total_legs // 20)
+            pbar = None
+            if use_tqdm:
+                pbar = tqdm(total=total_legs, desc=desc, dynamic_ncols=True, leave=True)
+            else:
+                print(
+                    f"  -> {desc}: started {total_legs} legs across {len(_task_groups)} task(s) "
+                    f"on {_worker_count} worker(s)",
+                    flush=True,
                 )
-                try:
-                    import concurrent.futures
 
-                    total_legs = len(files)
-                    desc = f"Legs (voxel={float(grid['voxel_size']):.1f}m)"
-                    use_tqdm = _should_use_tqdm()
-
-                    start_ts = time.time()
-                    done_legs = 0
-                    done_rays = 0
-                    report_every = max(1, total_legs // 20)
-                    pbar = None
-                    if use_tqdm:
-                        pbar = tqdm(total=total_legs, desc=desc, dynamic_ncols=True, leave=True)
-                    else:
-                        print(f"  -> {desc}: started {total_legs} legs across {len(batches)} batch(es)", flush=True)
-
-                    for bi, batch in enumerate(batches, start=1):
-                        batch_threads_total = sum(leg_threads for _, _, leg_threads in batch)
-                        
-                        # Cap batch size to hard concurrency limit to prevent heap corruption
-                        _safe_batch_size = min(len(batch), _max_concurrent_procs)
-                        
-                        if not pbar:
-                            print(
-                                f"  -> {desc}: batch {bi}/{len(batches)} with {len(batch)} leg(s), "
-                                f"submitting {_safe_batch_size} concurrent process(es)",
-                                flush=True,
-                            )
-
-                        import multiprocessing, sys as _sys
-                        _mp_ctx = multiprocessing.get_context('fork') if _sys.platform == 'linux' else None
-                        with concurrent.futures.ProcessPoolExecutor(max_workers=_safe_batch_size, mp_context=_mp_ctx) as ex:
-                            # Submit only up to the memory-safe batch size to avoid oversubscription
-                            # If batch is larger than safe size, remaining files will be processed in subsequent batches
-                            batch_to_submit = batch[:_safe_batch_size]
-                            remaining_batch = batch[_safe_batch_size:]
-                            
-                            futs = [
-                                ex.submit(
-                                    _process_single_leg_task,
-                                    pf,
-                                    grid,
-                                    epsilon,
-                                    valid_rays_dir,
-                                    leg_threads,
-                                    debug,
-                                )
-                                for pf, _nrg, leg_threads in batch_to_submit
-                            ]
-                            for fut in concurrent.futures.as_completed(futs):
-                                res = fut.result()
-                                done_legs += 1
-                                if isinstance(res, dict):
-                                    done_rays += int(res.get("rays_traversed", 0))
-
-                                elapsed = max(1e-9, time.time() - start_ts)
-                                legs_rate = done_legs / elapsed
-                                rays_rate = done_rays / elapsed
-
-                                if pbar is not None:
-                                    pbar.update(1)
-                                    pbar.set_postfix_str(
-                                        f"rays={done_rays:,} | {rays_rate:,.0f} rays/s",
-                                        refresh=True,
-                                    )
-                                elif done_legs >= total_legs or done_legs % report_every == 0:
-                                    pct = 100.0 * done_legs / max(1, total_legs)
-                                    print(
-                                        f"  -> {desc}: {done_legs}/{total_legs} ({pct:.1f}%) | "
-                                        f"{legs_rate:.2f} legs/s | {done_rays:,} rays | {rays_rate:,.0f} rays/s",
-                                        flush=True,
-                                    )
-                        
-                        # If batch was memory-limited and we have remaining files, process them now
-                        # This ensures we don't skip files; we just process in smaller chunks
-                        if remaining_batch:
-                            log(f"  ℹ Processing {len(remaining_batch)} remaining file(s) from batch {bi} "
-                                f"(memory-limited from {len(batch)} total)")
-                            # Recursively process remaining by re-entering the loop for this specific batch
-                            # For simplicity, just submit them to the same executor pool sequentially
-                            _remaining_safe_size = _safe_batch_size
-                            while remaining_batch:
-                                _chunk = remaining_batch[:_remaining_safe_size]
-                                remaining_batch = remaining_batch[_remaining_safe_size:]
-                                
-                                import multiprocessing, sys as _sys
-                                _mp_ctx = multiprocessing.get_context('fork') if _sys.platform == 'linux' else None
-                                with concurrent.futures.ProcessPoolExecutor(max_workers=len(_chunk), mp_context=_mp_ctx) as ex_chunk:
-                                    futs_chunk = [
-                                        ex_chunk.submit(
-                                            _process_single_leg_task,
-                                            pf,
-                                            grid,
-                                            epsilon,
-                                            valid_rays_dir,
-                                            leg_threads,
-                                            debug,
-                                        )
-                                        for pf, _nrg, leg_threads in _chunk
-                                    ]
-                                    for fut in concurrent.futures.as_completed(futs_chunk):
-                                        res = fut.result()
-                                        done_legs += 1
-                                        if isinstance(res, dict):
-                                            done_rays += int(res.get("rays_traversed", 0))
-                                        if pbar is not None:
-                                            pbar.update(1)
-                        
-                        if pbar is not None:
-                            pbar.close()
-                except Exception as par_exc:
-                    msg = str(par_exc).lower()
-                    _is_broken = (isinstance(par_exc, concurrent.futures.BrokenExecutor)
-                                  or "terminated abruptly" in msg or "broken" in msg)
-                    _is_pickle = "un-serialize" in msg or "pickle" in msg or "picklable" in msg
-                    if _is_pickle or _is_broken:
-                        if _is_broken:
-                            log("  ! Worker process killed (OOM or signal); retrying with threading backend")
-                        else:
-                            log("  ! Process backend failed to serialize task; retrying with threading backend")
-                        # For threading backend, set once globally to avoid per-task race on set_num_threads.
-                        fallback_workers = max(1, min(len(files), int(leg_workers) if leg_workers is not None else nthreads))
-                        fallback_threads_per_leg = max(1, nthreads // fallback_workers)
-                        set_num_threads(fallback_threads_per_leg)
-                        import sys
-
-                        total_legs = len(files)
-                        desc = f"Legs (voxel={float(grid['voxel_size']):.1f}m, threads fallback)"
-                        use_tqdm = _should_use_tqdm()
-
-                        start_ts = time.time()
-                        done_legs = 0
-                        done_rays = 0
-                        report_every = max(1, total_legs // 20)
-                        pbar = None
-                        if use_tqdm:
-                            pbar = tqdm(total=total_legs, desc=desc, dynamic_ncols=True, leave=True)
-                        else:
-                            print(f"  -> {desc}: started {total_legs} legs", flush=True)
-
-                        def _run_one_leg(_pf):
-                            return process_files_numba_for_size(
-                                [_pf],
-                                grid,
-                                epsilon,
-                                valid_rays_dir,
-                                schema=voxel_ray_intersection_schema,
-                                numba_threads_override=None,
-                                show_progress=False,
-                                quiet=True,
-                                verbose=debug,
-                            )
-
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=fallback_workers) as ex:
-                            futs = [ex.submit(_run_one_leg, pf) for pf in files]
-                            for fut in concurrent.futures.as_completed(futs):
-                                res = fut.result()
-                                done_legs += 1
-                                if isinstance(res, dict):
-                                    done_rays += int(res.get("rays_traversed", 0))
-
-                                elapsed = max(1e-9, time.time() - start_ts)
-                                legs_rate = done_legs / elapsed
-                                rays_rate = done_rays / elapsed
-
-                                if pbar is not None:
-                                    pbar.update(1)
-                                    pbar.set_postfix_str(
-                                        f"rays={done_rays:,} | {rays_rate:,.0f} rays/s",
-                                        refresh=True,
-                                    )
-                                elif done_legs >= total_legs or done_legs % report_every == 0:
-                                    pct = 100.0 * done_legs / max(1, total_legs)
-                                    print(
-                                        f"  -> {desc}: {done_legs}/{total_legs} ({pct:.1f}%) | "
-                                        f"{legs_rate:.2f} legs/s | {done_rays:,} rays | {rays_rate:,.0f} rays/s"
-                                        ,
-                                        flush=True,
-                                    )
-
-                        if pbar is not None:
-                            pbar.close()
-                    else:
-                        raise
-            elif len(files) > 1:
-                effective_leg_workers = max(1, int(leg_workers))
-                threads_per_leg = max(1, nthreads // effective_leg_workers)
-                log(
-                    f"  ✓ Using fixed leg-level parallelism: {effective_leg_workers} workers × "
-                    f"{threads_per_leg} Numba threads/worker"
+            if _use_processes:
+                if _sys.platform == "linux" and mp_start_method in {"fork", "spawn", "forkserver"}:
+                    mp_ctx = multiprocessing.get_context(mp_start_method)
+                else:
+                    mp_ctx = None
+                executor = concurrent.futures.ProcessPoolExecutor(
+                    max_workers=_worker_count,
+                    mp_context=mp_ctx,
                 )
-                try:
-                    import concurrent.futures
+                submit_job = lambda _ex, _grp: _ex.submit(
+                    _process_file_group_task,
+                    _grp,
+                    _grid,
+                    epsilon,
+                    valid_rays_dir,
+                    _threads_per_worker,
+                    debug,
+                )
+            else:
+                set_num_threads(_threads_per_worker)
 
-                    total_legs = len(files)
-                    desc = f"Legs (voxel={float(grid['voxel_size']):.1f}m)"
-                    use_tqdm = _should_use_tqdm()
+                def _run_group_thread(_grp):
+                    return process_files_numba_for_size(
+                        list(_grp),
+                        _grid,
+                        epsilon,
+                        valid_rays_dir,
+                        schema=voxel_ray_intersection_schema,
+                        numba_threads_override=None,
+                        show_progress=False,
+                        quiet=True,
+                        verbose=debug,
+                    )
 
-                    start_ts = time.time()
-                    done_legs = 0
-                    done_rays = 0
-                    report_every = max(1, total_legs // 20)
-                    pbar = None
-                    if use_tqdm:
-                        pbar = tqdm(total=total_legs, desc=desc, dynamic_ncols=True, leave=True)
-                    else:
-                        print(f"  -> {desc}: started {total_legs} legs on {effective_leg_workers} workers", flush=True)
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=_worker_count)
+                submit_job = lambda _ex, _grp: _ex.submit(_run_group_thread, _grp)
 
-                    import multiprocessing, sys as _sys
-                    _mp_ctx = multiprocessing.get_context('fork') if _sys.platform == 'linux' else None
-                    with concurrent.futures.ProcessPoolExecutor(max_workers=effective_leg_workers, mp_context=_mp_ctx) as ex:
-                        futs = [
-                            ex.submit(
-                                _process_single_leg_task,
-                                pf,
-                                grid,
-                                epsilon,
-                                valid_rays_dir,
-                                threads_per_leg,
-                                debug,
-                            )
-                            for pf in files
-                        ]
-                        for fut in concurrent.futures.as_completed(futs):
+            try:
+                pending = collections.deque(_task_groups)
+                fut_to_group = {}
+
+                def _submit_one(_ex):
+                    if pending:
+                        grp = pending.popleft()
+                        fut = submit_job(_ex, grp)
+                        fut_to_group[fut] = grp
+
+                with executor as ex:
+                    for _ in range(min(_worker_count, len(_task_groups))):
+                        _submit_one(ex)
+
+                    while fut_to_group:
+                        done, _ = concurrent.futures.wait(
+                            fut_to_group.keys(),
+                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
+                        for fut in done:
+                            grp = fut_to_group.pop(fut)
                             res = fut.result()
-                            done_legs += 1
+                            done_legs += len(grp)
                             if isinstance(res, dict):
                                 done_rays += int(res.get("rays_traversed", 0))
 
@@ -6835,7 +6752,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
                             rays_rate = done_rays / elapsed
 
                             if pbar is not None:
-                                pbar.update(1)
+                                pbar.update(len(grp))
                                 pbar.set_postfix_str(
                                     f"rays={done_rays:,} | {rays_rate:,.0f} rays/s",
                                     refresh=True,
@@ -6848,80 +6765,89 @@ def voxel_ray_intersections(valid_rays_dir: str,
                                     flush=True,
                                 )
 
-                    if pbar is not None:
-                        pbar.close()
-                except Exception as par_exc:
-                    msg = str(par_exc).lower()
-                    _is_broken = (isinstance(par_exc, concurrent.futures.BrokenExecutor)
-                                  or "terminated abruptly" in msg or "broken" in msg)
-                    _is_pickle = "un-serialize" in msg or "pickle" in msg or "picklable" in msg
-                    if _is_pickle or _is_broken:
-                        if _is_broken:
-                            log("  ! Worker process killed (OOM or signal); retrying with threading backend")
-                        else:
-                            log("  ! Process backend failed to serialize task; retrying with threading backend")
-                        # For threading backend, set once globally to avoid per-task race on set_num_threads.
-                        set_num_threads(threads_per_leg)
-                        import sys
+                            _submit_one(ex)
+            finally:
+                if pbar is not None:
+                    pbar.close()
 
-                        total_legs = len(files)
-                        desc = f"Legs (voxel={float(grid['voxel_size']):.1f}m, threads fallback)"
-                        use_tqdm = _should_use_tqdm()
+        for vs, grid in grids.items():
+            import gc
+            gc.collect()
 
-                        start_ts = time.time()
-                        done_legs = 0
-                        done_rays = 0
-                        report_every = max(1, total_legs // 20)
-                        pbar = None
-                        if use_tqdm:
-                            pbar = tqdm(total=total_legs, desc=desc, dynamic_ncols=True, leave=True)
-                        else:
-                            print(f"  -> {desc}: started {total_legs} legs on {effective_leg_workers} workers", flush=True)
+            if len(files) > 1:
+                max_row_groups = max(1, max(row_groups_by_file.get(pf, 1) for pf in files))
+                cpu_budget = max(1, int(nthreads))
 
-                        def _run_one_leg(_pf):
-                            return process_files_numba_for_size(
-                                [_pf],
+                if leg_workers is not None:
+                    requested_workers = max(1, int(leg_workers))
+                else:
+                    requested_workers = max(1, cpu_budget // target_threads_per_worker)
+
+                if env_max_workers is not None:
+                    requested_workers = min(requested_workers, env_max_workers)
+
+                requested_workers = min(requested_workers, len(files), cpu_budget)
+                if requested_workers < 1:
+                    requested_workers = 1
+
+                threads_per_worker_cap = max_row_groups
+                if env_max_threads is not None:
+                    threads_per_worker_cap = min(threads_per_worker_cap, env_max_threads)
+
+                threads_per_worker = max(1, min(threads_per_worker_cap, cpu_budget // requested_workers))
+                effective_leg_workers = max(1, min(requested_workers, cpu_budget // threads_per_worker, len(files)))
+                threads_per_worker = max(1, min(threads_per_worker_cap, cpu_budget // effective_leg_workers))
+
+                file_tasks = _build_file_tasks(files, row_groups_by_file, effective_leg_workers)
+                packed_legs = sum(len(grp) for grp in file_tasks)
+                log(
+                    f"  ✓ Queue scheduler: {effective_leg_workers} process worker(s) × "
+                    f"{threads_per_worker} Numba thread(s)/worker under cpu_budget={cpu_budget}; "
+                    f"{len(file_tasks)} task(s) for {packed_legs} legs"
+                )
+
+                try:
+                    _run_task_queue(
+                        file_tasks,
+                        effective_leg_workers,
+                        threads_per_worker,
+                        grid,
+                        "process queue",
+                        _use_processes=True,
+                    )
+                except Exception:
+                    retry_workers = max(1, effective_leg_workers // 2)
+                    retry_threads = max(1, min(threads_per_worker_cap, cpu_budget // retry_workers))
+                    if retry_workers < effective_leg_workers:
+                        log(
+                            "  ! Process queue failed; retrying with reduced worker count "
+                            f"({effective_leg_workers} -> {retry_workers})"
+                        )
+                        try:
+                            _run_task_queue(
+                                file_tasks,
+                                retry_workers,
+                                retry_threads,
                                 grid,
-                                epsilon,
-                                valid_rays_dir,
-                                schema=voxel_ray_intersection_schema,
-                                numba_threads_override=None,
-                                show_progress=False,
-                                quiet=True,
-                                verbose=debug,
+                                "process queue retry",
+                                _use_processes=True,
                             )
+                            continue
+                        except Exception as retry_exc:
+                            log(f"  ! Reduced process retry failed: {retry_exc}")
 
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_leg_workers) as ex:
-                            futs = [ex.submit(_run_one_leg, pf) for pf in files]
-                            for fut in concurrent.futures.as_completed(futs):
-                                res = fut.result()
-                                done_legs += 1
-                                if isinstance(res, dict):
-                                    done_rays += int(res.get("rays_traversed", 0))
-
-                                elapsed = max(1e-9, time.time() - start_ts)
-                                legs_rate = done_legs / elapsed
-                                rays_rate = done_rays / elapsed
-
-                                if pbar is not None:
-                                    pbar.update(1)
-                                    pbar.set_postfix_str(
-                                        f"rays={done_rays:,} | {rays_rate:,.0f} rays/s",
-                                        refresh=True,
-                                    )
-                                elif done_legs >= total_legs or done_legs % report_every == 0:
-                                    pct = 100.0 * done_legs / max(1, total_legs)
-                                    print(
-                                        f"  -> {desc}: {done_legs}/{total_legs} ({pct:.1f}%) | "
-                                        f"{legs_rate:.2f} legs/s | {done_rays:,} rays | {rays_rate:,.0f} rays/s"
-                                        ,
-                                        flush=True,
-                                    )
-
-                        if pbar is not None:
-                            pbar.close()
-                    else:
-                        raise
+                    log("  ! Falling back to bounded threading queue backend")
+                    fallback_workers = max(1, min(effective_leg_workers, len(file_tasks)))
+                    # Thread fallback is a safety path; keep one Numba thread per task to avoid oversubscription.
+                    fallback_threads = 1
+                    _run_task_queue(
+                        file_tasks,
+                        fallback_workers,
+                        fallback_threads,
+                        grid,
+                        "thread queue fallback",
+                        _use_processes=False,
+                    )
             else:
                 process_files_numba_for_size(
                     files,
