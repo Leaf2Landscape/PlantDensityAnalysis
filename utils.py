@@ -5760,7 +5760,7 @@ def _dda_count_single(o, d, gmin, s, nx, ny, nz, id_grid,
 
     return count
 
-@njit(parallel=True, cache=True, fastmath=False, nogil=True)
+@njit(parallel=True, cache=False, fastmath=False, nogil=True)
 def ray_count_kernel(origins, dirs, gmin, s, nx, ny, nz, id_grid,
                      occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
                      eps, counts):
@@ -5860,7 +5860,7 @@ def _dda_write_single(o, d, gmin, s, nx, ny, nz, id_grid,
 
     return wrote
 
-@njit(parallel=True, cache=True, fastmath=False, nogil=True)
+@njit(parallel=True, cache=False, fastmath=False, nogil=True)
 def ray_write_kernel(origins, dirs, gmin, s, nx, ny, nz, id_grid,
                      occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
                      eps, offsets,
@@ -6442,7 +6442,10 @@ def voxel_ray_intersections(valid_rays_dir: str,
     else:
         nthreads = _detect_num_cpus()
     set_num_threads(nthreads)
-    log(f"  ✓ Configured Numba for {nthreads} threads")
+    from numba import get_num_threads
+    actual_threads = get_num_threads()
+    log(f"  ✓ Configured Numba for {nthreads} threads (actual: {actual_threads})")
+    log(f"  ℹ Environment: SLURM_CPUS_PER_TASK={os.environ.get('SLURM_CPUS_PER_TASK', 'not set')}, OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', 'not set')}")
 
     try:
         for vs, grid in grids.items():
