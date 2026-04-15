@@ -6526,19 +6526,42 @@ def voxel_ray_intersections(valid_rays_dir: str,
                     f"  ✓ Using leg-level parallelism: {effective_leg_workers} workers × "
                     f"{threads_per_leg} Numba threads/worker"
                 )
-                Parallel(n_jobs=effective_leg_workers, prefer="processes")(
-                    delayed(process_files_numba_for_size)(
-                        [pf],
-                        grid,
-                        epsilon,
-                        valid_rays_dir,
-                        schema=voxel_ray_intersection_schema,
-                        numba_threads_override=threads_per_leg,
-                        show_progress=False,
-                        verbose=debug,
+                try:
+                    Parallel(n_jobs=effective_leg_workers, prefer="processes")(
+                        delayed(process_files_numba_for_size)(
+                            [pf],
+                            grid,
+                            epsilon,
+                            valid_rays_dir,
+                            # Avoid sending Arrow schema over process boundaries.
+                            schema=None,
+                            numba_threads_override=threads_per_leg,
+                            show_progress=False,
+                            verbose=debug,
+                        )
+                        for pf in files
                     )
-                    for pf in files
-                )
+                except Exception as par_exc:
+                    msg = str(par_exc).lower()
+                    if "un-serialize" in msg or "pickle" in msg or "picklable" in msg:
+                        log("  ! Process backend failed to serialize task; retrying with threading backend")
+                        # For threading backend, set once globally to avoid per-task race on set_num_threads.
+                        set_num_threads(threads_per_leg)
+                        Parallel(n_jobs=effective_leg_workers, prefer="threads")(
+                            delayed(process_files_numba_for_size)(
+                                [pf],
+                                grid,
+                                epsilon,
+                                valid_rays_dir,
+                                schema=voxel_ray_intersection_schema,
+                                numba_threads_override=None,
+                                show_progress=False,
+                                verbose=debug,
+                            )
+                            for pf in files
+                        )
+                    else:
+                        raise
             else:
                 process_files_numba_for_size(
                     files,
