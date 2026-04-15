@@ -5953,9 +5953,9 @@ def process_files_numba_for_size(
         epsilon, 
         output_dir,
         schema=None,
-    numba_threads_override: Optional[int] = None,
+        numba_threads_override: Optional[int] = None,
         show_progress: bool = True,
-    quiet: bool = False,
+        quiet: bool = False,
         verbose: bool = True
     ):
     """
@@ -5986,8 +5986,8 @@ def process_files_numba_for_size(
 
     Returns
     -------
-    int
-        Total number of rows written across all legs for this voxel size.
+    Dict[str, int]
+        Summary counters with keys: rows_written, rays_traversed.
     """
     import os, math
     import numpy as np
@@ -5999,6 +5999,7 @@ def process_files_numba_for_size(
         set_num_threads(max(1, int(numba_threads_override)))
 
     rays_traversed = 0
+    rows_written = 0
     echos = 0
     samples = 0
     current_leg = None
@@ -6393,10 +6394,15 @@ def process_files_numba_for_size(
                 out_blocks.append(out_df)
 
         # Save once per leg (to avoid clobbering across row groups)
-        _concat_and_save_leg(leg_id, out_blocks, s)
+        rows_written += _concat_and_save_leg(leg_id, out_blocks, s)
     
     if overall_bar is not None:
         overall_bar.close()
+
+    return {
+        "rows_written": int(rows_written),
+        "rays_traversed": int(rays_traversed),
+    }
 
 # ------------------------------------------------------------
 # Helper: Detect CPU count from HPC environment
@@ -6519,11 +6525,34 @@ def voxel_ray_intersections(valid_rays_dir: str,
         if not debug:
             return Parallel(n_jobs=workers, prefer=prefer_backend)(tasks)
 
-        pbar = tqdm(total=total_tasks, desc=desc, dynamic_ncols=True, leave=True)
+        import sys
+        start_ts = time.time()
+        use_tqdm = False
+        try:
+            use_tqdm = bool(getattr(sys.stderr, "isatty", lambda: False)())
+        except Exception:
+            use_tqdm = False
+
+        pbar = None
+        if use_tqdm:
+            pbar = tqdm(total=total_tasks, desc=desc, dynamic_ncols=True, leave=True)
+        else:
+            print(f"  -> {desc}: started {total_tasks} legs on {workers} workers")
+        progress_done = {"count": 0}
+        report_every = max(1, total_tasks // 20)  # ~5% increments
 
         class _TqdmBatchCompletionCallback(joblib.parallel.BatchCompletionCallBack):
             def __call__(self, *args, **kwargs):
-                pbar.update(n=self.batch_size)
+                progress_done["count"] += int(self.batch_size)
+                if pbar is not None:
+                    pbar.update(n=self.batch_size)
+                else:
+                    done = progress_done["count"]
+                    if done >= total_tasks or (done % report_every == 0):
+                        elapsed = max(1e-9, time.time() - start_ts)
+                        rate = done / elapsed
+                        pct = 100.0 * done / max(1, total_tasks)
+                        print(f"  -> {desc}: {done}/{total_tasks} ({pct:.1f}%) at {rate:.2f} legs/s")
                 return super().__call__(*args, **kwargs)
 
         old_batch_callback = joblib.parallel.BatchCompletionCallBack
@@ -6532,7 +6561,16 @@ def voxel_ray_intersections(valid_rays_dir: str,
             return Parallel(n_jobs=workers, prefer=prefer_backend)(tasks)
         finally:
             joblib.parallel.BatchCompletionCallBack = old_batch_callback
-            pbar.close()
+            if pbar is not None:
+                pbar.close()
+            elif progress_done["count"] < total_tasks:
+                elapsed = max(1e-9, time.time() - start_ts)
+                rate = progress_done["count"] / elapsed
+                print(
+                    f"  -> {desc}: {progress_done['count']}/{total_tasks} "
+                    f"({100.0 * progress_done['count'] / max(1, total_tasks):.1f}%) "
+                    f"at {rate:.2f} legs/s"
+                )
 
     try:
         for vs, grid in grids.items():
@@ -6578,26 +6616,67 @@ def voxel_ray_intersections(valid_rays_dir: str,
                         log("  ! Process backend failed to serialize task; retrying with threading backend")
                         # For threading backend, set once globally to avoid per-task race on set_num_threads.
                         set_num_threads(threads_per_leg)
-                        _run_parallel_with_progress(
-                            "threads",
-                            (
-                                delayed(process_files_numba_for_size)(
-                                    [pf],
-                                    grid,
-                                    epsilon,
-                                    valid_rays_dir,
-                                    schema=voxel_ray_intersection_schema,
-                                    numba_threads_override=None,
-                                    show_progress=False,
-                                    quiet=True,
-                                    verbose=debug,
-                                )
-                                for pf in files
-                            ),
-                            total_tasks=len(files),
-                            desc=f"Legs (voxel={float(grid['voxel_size']):.1f}m, threads fallback)",
-                            workers=effective_leg_workers,
-                        )
+                        import concurrent.futures
+                        import sys
+
+                        total_legs = len(files)
+                        desc = f"Legs (voxel={float(grid['voxel_size']):.1f}m, threads fallback)"
+                        use_tqdm = False
+                        try:
+                            use_tqdm = bool(getattr(sys.stderr, "isatty", lambda: False)())
+                        except Exception:
+                            use_tqdm = False
+
+                        start_ts = time.time()
+                        done_legs = 0
+                        done_rays = 0
+                        report_every = max(1, total_legs // 20)
+                        pbar = None
+                        if debug and use_tqdm:
+                            pbar = tqdm(total=total_legs, desc=desc, dynamic_ncols=True, leave=True)
+                        elif debug:
+                            print(f"  -> {desc}: started {total_legs} legs on {effective_leg_workers} workers")
+
+                        def _run_one_leg(_pf):
+                            return process_files_numba_for_size(
+                                [_pf],
+                                grid,
+                                epsilon,
+                                valid_rays_dir,
+                                schema=voxel_ray_intersection_schema,
+                                numba_threads_override=None,
+                                show_progress=False,
+                                quiet=True,
+                                verbose=debug,
+                            )
+
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_leg_workers) as ex:
+                            futs = [ex.submit(_run_one_leg, pf) for pf in files]
+                            for fut in concurrent.futures.as_completed(futs):
+                                res = fut.result()
+                                done_legs += 1
+                                if isinstance(res, dict):
+                                    done_rays += int(res.get("rays_traversed", 0))
+
+                                elapsed = max(1e-9, time.time() - start_ts)
+                                legs_rate = done_legs / elapsed
+                                rays_rate = done_rays / elapsed
+
+                                if pbar is not None:
+                                    pbar.update(1)
+                                    pbar.set_postfix_str(
+                                        f"rays={done_rays:,} | {rays_rate:,.0f} rays/s",
+                                        refresh=True,
+                                    )
+                                elif debug and (done_legs >= total_legs or done_legs % report_every == 0):
+                                    pct = 100.0 * done_legs / max(1, total_legs)
+                                    print(
+                                        f"  -> {desc}: {done_legs}/{total_legs} ({pct:.1f}%) | "
+                                        f"{legs_rate:.2f} legs/s | {done_rays:,} rays | {rays_rate:,.0f} rays/s"
+                                    )
+
+                        if pbar is not None:
+                            pbar.close()
                     else:
                         raise
             else:
