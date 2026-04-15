@@ -6649,16 +6649,30 @@ def voxel_ray_intersections(valid_rays_dir: str,
 
                     for bi, batch in enumerate(batches, start=1):
                         batch_threads_total = sum(leg_threads for _, _, leg_threads in batch)
+                        
+                        # Re-measure parent RSS and memory safety *per batch* to account for
+                        # memory growth/accumulation during the iteration
+                        _parent_rss_mb_now = _psutil.Process().memory_info().rss / (1024 ** 2)
+                        # More conservative: assume 3x parent RSS dirtying per worker, 50% safety headroom
+                        _memory_safe_now = max(1, int(_available_mb * 0.50 / max(1.0, _parent_rss_mb_now * 3.0)))
+                        _safe_batch_size = min(len(batch), _memory_safe_now)
+                        
                         if not pbar:
                             print(
-                                f"  -> {desc}: batch {bi}/{len(batches)} with "
-                                f"{len(batch)} leg(s), thread budget={batch_threads_total}",
+                                f"  -> {desc}: batch {bi}/{len(batches)} with {len(batch)} leg(s), "
+                                f"memory check: RSS={_parent_rss_mb_now:.0f} MB → {_memory_safe_now} safe workers, "
+                                f"using {_safe_batch_size}",
                                 flush=True,
                             )
 
                         import multiprocessing, sys as _sys
                         _mp_ctx = multiprocessing.get_context('fork') if _sys.platform == 'linux' else None
-                        with concurrent.futures.ProcessPoolExecutor(max_workers=len(batch), mp_context=_mp_ctx) as ex:
+                        with concurrent.futures.ProcessPoolExecutor(max_workers=_safe_batch_size, mp_context=_mp_ctx) as ex:
+                            # Submit only up to the memory-safe batch size to avoid oversubscription
+                            # If batch is larger than safe size, remaining files will be processed in subsequent batches
+                            batch_to_submit = batch[:_safe_batch_size]
+                            remaining_batch = batch[_safe_batch_size:]
+                            
                             futs = [
                                 ex.submit(
                                     _process_single_leg_task,
@@ -6669,7 +6683,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
                                     leg_threads,
                                     debug,
                                 )
-                                for pf, _nrg, leg_threads in batch
+                                for pf, _nrg, leg_threads in batch_to_submit
                             ]
                             for fut in concurrent.futures.as_completed(futs):
                                 res = fut.result()
@@ -6694,8 +6708,41 @@ def voxel_ray_intersections(valid_rays_dir: str,
                                         f"{legs_rate:.2f} legs/s | {done_rays:,} rays | {rays_rate:,.0f} rays/s",
                                         flush=True,
                                     )
-
-                    if pbar is not None:
+                        
+                        # If batch was memory-limited and we have remaining files, process them now
+                        # This ensures we don't skip files; we just process in smaller chunks
+                        if remaining_batch:
+                            log(f"  ℹ Processing {len(remaining_batch)} remaining file(s) from batch {bi} "
+                                f"(memory-limited from {len(batch)} total)")
+                            # Recursively process remaining by re-entering the loop for this specific batch
+                            # For simplicity, just submit them to the same executor pool sequentially
+                            _remaining_safe_size = _safe_batch_size
+                            while remaining_batch:
+                                _chunk = remaining_batch[:_remaining_safe_size]
+                                remaining_batch = remaining_batch[_remaining_safe_size:]
+                                
+                                import multiprocessing, sys as _sys
+                                _mp_ctx = multiprocessing.get_context('fork') if _sys.platform == 'linux' else None
+                                with concurrent.futures.ProcessPoolExecutor(max_workers=len(_chunk), mp_context=_mp_ctx) as ex_chunk:
+                                    futs_chunk = [
+                                        ex_chunk.submit(
+                                            _process_single_leg_task,
+                                            pf,
+                                            grid,
+                                            epsilon,
+                                            valid_rays_dir,
+                                            leg_threads,
+                                            debug,
+                                        )
+                                        for pf, _nrg, leg_threads in _chunk
+                                    ]
+                                    for fut in concurrent.futures.as_completed(futs_chunk):
+                                        res = fut.result()
+                                        done_legs += 1
+                                        if isinstance(res, dict):
+                                            done_rays += int(res.get("rays_traversed", 0))
+                                        if pbar is not None:
+                                            pbar.update(1)
                         pbar.close()
                 except Exception as par_exc:
                     msg = str(par_exc).lower()
