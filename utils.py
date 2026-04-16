@@ -114,6 +114,9 @@ def _setup_numba_threads():
 
 _setup_numba_threads()
 
+# Per-process cache for warmup signatures to avoid repeated first-call warmups.
+_VOXEL_RI_WARMED_KERNELS = set()
+
 ### CONSTANTS ###
 beam_divergence = np.float32(0.001) # Beam divergence in radians
 
@@ -5809,11 +5812,22 @@ def _dda_count_single(o, d, gmin, s, nx, ny, nz, id_grid,
     return count
 
 @njit(parallel=True, cache=False, fastmath=False, nogil=True)
-def ray_count_kernel(origins, dirs, gmin, s, nx, ny, nz, id_grid,
-                     occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
-                     eps, counts):
+def ray_count_kernel_parallel(origins, dirs, gmin, s, nx, ny, nz, id_grid,
+                              occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
+                              eps, counts):
     n = origins.shape[0]
     for r in prange(n):
+        counts[r] = _dda_count_single(origins[r], dirs[r], gmin, s, nx, ny, nz, id_grid,
+                                      occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
+                                      eps)
+
+
+@njit(parallel=False, cache=False, fastmath=False, nogil=True)
+def ray_count_kernel_serial(origins, dirs, gmin, s, nx, ny, nz, id_grid,
+                            occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
+                            eps, counts):
+    n = origins.shape[0]
+    for r in range(n):
         counts[r] = _dda_count_single(origins[r], dirs[r], gmin, s, nx, ny, nz, id_grid,
                                       occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
                                       eps)
@@ -5909,10 +5923,10 @@ def _dda_write_single(o, d, gmin, s, nx, ny, nz, id_grid,
     return wrote
 
 @njit(parallel=True, cache=False, fastmath=False, nogil=True)
-def ray_write_kernel(origins, dirs, gmin, s, nx, ny, nz, id_grid,
-                     occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
-                     eps, offsets,
-                     out_ix, out_iy, out_iz, out_t0, out_t1, out_ray):
+def ray_write_kernel_parallel(origins, dirs, gmin, s, nx, ny, nz, id_grid,
+                              occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
+                              eps, offsets,
+                              out_ix, out_iy, out_iz, out_t0, out_t1, out_ray):
     n = origins.shape[0]
     for r in prange(n):
         start = offsets[r]
@@ -5923,7 +5937,22 @@ def ray_write_kernel(origins, dirs, gmin, s, nx, ny, nz, id_grid,
         for k in range(wrote):
             out_ray[start + k] = r
 
-def warmup_numba_kernels(grid, epsilon):
+
+@njit(parallel=False, cache=False, fastmath=False, nogil=True)
+def ray_write_kernel_serial(origins, dirs, gmin, s, nx, ny, nz, id_grid,
+                            occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
+                            eps, offsets,
+                            out_ix, out_iy, out_iz, out_t0, out_t1, out_ray):
+    n = origins.shape[0]
+    for r in range(n):
+        start = offsets[r]
+        wrote = _dda_write_single(origins[r], dirs[r], gmin, s, nx, ny, nz, id_grid,
+                                  occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
+                                  eps, start, out_ix, out_iy, out_iz, out_t0, out_t1, out_ray)
+        for k in range(wrote):
+            out_ray[start + k] = r
+
+def warmup_numba_kernels(grid, epsilon, kernel_mode: str):
     # tiny fake data
     origins = np.zeros((2,3), np.float64)
     dirs    = np.array([[1,0,0],[0,1,0]], np.float64)
@@ -5936,17 +5965,27 @@ def warmup_numba_kernels(grid, epsilon):
     occ_min_idx = np.array(grid["occ_min_idx"], np.int64)
     occ_max_idx = np.array(grid["occ_max_idx"], np.int64)
     counts = np.zeros(origins.shape[0], np.int32)
-    ray_count_kernel(origins, dirs, gmin, s, nx, ny, nz, idg,
-                     occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
-                     epsilon, counts)
+    if kernel_mode == "parallel":
+        ray_count_kernel_parallel(origins, dirs, gmin, s, nx, ny, nz, idg,
+                                  occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
+                                  epsilon, counts)
+    else:
+        ray_count_kernel_serial(origins, dirs, gmin, s, nx, ny, nz, idg,
+                                occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
+                                epsilon, counts)
     # second pass (zero-sized buffers)
     offsets = np.zeros_like(counts)
     out_ix = out_iy = out_iz = np.zeros(1, np.int32)
     out_t0 = out_t1 = np.zeros(1, np.float64)
     out_ray = np.zeros(1, np.int32)
-    ray_write_kernel(origins, dirs, gmin, s, nx, ny, nz, idg,
-                     occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
-                     epsilon, offsets, out_ix, out_iy, out_iz, out_t0, out_t1, out_ray)
+    if kernel_mode == "parallel":
+        ray_write_kernel_parallel(origins, dirs, gmin, s, nx, ny, nz, idg,
+                                  occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
+                                  epsilon, offsets, out_ix, out_iy, out_iz, out_t0, out_t1, out_ray)
+    else:
+        ray_write_kernel_serial(origins, dirs, gmin, s, nx, ny, nz, idg,
+                                occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
+                                epsilon, offsets, out_ix, out_iy, out_iz, out_t0, out_t1, out_ray)
 
 import pyarrow.parquet as pq
 import pandas as pd
@@ -5960,6 +5999,7 @@ def process_files_numba_for_size(
         output_dir,
         schema=None,
         numba_threads_override: Optional[int] = None,
+    kernel_mode: str = "parallel",
         show_progress: bool = True,
         quiet: bool = False,
         verbose: bool = True
@@ -6000,6 +6040,10 @@ def process_files_numba_for_size(
     import pandas as pd
     import pyarrow.parquet as pq
     from tqdm.auto import tqdm
+
+    kernel_mode = str(kernel_mode).strip().lower()
+    if kernel_mode not in {"parallel", "serial"}:
+        raise ValueError(f"Unsupported kernel_mode={kernel_mode!r}; expected 'parallel' or 'serial'")
 
     if numba_threads_override is not None:
         set_num_threads(max(1, int(numba_threads_override)))
@@ -6067,8 +6111,24 @@ def process_files_numba_for_size(
     occ_min_idx = np.array(grid["occ_min_idx"], np.int64)
     occ_max_idx = np.array(grid["occ_max_idx"], np.int64)
 
-    # Avoid first-call JIT inside hot loops
-    warmup_numba_kernels(grid, epsilon)
+    if kernel_mode == "parallel":
+        count_kernel = ray_count_kernel_parallel
+        write_kernel = ray_write_kernel_parallel
+    else:
+        count_kernel = ray_count_kernel_serial
+        write_kernel = ray_write_kernel_serial
+
+    # Avoid repeated warmup overhead when a worker handles many single-file tasks.
+    warmup_key = (
+        kernel_mode,
+        int(nx),
+        int(ny),
+        int(nz),
+        float(s),
+    )
+    if warmup_key not in _VOXEL_RI_WARMED_KERNELS:
+        warmup_numba_kernels(grid, epsilon, kernel_mode=kernel_mode)
+        _VOXEL_RI_WARMED_KERNELS.add(warmup_key)
 
     # --- Pre-scan Parquet files to know the overall total (row groups) ---
     pf_meta = []  # list of tuples: (pf_path, pfh, leg_id, num_row_groups)
@@ -6164,7 +6224,7 @@ def process_files_numba_for_size(
 
             # -------- PASS 1: COUNT (chunked with tqdm) ---------------------
             counts = np.zeros(N, np.int32)
-            ray_count_kernel(
+            count_kernel(
                 uniq_orig, uniq_dirs,
                 gmin, s, nx, ny, nz, id_grid,
                 occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
@@ -6192,7 +6252,7 @@ def process_files_numba_for_size(
             out_ray = np.empty(total_hits, np.int32)
 
             # -------- PASS 2: WRITE (no chunking) ---------------------
-            ray_write_kernel(
+            write_kernel(
                 uniq_orig, uniq_dirs,
                 gmin, s, nx, ny, nz, id_grid,
                 occ_min_xyz, occ_max_xyz, occ_min_idx, occ_max_idx,
@@ -6417,6 +6477,7 @@ def _process_single_leg_task(
     epsilon: float,
     valid_rays_dir: str,
     numba_threads_override: int,
+    kernel_mode: str,
     verbose: bool,
 ):
     """Top-level worker entrypoint for process-based leg parallelism."""
@@ -6435,41 +6496,11 @@ def _process_single_leg_task(
         valid_rays_dir,
         schema=None,
         numba_threads_override=numba_threads_override,
+        kernel_mode=kernel_mode,
         show_progress=False,
         quiet=True,
         verbose=verbose,
     )
-
-
-def _process_file_group_task(
-    pf_group,
-    grid,
-    epsilon: float,
-    valid_rays_dir: str,
-    numba_threads_override: int,
-    verbose: bool,
-):
-    """Top-level worker entrypoint for grouped file processing."""
-    _threads = max(1, int(numba_threads_override))
-    # Keep native thread pools aligned with per-worker budget.
-    os.environ["OMP_NUM_THREADS"] = str(_threads)
-    os.environ["OPENBLAS_NUM_THREADS"] = str(_threads)
-    os.environ["MKL_NUM_THREADS"] = str(_threads)
-    os.environ["NUMEXPR_NUM_THREADS"] = str(_threads)
-    set_num_threads(_threads)
-
-    return process_files_numba_for_size(
-        list(pf_group),
-        grid,
-        epsilon,
-        valid_rays_dir,
-        schema=None,
-        numba_threads_override=numba_threads_override,
-        show_progress=False,
-        quiet=True,
-        verbose=verbose,
-    )
-
 # ------------------------------------------------------------
 # Helper: Detect CPU count from HPC environment
 # ------------------------------------------------------------
@@ -6596,49 +6627,29 @@ def voxel_ray_intersections(valid_rays_dir: str,
             return False
 
     try:
-        import collections
         import concurrent.futures
         import math
         import multiprocessing
         import sys as _sys
 
-        max_files_per_task = max(1, int(os.environ.get("VOXEL_RI_MAX_FILES_PER_TASK", "4")))
-        env_target_threads_raw = os.environ.get("VOXEL_RI_TARGET_THREADS_PER_WORKER")
-        env_max_workers_raw = os.environ.get("VOXEL_RI_MAX_WORKERS")
-        env_max_threads_raw = os.environ.get("VOXEL_RI_MAX_THREADS_PER_WORKER")
-        mp_start_method = os.environ.get("VOXEL_RI_MP_START_METHOD", "spawn").strip().lower()
-
         if row_groups_by_file:
             _rg_values = np.array([max(1, int(v)) for v in row_groups_by_file.values()], dtype=np.int32)
-            observed_max_row_groups = int(np.max(_rg_values))
-            observed_mean_row_groups = float(np.mean(_rg_values))
             observed_p90_row_groups = int(max(1, math.ceil(float(np.percentile(_rg_values, 90)))))
         else:
-            observed_max_row_groups = 1
-            observed_mean_row_groups = 1.0
             observed_p90_row_groups = 1
 
-        auto_target_threads_per_worker = 1 if observed_p90_row_groups <= 1 else 2
-
-        if env_target_threads_raw:
-            try:
-                target_threads_per_worker = max(1, int(env_target_threads_raw))
-            except (TypeError, ValueError):
-                # Invalid override; fall back to metadata-driven default.
-                target_threads_per_worker = auto_target_threads_per_worker
+        n_files = len(files)
+        if n_files >= observed_p90_row_groups:
+            parallel_mode = "file"
         else:
-            target_threads_per_worker = auto_target_threads_per_worker
+            parallel_mode = "rowgroup"
 
         log(
-            "  ℹ Scheduler defaults: "
-            f"max_row_groups={observed_max_row_groups}, "
-            f"p90_row_groups={observed_p90_row_groups}, "
-            f"mean_row_groups={observed_mean_row_groups:.2f}, "
-            f"target_threads_per_worker={target_threads_per_worker}"
+            "  ✓ Parallel mode decision (fixed for run): "
+            f"mode={parallel_mode}, files={n_files}, p90_row_groups={observed_p90_row_groups}"
         )
-        if _sys.platform == "linux" and mp_start_method == "fork":
-            log("  ⚠ Using fork start method; set VOXEL_RI_MP_START_METHOD=spawn for better stability")
 
+        env_max_workers_raw = os.environ.get("VOXEL_RI_MAX_WORKERS")
         env_max_workers = None
         if env_max_workers_raw:
             try:
@@ -6646,131 +6657,78 @@ def voxel_ray_intersections(valid_rays_dir: str,
             except (TypeError, ValueError):
                 env_max_workers = None
 
-        env_max_threads = None
-        if env_max_threads_raw:
-            try:
-                env_max_threads = max(1, int(env_max_threads_raw))
-            except (TypeError, ValueError):
-                env_max_threads = None
+        _mp_env = os.environ.get("VOXEL_RI_MP_START_METHOD")
+        if _mp_env:
+            mp_start_method = _mp_env.strip().lower()
+        else:
+            # Local default: fork for speed. HPC/SLURM default: spawn for stability.
+            mp_start_method = "spawn" if os.environ.get("SLURM_CPUS_PER_TASK") else "fork"
 
-        def _build_file_tasks(_files, _row_groups_by_file, _workers):
-            if not _files:
-                return []
+        for vs, grid in grids.items():
+            import gc
+            gc.collect()
 
-            costs = {pf: max(1, int(_row_groups_by_file.get(pf, 1))) for pf in _files}
-            total_cost = sum(costs.values())
-            target_cost = max(1, int(math.ceil(total_cost / max(1, _workers * 2))))
-
-            light_to_heavy = sorted(_files, key=lambda _pf: costs[_pf])
-            tasks = []
-            cur_task = []
-            cur_cost = 0
-            for pf in light_to_heavy:
-                c = costs[pf]
-                would_overflow = cur_task and (cur_cost + c > target_cost or len(cur_task) >= max_files_per_task)
-                if would_overflow:
-                    tasks.append(cur_task)
-                    cur_task = [pf]
-                    cur_cost = c
+            if parallel_mode == "file" and n_files > 1:
+                cpu_budget = max(1, int(nthreads))
+                if leg_workers is not None:
+                    effective_leg_workers = max(1, int(leg_workers))
                 else:
-                    cur_task.append(pf)
-                    cur_cost += c
-            if cur_task:
-                tasks.append(cur_task)
+                    effective_leg_workers = cpu_budget
 
-            min_task_count = min(len(_files), _workers)
-            idx = 0
-            while len(tasks) < min_task_count and idx < len(tasks):
-                grp = tasks[idx]
-                if len(grp) > 1:
-                    mid = len(grp) // 2
-                    tasks[idx] = grp[:mid]
-                    tasks.insert(idx + 1, grp[mid:])
-                idx += 1
-            return tasks
+                if env_max_workers is not None:
+                    effective_leg_workers = min(effective_leg_workers, env_max_workers)
 
-        def _run_task_queue(_task_groups, _worker_count, _threads_per_worker, _grid, _backend_name, *, _use_processes):
-            if not _task_groups:
-                return
+                effective_leg_workers = max(1, min(effective_leg_workers, n_files, cpu_budget))
 
-            total_legs = len(files)
-            desc = f"Legs (voxel={float(_grid['voxel_size']):.1f}m, {_backend_name})"
-            use_tqdm = _should_use_tqdm()
+                # File-parallel mode uses serial kernels only. Never enable Numba parallelism here.
+                threads_per_worker = 1
 
-            start_ts = time.time()
-            done_legs = 0
-            done_rays = 0
-            report_every = max(1, total_legs // 20)
-            pbar = None
-            if use_tqdm:
-                pbar = tqdm(total=total_legs, desc=desc, dynamic_ncols=True, leave=True)
-            else:
-                print(
-                    f"  -> {desc}: started {total_legs} legs across {len(_task_groups)} task(s) "
-                    f"on {_worker_count} worker(s)",
-                    flush=True,
+                log(
+                    f"  ✓ File parallelism only: {effective_leg_workers} process worker(s) × "
+                    f"{threads_per_worker} Numba thread(s)/worker"
                 )
 
-            if _use_processes:
+                total_legs = n_files
+                desc = f"Legs (voxel={float(grid['voxel_size']):.1f}m, file parallel only)"
+                use_tqdm = _should_use_tqdm()
+
+                start_ts = time.time()
+                done_legs = 0
+                done_rays = 0
+                report_every = max(1, total_legs // 20)
+                pbar = None
+                if use_tqdm:
+                    pbar = tqdm(total=total_legs, desc=desc, dynamic_ncols=True, leave=True)
+                else:
+                    print(f"  -> {desc}: started {total_legs} legs on {effective_leg_workers} worker(s)", flush=True)
+
                 if _sys.platform == "linux" and mp_start_method in {"fork", "spawn", "forkserver"}:
-                    mp_ctx = multiprocessing.get_context(mp_start_method)
+                    _mp_ctx = multiprocessing.get_context(mp_start_method)
                 else:
-                    mp_ctx = None
-                executor = concurrent.futures.ProcessPoolExecutor(
-                    max_workers=_worker_count,
-                    mp_context=mp_ctx,
-                )
-                submit_job = lambda _ex, _grp: _ex.submit(
-                    _process_file_group_task,
-                    _grp,
-                    _grid,
-                    epsilon,
-                    valid_rays_dir,
-                    _threads_per_worker,
-                    debug,
-                )
-            else:
-                set_num_threads(_threads_per_worker)
+                    _mp_ctx = None
 
-                def _run_group_thread(_grp):
-                    return process_files_numba_for_size(
-                        list(_grp),
-                        _grid,
-                        epsilon,
-                        valid_rays_dir,
-                        schema=voxel_ray_intersection_schema,
-                        numba_threads_override=None,
-                        show_progress=False,
-                        quiet=True,
-                        verbose=debug,
-                    )
+                try:
+                    with concurrent.futures.ProcessPoolExecutor(
+                        max_workers=effective_leg_workers,
+                        mp_context=_mp_ctx,
+                    ) as ex:
+                        futs = [
+                            ex.submit(
+                                _process_single_leg_task,
+                                pf,
+                                grid,
+                                epsilon,
+                                valid_rays_dir,
+                                threads_per_worker,
+                                "serial",
+                                debug,
+                            )
+                            for pf in files
+                        ]
 
-                executor = concurrent.futures.ThreadPoolExecutor(max_workers=_worker_count)
-                submit_job = lambda _ex, _grp: _ex.submit(_run_group_thread, _grp)
-
-            try:
-                pending = collections.deque(_task_groups)
-                fut_to_group = {}
-
-                def _submit_one(_ex):
-                    if pending:
-                        grp = pending.popleft()
-                        fut = submit_job(_ex, grp)
-                        fut_to_group[fut] = grp
-
-                with executor as ex:
-                    for _ in range(min(_worker_count, len(_task_groups))):
-                        _submit_one(ex)
-
-                    while fut_to_group:
-                        done, _ = concurrent.futures.wait(
-                            fut_to_group.keys(),
-                            return_when=concurrent.futures.FIRST_COMPLETED,
-                        )
-                        for fut in done:
-                            grp = fut_to_group.pop(fut)
+                        for fut in concurrent.futures.as_completed(futs):
                             res = fut.result()
-                            done_legs += len(grp)
+                            done_legs += 1
                             if isinstance(res, dict):
                                 done_rays += int(res.get("rays_traversed", 0))
 
@@ -6779,7 +6737,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
                             rays_rate = done_rays / elapsed
 
                             if pbar is not None:
-                                pbar.update(len(grp))
+                                pbar.update(1)
                                 pbar.set_postfix_str(
                                     f"rays={done_rays:,} | {rays_rate:,.0f} rays/s",
                                     refresh=True,
@@ -6791,94 +6749,15 @@ def voxel_ray_intersections(valid_rays_dir: str,
                                     f"{legs_rate:.2f} legs/s | {done_rays:,} rays | {rays_rate:,.0f} rays/s",
                                     flush=True,
                                 )
-
-                            _submit_one(ex)
-            finally:
-                if pbar is not None:
-                    pbar.close()
-
-        for vs, grid in grids.items():
-            import gc
-            gc.collect()
-
-            if len(files) > 1:
-                max_row_groups = max(1, max(row_groups_by_file.get(pf, 1) for pf in files))
-                cpu_budget = max(1, int(nthreads))
-
-                if leg_workers is not None:
-                    requested_workers = max(1, int(leg_workers))
-                else:
-                    requested_workers = max(1, cpu_budget // target_threads_per_worker)
-
-                if env_max_workers is not None:
-                    requested_workers = min(requested_workers, env_max_workers)
-                elif leg_workers is None and cpu_budget > 32:
-                    # Stability guard for high-core nodes: avoid extreme process fan-out by default.
-                    requested_workers = min(requested_workers, max(1, cpu_budget // 2))
-
-                requested_workers = min(requested_workers, len(files), cpu_budget)
-                if requested_workers < 1:
-                    requested_workers = 1
-
-                threads_per_worker_cap = max_row_groups
-                if env_max_threads is not None:
-                    threads_per_worker_cap = min(threads_per_worker_cap, env_max_threads)
-
-                threads_per_worker = max(1, min(threads_per_worker_cap, cpu_budget // requested_workers))
-                effective_leg_workers = max(1, min(requested_workers, cpu_budget // threads_per_worker, len(files)))
-                threads_per_worker = max(1, min(threads_per_worker_cap, cpu_budget // effective_leg_workers))
-
-                file_tasks = _build_file_tasks(files, row_groups_by_file, effective_leg_workers)
-                packed_legs = sum(len(grp) for grp in file_tasks)
-                log(
-                    f"  ✓ Queue scheduler: {effective_leg_workers} process worker(s) × "
-                    f"{threads_per_worker} Numba thread(s)/worker under cpu_budget={cpu_budget}; "
-                    f"{len(file_tasks)} task(s) for {packed_legs} legs"
-                )
-
-                try:
-                    _run_task_queue(
-                        file_tasks,
-                        effective_leg_workers,
-                        threads_per_worker,
-                        grid,
-                        "process queue",
-                        _use_processes=True,
-                    )
-                except Exception:
-                    retry_workers = max(1, effective_leg_workers // 2)
-                    retry_threads = max(1, min(threads_per_worker_cap, cpu_budget // retry_workers))
-                    if retry_workers < effective_leg_workers:
-                        log(
-                            "  ! Process queue failed; retrying with reduced worker count "
-                            f"({effective_leg_workers} -> {retry_workers})"
-                        )
-                        try:
-                            _run_task_queue(
-                                file_tasks,
-                                retry_workers,
-                                retry_threads,
-                                grid,
-                                "process queue retry",
-                                _use_processes=True,
-                            )
-                            continue
-                        except Exception as retry_exc:
-                            log(f"  ! Reduced process retry failed: {retry_exc}")
-
-                    log("  ! Falling back to bounded threading queue backend")
-                    fallback_workers = max(1, min(effective_leg_workers, len(file_tasks)))
-                    # Thread fallback is a safety path; keep one Numba thread per task to avoid oversubscription.
-                    fallback_threads = 1
-                    _run_task_queue(
-                        file_tasks,
-                        fallback_workers,
-                        fallback_threads,
-                        grid,
-                        "thread queue fallback",
-                        _use_processes=False,
-                    )
+                finally:
+                    if pbar is not None:
+                        pbar.close()
             else:
+                # Row-group mode uses a single process with Numba parallel kernels only.
+                if leg_workers is not None:
+                    log("  ℹ leg_workers ignored in row-group-only mode")
+                log(f"  ✓ Row-group parallelism only: 1 process × {nthreads} Numba thread(s)")
+
                 process_files_numba_for_size(
                     files,
                     grid,
@@ -6886,6 +6765,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
                     valid_rays_dir,
                     schema=voxel_ray_intersection_schema,
                     numba_threads_override=nthreads,
+                    kernel_mode="parallel",
                     quiet=False,
                     verbose=debug,
                 )
