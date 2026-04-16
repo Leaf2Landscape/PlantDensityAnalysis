@@ -117,6 +117,31 @@ _setup_numba_threads()
 # Per-process cache for warmup signatures to avoid repeated first-call warmups.
 _VOXEL_RI_WARMED_KERNELS = set()
 
+
+def _configure_pyarrow_worker_threads() -> tuple[int, int]:
+    """Configure pyarrow CPU/IO thread pools for worker processes."""
+    cpu_raw = os.environ.get("VOXEL_RI_ARROW_CPU_THREADS", "1")
+    io_raw = os.environ.get("VOXEL_RI_ARROW_IO_THREADS", "1")
+    try:
+        cpu_threads = max(1, int(cpu_raw))
+    except (TypeError, ValueError):
+        cpu_threads = 1
+    try:
+        io_threads = max(1, int(io_raw))
+    except (TypeError, ValueError):
+        io_threads = 1
+
+    try:
+        pa.set_cpu_count(cpu_threads)
+    except Exception:
+        pass
+    try:
+        pa.set_io_thread_count(io_threads)
+    except Exception:
+        pass
+
+    return cpu_threads, io_threads
+
 ### CONSTANTS ###
 beam_divergence = np.float32(0.001) # Beam divergence in radians
 
@@ -6491,6 +6516,7 @@ def _process_single_leg_task(
     os.environ["MKL_NUM_THREADS"] = str(_threads)
     os.environ["NUMEXPR_NUM_THREADS"] = str(_threads)
     set_num_threads(_threads)
+    _configure_pyarrow_worker_threads()
 
     return process_files_numba_for_size(
         [pf],
@@ -6522,6 +6548,7 @@ def _process_rowgroup_voxel_task(
     os.environ["MKL_NUM_THREADS"] = str(_threads)
     os.environ["NUMEXPR_NUM_THREADS"] = str(_threads)
     set_num_threads(_threads)
+    _configure_pyarrow_worker_threads()
 
     return process_files_numba_for_size(
         list(files),
@@ -6742,6 +6769,17 @@ def voxel_ray_intersections(valid_rays_dir: str,
             cpu_budget = max(1, int(nthreads))
             total_tasks = n_files * len(grid_items)
 
+            reserved_cpus_raw = os.environ.get("VOXEL_RI_RESERVED_CPUS")
+            if reserved_cpus_raw is not None:
+                try:
+                    reserved_cpus = max(0, int(reserved_cpus_raw))
+                except (TypeError, ValueError):
+                    reserved_cpus = 4 if os.environ.get("SLURM_CPUS_PER_TASK") else 1
+            else:
+                reserved_cpus = 4 if os.environ.get("SLURM_CPUS_PER_TASK") else 1
+
+            worker_cpu_budget = max(1, cpu_budget - reserved_cpus)
+
             mem_per_worker_mb_raw = os.environ.get("VOXEL_RI_MEM_PER_WORKER_MB", "2500")
             mem_headroom_frac_raw = os.environ.get("VOXEL_RI_MEM_HEADROOM_FRACTION", "0.80")
             try:
@@ -6768,12 +6806,12 @@ def voxel_ray_intersections(valid_rays_dir: str,
             if leg_workers is not None:
                 effective_leg_workers = max(1, int(leg_workers))
             else:
-                effective_leg_workers = min(cpu_budget, mem_limited_workers)
+                effective_leg_workers = min(worker_cpu_budget, mem_limited_workers)
 
             if env_max_workers is not None:
                 effective_leg_workers = min(effective_leg_workers, env_max_workers)
 
-            effective_leg_workers = max(1, min(effective_leg_workers, cpu_budget, total_tasks))
+            effective_leg_workers = max(1, min(effective_leg_workers, worker_cpu_budget, total_tasks))
 
             # File-parallel mode uses serial kernels only. Never enable Numba parallelism here.
             threads_per_worker = 1
@@ -6792,9 +6830,13 @@ def voxel_ray_intersections(valid_rays_dir: str,
             )
             log(
                 "  ℹ Worker budget: "
-                f"cpu_budget={cpu_budget}, mem_budget_mb={mem_budget_mb} ({mem_budget_source}), "
+                f"cpu_budget={cpu_budget}, reserved_cpus={reserved_cpus}, worker_cpu_budget={worker_cpu_budget}, "
+                f"mem_budget_mb={mem_budget_mb} ({mem_budget_source}), "
                 f"mem_per_worker_mb={mem_per_worker_mb}, mem_limited_workers={mem_limited_workers}"
             )
+            arrow_cpu_threads = os.environ.get("VOXEL_RI_ARROW_CPU_THREADS", "1")
+            arrow_io_threads = os.environ.get("VOXEL_RI_ARROW_IO_THREADS", "1")
+            log(f"  ℹ PyArrow worker threads: cpu={arrow_cpu_threads}, io={arrow_io_threads}")
             if max_tasks_per_child is not None:
                 log(f"  ℹ Worker recycling: max_tasks_per_child={max_tasks_per_child}")
             else:
@@ -6901,12 +6943,16 @@ def voxel_ray_intersections(valid_rays_dir: str,
             done_rays_nonlocal = [done_rays]
             current_workers = effective_leg_workers
             pool_restarts = 0
+            min_workers_reached = current_workers
+            first_crash_detail = None
 
             try:
                 while task_queue:
                     try:
                         _run_file_queue_attempt(current_workers)
                     except Exception as pool_exc:
+                        if first_crash_detail is None:
+                            first_crash_detail = str(pool_exc)
                         pool_restarts += 1
                         if pool_restarts > max_pool_restarts:
                             raise RuntimeError(
@@ -6920,6 +6966,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
                         )
                         log(f"  ! Crash detail: {pool_exc}")
                         current_workers = next_workers
+                        min_workers_reached = min(min_workers_reached, current_workers)
                         continue
                     break
             finally:
@@ -6928,6 +6975,17 @@ def voxel_ray_intersections(valid_rays_dir: str,
 
             done_tasks = done_tasks_nonlocal[0]
             done_rays = done_rays_nonlocal[0]
+
+            if pool_restarts > 0:
+                log(
+                    "  ⚠ File queue incident summary: "
+                    f"restarts={pool_restarts}, min_workers={min_workers_reached}, "
+                    f"final_workers={current_workers}"
+                )
+                if first_crash_detail:
+                    log(f"  ⚠ First crash task: {first_crash_detail}")
+            else:
+                log("  ✓ File queue incident summary: no pool restarts")
 
             for _vs_key in sorted(done_per_voxel.keys()):
                 _done = done_per_voxel[_vs_key]
