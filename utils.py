@@ -6629,8 +6629,6 @@ def voxel_ray_intersections(valid_rays_dir: str,
     try:
         import concurrent.futures
         import math
-        import multiprocessing
-        import sys as _sys
 
         if row_groups_by_file:
             _rg_values = np.array([max(1, int(v)) for v in row_groups_by_file.values()], dtype=np.int32)
@@ -6656,13 +6654,6 @@ def voxel_ray_intersections(valid_rays_dir: str,
                 env_max_workers = max(1, int(env_max_workers_raw))
             except (TypeError, ValueError):
                 env_max_workers = None
-
-        _mp_env = os.environ.get("VOXEL_RI_MP_START_METHOD")
-        if _mp_env:
-            mp_start_method = _mp_env.strip().lower()
-        else:
-            # Local default: fork for speed. HPC/SLURM default: spawn for stability.
-            mp_start_method = "spawn" if os.environ.get("SLURM_CPUS_PER_TASK") else "fork"
 
         for vs, grid in grids.items():
             import gc
@@ -6702,15 +6693,9 @@ def voxel_ray_intersections(valid_rays_dir: str,
                 else:
                     print(f"  -> {desc}: started {total_legs} legs on {effective_leg_workers} worker(s)", flush=True)
 
-                if _sys.platform == "linux" and mp_start_method in {"fork", "spawn", "forkserver"}:
-                    _mp_ctx = multiprocessing.get_context(mp_start_method)
-                else:
-                    _mp_ctx = None
-
                 try:
                     with concurrent.futures.ProcessPoolExecutor(
                         max_workers=effective_leg_workers,
-                        mp_context=_mp_ctx,
                     ) as ex:
                         futs = [
                             ex.submit(
