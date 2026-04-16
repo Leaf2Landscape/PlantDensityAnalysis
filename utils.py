@@ -6800,6 +6800,12 @@ def voxel_ray_intersections(valid_rays_dir: str,
             else:
                 log("  ℹ Worker recycling: disabled")
 
+            env_max_restarts_raw = os.environ.get("VOXEL_RI_MAX_POOL_RESTARTS", "6")
+            try:
+                max_pool_restarts = max(0, int(env_max_restarts_raw))
+            except (TypeError, ValueError):
+                max_pool_restarts = 6
+
             desc = "Legs (file+voxel queue, file parallel only)"
             use_tqdm = _should_use_tqdm()
             start_ts = time.time()
@@ -6832,15 +6838,15 @@ def voxel_ray_intersections(valid_rays_dir: str,
                     "serial",
                     debug,
                 )
-                _fut_meta[_fut] = (_vs, float(_grid["voxel_size"]))
+                _fut_meta[_fut] = (_vs, _grid, _pf)
 
-            try:
+            def _run_file_queue_attempt(_workers: int):
                 with concurrent.futures.ProcessPoolExecutor(
-                    max_workers=effective_leg_workers,
+                    max_workers=_workers,
                     max_tasks_per_child=max_tasks_per_child,
                 ) as ex:
                     fut_meta = {}
-                    for _ in range(min(effective_leg_workers, total_tasks)):
+                    for _ in range(min(_workers, len(task_queue))):
                         _submit_one(ex, fut_meta)
 
                     while fut_meta:
@@ -6850,37 +6856,78 @@ def voxel_ray_intersections(valid_rays_dir: str,
                         )
 
                         for fut in done:
-                            _vs, _vs_val = fut_meta.pop(fut)
-                            res = fut.result()
-                            done_tasks += 1
+                            _vs, _grid, _pf = fut_meta.pop(fut)
+                            _vs_val = float(_grid["voxel_size"])
+                            try:
+                                res = fut.result()
+                            except Exception as task_exc:
+                                # Re-queue failed + in-flight tasks for next pool attempt.
+                                task_queue.appendleft((_vs, _grid, _pf))
+                                for _pending_task in fut_meta.values():
+                                    task_queue.appendleft(_pending_task)
+                                fut_meta.clear()
+                                raise RuntimeError(
+                                    f"task crash: voxel={_vs_val:.1f}m file={os.path.basename(_pf)}: {task_exc}"
+                                ) from task_exc
+
+                            done_tasks_nonlocal[0] += 1
                             done_per_voxel[_vs_val] += 1
                             if isinstance(res, dict):
                                 _task_rays = int(res.get("rays_traversed", 0))
-                                done_rays += _task_rays
+                                done_rays_nonlocal[0] += _task_rays
                                 rays_per_voxel[_vs_val] += _task_rays
 
                             elapsed = max(1e-9, time.time() - start_ts)
-                            task_rate = done_tasks / elapsed
-                            rays_rate = done_rays / elapsed
+                            task_rate = done_tasks_nonlocal[0] / elapsed
+                            rays_rate = done_rays_nonlocal[0] / elapsed
 
                             if pbar is not None:
                                 pbar.update(1)
                                 pbar.set_postfix_str(
-                                    f"task={done_tasks}/{total_tasks} | rays={done_rays:,} | {rays_rate:,.0f} rays/s",
+                                    f"task={done_tasks_nonlocal[0]}/{total_tasks} | rays={done_rays_nonlocal[0]:,} | {rays_rate:,.0f} rays/s",
                                     refresh=True,
                                 )
-                            elif done_tasks >= total_tasks or done_tasks % report_every == 0:
-                                pct = 100.0 * done_tasks / max(1, total_tasks)
+                            elif done_tasks_nonlocal[0] >= total_tasks or done_tasks_nonlocal[0] % report_every == 0:
+                                pct = 100.0 * done_tasks_nonlocal[0] / max(1, total_tasks)
                                 print(
-                                    f"  -> {desc}: {done_tasks}/{total_tasks} ({pct:.1f}%) | "
-                                    f"{task_rate:.2f} tasks/s | {done_rays:,} rays | {rays_rate:,.0f} rays/s",
+                                    f"  -> {desc}: {done_tasks_nonlocal[0]}/{total_tasks} ({pct:.1f}%) | "
+                                    f"{task_rate:.2f} tasks/s | {done_rays_nonlocal[0]:,} rays | {rays_rate:,.0f} rays/s",
                                     flush=True,
                                 )
 
                             _submit_one(ex, fut_meta)
+
+            done_tasks_nonlocal = [done_tasks]
+            done_rays_nonlocal = [done_rays]
+            current_workers = effective_leg_workers
+            pool_restarts = 0
+
+            try:
+                while task_queue:
+                    try:
+                        _run_file_queue_attempt(current_workers)
+                    except Exception as pool_exc:
+                        pool_restarts += 1
+                        if pool_restarts > max_pool_restarts:
+                            raise RuntimeError(
+                                f"File queue failed after {pool_restarts} pool restart(s): {pool_exc}"
+                            ) from pool_exc
+
+                        next_workers = max(1, current_workers // 2)
+                        log(
+                            "  ! File queue pool crashed; restarting with reduced workers "
+                            f"({current_workers} -> {next_workers}), restart {pool_restarts}/{max_pool_restarts}"
+                        )
+                        log(f"  ! Crash detail: {pool_exc}")
+                        current_workers = next_workers
+                        continue
+                    break
             finally:
                 if pbar is not None:
                     pbar.close()
+
+            done_tasks = done_tasks_nonlocal[0]
+            done_rays = done_rays_nonlocal[0]
 
             for _vs_key in sorted(done_per_voxel.keys()):
                 _done = done_per_voxel[_vs_key]
