@@ -6549,6 +6549,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
                                    epsilon: float = 1e-6,
                                    n_jobs: int = -1,
                                    leg_workers: Optional[int] = None,
+                                   parallel_mode: str = "auto",
                                    debug: bool = True):
     """
     Produces a DataFrame with exactly OUTPUT_COLUMNS
@@ -6565,6 +6566,9 @@ def voxel_ray_intersections(valid_rays_dir: str,
         Numerical tolerance
     n_jobs : int
         Number of parallel jobs (-1 = all CPUs)
+    parallel_mode : str
+        Parallelism strategy. One of: "auto", "file", "row_group".
+        "auto" selects based on len(files) vs P90(num_row_groups).
     """
     
     log("=" * 70)
@@ -6638,14 +6642,24 @@ def voxel_ray_intersections(valid_rays_dir: str,
             observed_p90_row_groups = 1
 
         n_files = len(files)
-        if n_files >= observed_p90_row_groups:
-            parallel_mode = "file"
+        mode_requested = str(parallel_mode).strip().lower()
+        if mode_requested not in {"auto", "file", "row_group"}:
+            raise ValueError(
+                f"Invalid parallel_mode={parallel_mode!r}; expected one of 'auto', 'file', 'row_group'"
+            )
+
+        if mode_requested == "auto":
+            if n_files >= observed_p90_row_groups:
+                selected_parallel_mode = "file"
+            else:
+                selected_parallel_mode = "row_group"
         else:
-            parallel_mode = "rowgroup"
+            selected_parallel_mode = mode_requested
 
         log(
             "  ✓ Parallel mode decision (fixed for run): "
-            f"mode={parallel_mode}, files={n_files}, p90_row_groups={observed_p90_row_groups}"
+            f"mode={selected_parallel_mode}, requested={mode_requested}, "
+            f"files={n_files}, p90_row_groups={observed_p90_row_groups}"
         )
 
         env_max_workers_raw = os.environ.get("VOXEL_RI_MAX_WORKERS")
@@ -6655,6 +6669,17 @@ def voxel_ray_intersections(valid_rays_dir: str,
                 env_max_workers = max(1, int(env_max_workers_raw))
             except (TypeError, ValueError):
                 env_max_workers = None
+
+        env_max_tasks_child_raw = os.environ.get("VOXEL_RI_MAX_TASKS_PER_CHILD")
+        max_tasks_per_child = None
+        if env_max_tasks_child_raw:
+            try:
+                max_tasks_per_child = max(1, int(env_max_tasks_child_raw))
+            except (TypeError, ValueError):
+                max_tasks_per_child = None
+        elif os.environ.get("SLURM_CPUS_PER_TASK"):
+            # HPC default: recycle aggressively to prevent long-lived native-state corruption.
+            max_tasks_per_child = 1
 
         def _slurm_mem_limit_mb(_cpu_budget: int) -> Optional[int]:
             """Best-effort SLURM memory limit in MB."""
@@ -6680,7 +6705,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
 
         grid_items = list(grids.items())
 
-        if parallel_mode == "file" and n_files > 1:
+        if selected_parallel_mode == "file" and n_files > 1:
             cpu_budget = max(1, int(nthreads))
             total_tasks = n_files * len(grid_items)
 
@@ -6737,6 +6762,10 @@ def voxel_ray_intersections(valid_rays_dir: str,
                 f"cpu_budget={cpu_budget}, mem_budget_mb={mem_budget_mb} ({mem_budget_source}), "
                 f"mem_per_worker_mb={mem_per_worker_mb}, mem_limited_workers={mem_limited_workers}"
             )
+            if max_tasks_per_child is not None:
+                log(f"  ℹ Worker recycling: max_tasks_per_child={max_tasks_per_child}")
+            else:
+                log("  ℹ Worker recycling: disabled")
 
             desc = "Legs (file+voxel queue, file parallel only)"
             use_tqdm = _should_use_tqdm()
@@ -6773,6 +6802,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
             try:
                 with concurrent.futures.ProcessPoolExecutor(
                     max_workers=effective_leg_workers,
+                    max_tasks_per_child=max_tasks_per_child,
                 ) as ex:
                     fut_meta = {}
                     for _ in range(min(effective_leg_workers, total_tasks)):

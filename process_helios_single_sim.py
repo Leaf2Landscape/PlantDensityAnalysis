@@ -46,6 +46,7 @@ if __name__ == "__main__":
     parser.add_argument("--reference_data_path", type=str, default=None, help="OPTIONAL: Path to the reference data. Defaults to 'references' folder in project directory.")
     parser.add_argument("--test_mode", action='store_true', help="If set, only outputs plot of wood and leaf points to check settings.")
     parser.add_argument("--overwrite_valid_rays", action='store_true', help="If set, will overwrite existing valid rays files in output directory. Default: False (will skip processing if valid rays files are found)")
+    parser.add_argument("--parallel_mode", type=str, choices=['file', 'row_group', 'auto'], default='auto', help="Parallelization mode for processing. 'file' processes files in parallel, 'row_group' processes row groups in parallel, 'auto' lets the script decide based on data size. Default: 'auto'")
     parser.add_argument("--debug", action='store_true', help="If set, runs in debug mode with verbose outputs and extra saved files")
     args = parser.parse_args()
 
@@ -102,7 +103,9 @@ if __name__ == "__main__":
     try:
         voxel_ray_intersections(
             valid_rays_dir=valid_rays_dir,
-            references_dir=reference_dir
+            references_dir=reference_dir,
+            parallel_mode=args.parallel_mode,
+            debug=args.debug
         )
     except Exception as e:
         raise RuntimeError(f"Error during voxel-ray intersections computation: {e}")
