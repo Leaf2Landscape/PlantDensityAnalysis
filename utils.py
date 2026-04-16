@@ -6147,6 +6147,8 @@ def process_files_numba_for_size(
     # --- NEW: Create the overall tqdm bar (one bar for the whole process) -----
     overall_bar = None
     def _create_overall_bar():
+        import sys
+
         if not show_progress:
             return None
         return tqdm(
@@ -6156,6 +6158,7 @@ def process_files_numba_for_size(
             leave=True,
             dynamic_ncols=True,
             smoothing=0.1,
+            file=sys.stdout,
         )
 
     if show_progress:
@@ -6501,6 +6504,36 @@ def _process_single_leg_task(
         quiet=True,
         verbose=verbose,
     )
+
+
+def _process_rowgroup_voxel_task(
+    files,
+    grid,
+    epsilon: float,
+    valid_rays_dir: str,
+    numba_threads_override: int,
+    kernel_mode: str,
+    verbose: bool,
+):
+    """Top-level worker entrypoint for row-group mode (single-process isolated run)."""
+    _threads = max(1, int(numba_threads_override))
+    os.environ["OMP_NUM_THREADS"] = str(_threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(_threads)
+    os.environ["MKL_NUM_THREADS"] = str(_threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(_threads)
+    set_num_threads(_threads)
+
+    return process_files_numba_for_size(
+        list(files),
+        grid,
+        epsilon,
+        valid_rays_dir,
+        schema=voxel_ray_intersection_schema,
+        numba_threads_override=_threads,
+        kernel_mode=kernel_mode,
+        quiet=False,
+        verbose=verbose,
+    )
 # ------------------------------------------------------------
 # Helper: Detect CPU count from HPC environment
 # ------------------------------------------------------------
@@ -6626,7 +6659,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
         import sys
 
         try:
-            return bool(getattr(sys.stderr, "isatty", lambda: False)())
+            return bool(getattr(sys.stdout, "isatty", lambda: False)())
         except Exception:
             return False
 
@@ -6776,7 +6809,9 @@ def voxel_ray_intersections(valid_rays_dir: str,
             pbar = None
 
             if use_tqdm:
-                pbar = tqdm(total=total_tasks, desc=desc, dynamic_ncols=True, leave=True)
+                import sys
+
+                pbar = tqdm(total=total_tasks, desc=desc, dynamic_ncols=True, leave=True, file=sys.stdout)
             else:
                 print(
                     f"  -> {desc}: started {total_tasks} tasks on {effective_leg_workers} worker(s)",
@@ -6861,17 +6896,37 @@ def voxel_ray_intersections(valid_rays_dir: str,
                     log("  ℹ leg_workers ignored in row-group-only mode")
                 log(f"  ✓ Row-group parallelism only: 1 process × {nthreads} Numba thread(s)")
 
-                process_files_numba_for_size(
-                    files,
-                    grid,
-                    epsilon,
-                    valid_rays_dir,
-                    schema=voxel_ray_intersection_schema,
-                    numba_threads_override=nthreads,
-                    kernel_mode="parallel",
-                    quiet=False,
-                    verbose=debug,
-                )
+                try:
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1) as ex:
+                        fut = ex.submit(
+                            _process_rowgroup_voxel_task,
+                            files,
+                            grid,
+                            epsilon,
+                            valid_rays_dir,
+                            nthreads,
+                            "parallel",
+                            debug,
+                        )
+                        fut.result()
+                except Exception as rg_exc:
+                    log(
+                        "  ! Row-group parallel worker crashed for "
+                        f"voxel={float(grid['voxel_size']):.1f}m; retrying in serial-kernel safe mode"
+                    )
+                    log(f"  ! Crash detail: {rg_exc}")
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1) as ex:
+                        fut = ex.submit(
+                            _process_rowgroup_voxel_task,
+                            files,
+                            grid,
+                            epsilon,
+                            valid_rays_dir,
+                            1,
+                            "serial",
+                            debug,
+                        )
+                        fut.result()
     except Exception as e:
         log(f"  ✗ Error during processing: {e}")
         raise Exception(f"Error in process_files_numba_for_size: {e}")
