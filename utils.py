@@ -6627,6 +6627,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
             return False
 
     try:
+        import collections
         import concurrent.futures
         import math
 
@@ -6655,89 +6656,176 @@ def voxel_ray_intersections(valid_rays_dir: str,
             except (TypeError, ValueError):
                 env_max_workers = None
 
-        for vs, grid in grids.items():
-            import gc
-            gc.collect()
+        def _slurm_mem_limit_mb(_cpu_budget: int) -> Optional[int]:
+            """Best-effort SLURM memory limit in MB."""
+            raw_node = os.environ.get("SLURM_MEM_PER_NODE")
+            if raw_node:
+                try:
+                    node_mb = int(str(raw_node).strip())
+                    if node_mb > 0:
+                        return node_mb
+                except (TypeError, ValueError):
+                    pass
 
-            if parallel_mode == "file" and n_files > 1:
-                cpu_budget = max(1, int(nthreads))
-                if leg_workers is not None:
-                    effective_leg_workers = max(1, int(leg_workers))
-                else:
-                    effective_leg_workers = cpu_budget
+            raw_per_cpu = os.environ.get("SLURM_MEM_PER_CPU")
+            if raw_per_cpu:
+                try:
+                    per_cpu_mb = int(str(raw_per_cpu).strip())
+                    if per_cpu_mb > 0:
+                        return per_cpu_mb * max(1, int(_cpu_budget))
+                except (TypeError, ValueError):
+                    pass
 
-                if env_max_workers is not None:
-                    effective_leg_workers = min(effective_leg_workers, env_max_workers)
+            return None
 
-                effective_leg_workers = max(1, min(effective_leg_workers, n_files, cpu_budget))
+        grid_items = list(grids.items())
 
-                # File-parallel mode uses serial kernels only. Never enable Numba parallelism here.
-                threads_per_worker = 1
+        if parallel_mode == "file" and n_files > 1:
+            cpu_budget = max(1, int(nthreads))
+            total_tasks = n_files * len(grid_items)
 
-                log(
-                    f"  ✓ File parallelism only: {effective_leg_workers} process worker(s) × "
-                    f"{threads_per_worker} Numba thread(s)/worker"
+            mem_per_worker_mb_raw = os.environ.get("VOXEL_RI_MEM_PER_WORKER_MB", "2500")
+            mem_headroom_frac_raw = os.environ.get("VOXEL_RI_MEM_HEADROOM_FRACTION", "0.80")
+            try:
+                mem_per_worker_mb = max(256, int(mem_per_worker_mb_raw))
+            except (TypeError, ValueError):
+                mem_per_worker_mb = 2500
+            try:
+                mem_headroom_frac = float(mem_headroom_frac_raw)
+                if not (0.1 <= mem_headroom_frac <= 0.95):
+                    mem_headroom_frac = 0.80
+            except (TypeError, ValueError):
+                mem_headroom_frac = 0.80
+
+            slurm_mem_mb = _slurm_mem_limit_mb(cpu_budget)
+            if slurm_mem_mb is not None:
+                mem_budget_mb = max(1, int(slurm_mem_mb * mem_headroom_frac))
+                mem_budget_source = "slurm"
+            else:
+                mem_budget_mb = max(1, int(psutil.virtual_memory().available / (1024 * 1024)))
+                mem_budget_source = "psutil_available"
+
+            mem_limited_workers = max(1, mem_budget_mb // mem_per_worker_mb)
+
+            if leg_workers is not None:
+                effective_leg_workers = max(1, int(leg_workers))
+            else:
+                effective_leg_workers = min(cpu_budget, mem_limited_workers)
+
+            if env_max_workers is not None:
+                effective_leg_workers = min(effective_leg_workers, env_max_workers)
+
+            effective_leg_workers = max(1, min(effective_leg_workers, cpu_budget, total_tasks))
+
+            # File-parallel mode uses serial kernels only. Never enable Numba parallelism here.
+            threads_per_worker = 1
+
+            task_queue = collections.deque(
+                (vs, grid, pf)
+                for vs, grid in grid_items
+                for pf in files
+            )
+            done_per_voxel = {float(grid["voxel_size"]): 0 for _, grid in grid_items}
+            rays_per_voxel = {float(grid["voxel_size"]): 0 for _, grid in grid_items}
+
+            log(
+                f"  ✓ File parallelism only: {effective_leg_workers} persistent process worker(s) × "
+                f"{threads_per_worker} Numba thread(s)/worker over {total_tasks} file/voxel task(s)"
+            )
+            log(
+                "  ℹ Worker budget: "
+                f"cpu_budget={cpu_budget}, mem_budget_mb={mem_budget_mb} ({mem_budget_source}), "
+                f"mem_per_worker_mb={mem_per_worker_mb}, mem_limited_workers={mem_limited_workers}"
+            )
+
+            desc = "Legs (file+voxel queue, file parallel only)"
+            use_tqdm = _should_use_tqdm()
+            start_ts = time.time()
+            done_tasks = 0
+            done_rays = 0
+            report_every = max(1, total_tasks // 20)
+            pbar = None
+
+            if use_tqdm:
+                pbar = tqdm(total=total_tasks, desc=desc, dynamic_ncols=True, leave=True)
+            else:
+                print(
+                    f"  -> {desc}: started {total_tasks} tasks on {effective_leg_workers} worker(s)",
+                    flush=True,
                 )
 
-                total_legs = n_files
-                desc = f"Legs (voxel={float(grid['voxel_size']):.1f}m, file parallel only)"
-                use_tqdm = _should_use_tqdm()
+            def _submit_one(_executor, _fut_meta):
+                if not task_queue:
+                    return
+                _vs, _grid, _pf = task_queue.popleft()
+                _fut = _executor.submit(
+                    _process_single_leg_task,
+                    _pf,
+                    _grid,
+                    epsilon,
+                    valid_rays_dir,
+                    threads_per_worker,
+                    "serial",
+                    debug,
+                )
+                _fut_meta[_fut] = (_vs, float(_grid["voxel_size"]))
 
-                start_ts = time.time()
-                done_legs = 0
-                done_rays = 0
-                report_every = max(1, total_legs // 20)
-                pbar = None
-                if use_tqdm:
-                    pbar = tqdm(total=total_legs, desc=desc, dynamic_ncols=True, leave=True)
-                else:
-                    print(f"  -> {desc}: started {total_legs} legs on {effective_leg_workers} worker(s)", flush=True)
+            try:
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=effective_leg_workers,
+                ) as ex:
+                    fut_meta = {}
+                    for _ in range(min(effective_leg_workers, total_tasks)):
+                        _submit_one(ex, fut_meta)
 
-                try:
-                    with concurrent.futures.ProcessPoolExecutor(
-                        max_workers=effective_leg_workers,
-                    ) as ex:
-                        futs = [
-                            ex.submit(
-                                _process_single_leg_task,
-                                pf,
-                                grid,
-                                epsilon,
-                                valid_rays_dir,
-                                threads_per_worker,
-                                "serial",
-                                debug,
-                            )
-                            for pf in files
-                        ]
+                    while fut_meta:
+                        done, _ = concurrent.futures.wait(
+                            fut_meta.keys(),
+                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
 
-                        for fut in concurrent.futures.as_completed(futs):
+                        for fut in done:
+                            _vs, _vs_val = fut_meta.pop(fut)
                             res = fut.result()
-                            done_legs += 1
+                            done_tasks += 1
+                            done_per_voxel[_vs_val] += 1
                             if isinstance(res, dict):
-                                done_rays += int(res.get("rays_traversed", 0))
+                                _task_rays = int(res.get("rays_traversed", 0))
+                                done_rays += _task_rays
+                                rays_per_voxel[_vs_val] += _task_rays
 
                             elapsed = max(1e-9, time.time() - start_ts)
-                            legs_rate = done_legs / elapsed
+                            task_rate = done_tasks / elapsed
                             rays_rate = done_rays / elapsed
 
                             if pbar is not None:
                                 pbar.update(1)
                                 pbar.set_postfix_str(
-                                    f"rays={done_rays:,} | {rays_rate:,.0f} rays/s",
+                                    f"task={done_tasks}/{total_tasks} | rays={done_rays:,} | {rays_rate:,.0f} rays/s",
                                     refresh=True,
                                 )
-                            elif done_legs >= total_legs or done_legs % report_every == 0:
-                                pct = 100.0 * done_legs / max(1, total_legs)
+                            elif done_tasks >= total_tasks or done_tasks % report_every == 0:
+                                pct = 100.0 * done_tasks / max(1, total_tasks)
                                 print(
-                                    f"  -> {desc}: {done_legs}/{total_legs} ({pct:.1f}%) | "
-                                    f"{legs_rate:.2f} legs/s | {done_rays:,} rays | {rays_rate:,.0f} rays/s",
+                                    f"  -> {desc}: {done_tasks}/{total_tasks} ({pct:.1f}%) | "
+                                    f"{task_rate:.2f} tasks/s | {done_rays:,} rays | {rays_rate:,.0f} rays/s",
                                     flush=True,
                                 )
-                finally:
-                    if pbar is not None:
-                        pbar.close()
-            else:
+
+                            _submit_one(ex, fut_meta)
+            finally:
+                if pbar is not None:
+                    pbar.close()
+
+            for _vs_key in sorted(done_per_voxel.keys()):
+                _done = done_per_voxel[_vs_key]
+                _rays = rays_per_voxel[_vs_key]
+                log(f"  ✓ voxel={_vs_key:.1f}m completed {_done}/{n_files} legs, rays={_rays:,}")
+        else:
+            for vs, grid in grid_items:
+                import gc
+                gc.collect()
+
                 # Row-group mode uses a single process with Numba parallel kernels only.
                 if leg_workers is not None:
                     log("  ℹ leg_workers ignored in row-group-only mode")
