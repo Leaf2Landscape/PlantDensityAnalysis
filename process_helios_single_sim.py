@@ -55,8 +55,6 @@ if __name__ == "__main__":
     if not os.path.exists(project_dir):
         raise FileNotFoundError(f"Project directory {project_dir} does not exist.")
     helios_dir = os.path.join(project_dir,"helios") if args.helios_data_path is None else args.helios_data_path
-    if not os.path.exists(helios_dir):
-        raise FileNotFoundError(f"Helios data directory {helios_dir} does not exist.")
     reference_dir = os.path.join(project_dir,"references") if args.reference_data_path is None else args.reference_data_path
     if not os.path.exists(reference_dir):
         raise FileNotFoundError(f"Reference data directory {reference_dir} does not exist.")
@@ -70,6 +68,8 @@ if __name__ == "__main__":
 
     # If in test mode, just test the Helios settings and exit
     if args.test_mode:
+        if not os.path.exists(helios_dir):
+            raise FileNotFoundError(f"Helios data directory {helios_dir} does not exist.")
         success = test_helios_settings(
             helios_dir=helios_dir, 
             leaf_object_ids=args.leaf_ids, 
@@ -82,8 +82,12 @@ if __name__ == "__main__":
             print("Test mode completed successfully. Please check the output plot for leaf and wood point classification.")
             exit(0)
 
+    has_valid_rays = any(fname.endswith("valid_rays.parquet") for fname in os.listdir(valid_rays_dir))
+
     # Step 1: Prepare Helios data
-    if args.overwrite_valid_rays or not any(fname.endswith("valid_rays.parquet") for fname in os.listdir(valid_rays_dir)):
+    if args.overwrite_valid_rays or not has_valid_rays:
+        if not os.path.exists(helios_dir):
+            raise FileNotFoundError(f"Helios data directory {helios_dir} does not exist.")
         print("No existing valid rays files found or overwrite enabled. Processing Helios data to generate valid rays...")
         try:
             prepare_helios_data(
@@ -98,6 +102,8 @@ if __name__ == "__main__":
         except Exception as e:
             raise RuntimeError(f"Error during Helios data preparation: {e}")
         print("Helios data preparation completed. Proceeding to normals and voxel-ray intersections...")
+    else:
+        print("Existing valid rays files found. Skipping Helios data preparation.")
 
     # Step 2: Calculate voxel-ray intersections for chosen voxel sizes
     try:
