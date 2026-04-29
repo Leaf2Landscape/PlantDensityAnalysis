@@ -18,7 +18,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Setup and validate paths
-    project_dir = args.project_directory
+    project_dir = os.path.abspath(args.project_directory)
     if not os.path.exists(project_dir):
         raise FileNotFoundError(f"Project directory {project_dir} does not exist.")
     valid_rays_dir = os.path.join(project_dir, "valid_rays") if args.valid_rays_path is None else args.valid_rays_path
