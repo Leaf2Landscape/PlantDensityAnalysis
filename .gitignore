@@ -174,3 +174,7 @@ cython_debug/
 .pypirc
 .vscode/launch.json
 .vscode/launch.json
+
+# Claude files
+CLAUDE.md
+.claude/
