@@ -2,9 +2,9 @@ name: plantdensityanalysis_env
 channels:
   - conda-forge
   - open3d-admin
-  - rios
   - defaults
 dependencies:
+  - python=3.10
   - numpy
   - pandas
   - pyarrow
@@ -13,12 +13,16 @@ dependencies:
   - tqdm
   - numba
   - scikit-learn
+  - scipy
   - trimesh
   - rtree
+  - matplotlib
   - ipykernel
   - dask
   - distributed
   - open3d
+  - psutil
   - pip
   - pip:
       - fnvhash==0.1.0
+      - tqdm_joblib
