@@ -1,4 +1,4 @@
-# PlantDensityAnalysis: HELIOS Simulation Analysis & Reference Validation
+# PlantDensityAnalysis: Voxel Reference Retrieval from 3D Mesh and HELIOS Simulation Analysis & Comparison
 
 A complete workflow for analyzing plant canopy structure using HELIOS simulations and validating results against high-resolution 3D reference meshes.
 
