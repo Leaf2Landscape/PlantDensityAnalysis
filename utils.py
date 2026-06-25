@@ -4547,7 +4547,21 @@ def voxel_ray_intersections(valid_rays_dir: str,
     try:
         import collections
         import concurrent.futures
+        import inspect
         import math
+
+        # `max_tasks_per_child` was added to ProcessPoolExecutor in Python 3.11.
+        # Build kwargs so the code also runs on Python 3.10 (drops worker recycling).
+        _ppe_supports_max_tasks = (
+            "max_tasks_per_child"
+            in inspect.signature(concurrent.futures.ProcessPoolExecutor).parameters
+        )
+
+        def _ppe_kwargs(_max_workers, _max_tasks_per_child):
+            kwargs = {"max_workers": _max_workers}
+            if _max_tasks_per_child is not None and _ppe_supports_max_tasks:
+                kwargs["max_tasks_per_child"] = _max_tasks_per_child
+            return kwargs
 
         if row_groups_by_file:
             _rg_values = np.array([max(1, int(v)) for v in row_groups_by_file.values()], dtype=np.int32)
@@ -4738,8 +4752,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
 
             def _run_file_queue_attempt(_workers: int):
                 with concurrent.futures.ProcessPoolExecutor(
-                    max_workers=_workers,
-                    max_tasks_per_child=max_tasks_per_child,
+                    **_ppe_kwargs(_workers, max_tasks_per_child)
                 ) as ex:
                     fut_meta = {}
                     for _ in range(min(_workers, len(task_queue))):
@@ -4856,7 +4869,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
                 log(f"  ✓ Row-group parallelism only: 1 process × {nthreads} Numba thread(s)")
 
                 try:
-                    with concurrent.futures.ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1) as ex:
+                    with concurrent.futures.ProcessPoolExecutor(**_ppe_kwargs(1, 1)) as ex:
                         fut = ex.submit(
                             _process_rowgroup_voxel_task,
                             files,
@@ -4874,7 +4887,7 @@ def voxel_ray_intersections(valid_rays_dir: str,
                         f"voxel={float(grid['voxel_size']):.1f}m; retrying in serial-kernel safe mode"
                     )
                     log(f"  ! Crash detail: {rg_exc}")
-                    with concurrent.futures.ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1) as ex:
+                    with concurrent.futures.ProcessPoolExecutor(**_ppe_kwargs(1, 1)) as ex:
                         fut = ex.submit(
                             _process_rowgroup_voxel_task,
                             files,

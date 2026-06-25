@@ -4,7 +4,7 @@ channels:
   - open3d-admin
   - defaults
 dependencies:
-  - python=3.10
+  - python=3.11
   - numpy
   - pandas
   - pyarrow
