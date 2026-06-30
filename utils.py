@@ -1948,10 +1948,12 @@ def prepare_helios_data(input_dir, output_dir, references_dir, leaf_object_ids, 
         logger.info(f"Leg {leg_idx}: {len(rays)} rays, {num_points} points written.")
         return len(rays), num_points
 
-    print(f"Processing {len(pulses)} scanner legs in parallel...")
-    logger.info(f"Processing {len(pulses)} legs...")
+    res = detect_resources()
+    n_jobs = max(1, min(res.n_workers, len(pulses)))
+    print(f"Processing {len(pulses)} scanner legs in parallel ({n_jobs} workers)...")
+    logger.info(f"Processing {len(pulses)} legs with {n_jobs} workers...")
     with tqdm_joblib.tqdm_joblib(tqdm(desc='Processing scanner legs', total=len(pulses), unit='leg')):
-        results = Parallel(n_jobs=-1)(
+        results = Parallel(n_jobs=n_jobs)(
             delayed(_process_single_leg)(leg_idx, pf, xf)
             for leg_idx, pf, xf in zip(leg_indices, pulses, points)
         )
@@ -4277,7 +4279,7 @@ def get_voxel_metrics(
                 normals, weights = compute_normals_weights_from_points_parallel(
                     unique_pts,
                     voxel_size=normal_calc_voxel_size,
-                    n_jobs=-1
+                    n_jobs=n_workers
                 )
                 
                 # Cache by (x, y, z) tuple
@@ -4391,7 +4393,7 @@ def get_voxel_metrics(
                 normals, weights = compute_normals_weights_from_points_parallel(
                     pts,
                     voxel_size=normal_calc_voxel_size,
-                    n_jobs=-1
+                    n_jobs=n_workers
                 )
                 df.loc[idx, "normal_x"] = normals[:,0]
                 df.loc[idx, "normal_y"] = normals[:,1]
@@ -4619,7 +4621,7 @@ def get_voxel_metrics(
         position=0
     ) as pbar:
         results_nested = Parallel(
-            n_jobs=-1, prefer=prefer, batch_size="auto", verbose=0
+            n_jobs=n_workers, prefer=prefer, batch_size="auto", verbose=0
         )(
             tqdm(
                 (delayed(_process_range)(a,b) for (a,b) in tasks),

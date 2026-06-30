@@ -9,6 +9,14 @@ import trimesh
 import pytest
 
 
+def pytest_configure(config):
+    """Register custom markers."""
+    config.addinivalue_line(
+        "markers",
+        "slow: marks tests that spawn worker processes (deselect with '-m \"not slow\"')",
+    )
+
+
 @pytest.fixture
 def test_data_dir():
     """Create a temporary directory for test data."""
