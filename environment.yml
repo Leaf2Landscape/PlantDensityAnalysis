@@ -10,6 +10,7 @@ dependencies:
   - pyarrow
   - pyvista
   - joblib
+  - loky
   - tqdm
   - numba
   - scikit-learn
